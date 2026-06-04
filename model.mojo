@@ -9,6 +9,9 @@ from std.algorithm import parallelize
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1. Model Configuration & Memory Offsets
+# -----------------------------------------------------------------------------
 struct TransformerConfig[
     embed_dim: Int,
     head_dim: Int,
@@ -19,51 +22,44 @@ struct TransformerConfig[
     vocab_size: Int,
     max_seq_len: Int,
 ]:
-    comptime wq_size: Int = Self.num_heads * Self.head_dim * Self.embed_dim
-    comptime wk_size: Int = Self.num_kv_heads * Self.head_dim * Self.embed_dim
-    comptime wv_size: Int = Self.num_kv_heads * Self.head_dim * Self.embed_dim
-    comptime wo_size: Int = Self.embed_dim * Self.num_heads * Self.head_dim
-    comptime w1_size: Int = Self.intermediate_dim * Self.embed_dim
-    comptime w2_size: Int = Self.embed_dim * Self.intermediate_dim
-    comptime w3_size: Int = Self.intermediate_dim * Self.embed_dim
-    comptime rms_attn_size: Int = Self.embed_dim
-    comptime rms_ffn_size: Int = Self.embed_dim
-    
-    comptime total_floats: Int = (
-        Self.wq_size + Self.wk_size + Self.wv_size + Self.wo_size +
-        Self.w1_size + Self.w2_size + Self.w3_size +
-        Self.rms_attn_size + Self.rms_ffn_size
-    )
-    comptime raw_bytes_size: Int = Self.total_floats * 4
-    # 4KB block size alignment for O_DIRECT compliance
-    comptime aligned_bytes_size: Int = ((Self.raw_bytes_size + 4095) // 4096) * 4096
-    
     @always_inline
     def is_global_layer(self, layer_idx: Int) -> Bool:
         return layer_idx % 6 == 5
 
     @always_inline
     def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[Float32, _]) -> LayerWeights:
-        var layer_heads = 32 if self.is_global_layer(layer_idx) else 16
-        var layer_kv_heads = 2 if self.is_global_layer(layer_idx) else 8
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 1 if is_global else 8
         
-        var wq_size = layer_heads * Self.head_dim * Self.embed_dim
-        var wk_size = layer_kv_heads * Self.head_dim * Self.embed_dim
-        var wv_size = layer_kv_heads * Self.head_dim * Self.embed_dim
-        var wo_size = Self.embed_dim * layer_heads * Self.head_dim
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
         var w1_size = Self.intermediate_dim * Self.embed_dim
         var w2_size = Self.embed_dim * Self.intermediate_dim
         var w3_size = Self.intermediate_dim * Self.embed_dim
         
         var wq = base_ptr
         var wk = wq + wq_size
-        var wv = wk + wk_size
-        var wo = wv + wv_size
+        
+        var wv = wk # fallback for global layer where wv is not packed
+        var wo = wk + wk_size
+        if not is_global:
+            wv = wk + wk_size
+            wo = wv + wv_size
+            
         var w1 = wo + wo_size
         var w2 = w1 + w1_size
         var w3 = w2 + w2_size
-        var rms_attn = w3 + w3_size
-        var rms_ffn = rms_attn + Self.embed_dim
+        var input_layernorm = w3 + w3_size
+        var post_attention_layernorm = input_layernorm + Self.embed_dim
+        var pre_feedforward_layernorm = post_attention_layernorm + Self.embed_dim
+        var post_feedforward_layernorm = pre_feedforward_layernorm + Self.embed_dim
+        var q_norm = post_feedforward_layernorm + Self.embed_dim
+        var k_norm = q_norm + layer_head_dim
+        var layer_scalar = k_norm + layer_head_dim
         
         return LayerWeights(
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wq.__int__()),
@@ -73,29 +69,43 @@ struct TransformerConfig[
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w1.__int__()),
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w2.__int__()),
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w3.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=rms_attn.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=rms_ffn.__int__())
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=input_layernorm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=post_attention_layernorm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pre_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=post_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_norm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_norm.__int__()),
+            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=layer_scalar.__int__())
         )
 
     @always_inline
     def get_layer_aligned_size(self, layer_idx: Int) -> Int:
-        var layer_heads = 32 if self.is_global_layer(layer_idx) else 16
-        var layer_kv_heads = 2 if self.is_global_layer(layer_idx) else 8
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 1 if is_global else 8
         
-        var wq_size = layer_heads * Self.head_dim * Self.embed_dim
-        var wk_size = layer_kv_heads * Self.head_dim * Self.embed_dim
-        var wv_size = layer_kv_heads * Self.head_dim * Self.embed_dim
-        var wo_size = Self.embed_dim * layer_heads * Self.head_dim
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
         var w1_size = Self.intermediate_dim * Self.embed_dim
         var w2_size = Self.embed_dim * Self.intermediate_dim
         var w3_size = Self.intermediate_dim * Self.embed_dim
-        var rms_attn_size = Self.embed_dim
-        var rms_ffn_size = Self.embed_dim
+        var input_layernorm_size = Self.embed_dim
+        var post_attention_layernorm_size = Self.embed_dim
+        var pre_feedforward_layernorm_size = Self.embed_dim
+        var post_feedforward_layernorm_size = Self.embed_dim
+        var q_norm_size = layer_head_dim
+        var k_norm_size = layer_head_dim
+        var layer_scalar_size = 1
         
         var total_floats = (
             wq_size + wk_size + wv_size + wo_size +
             w1_size + w2_size + w3_size +
-            rms_attn_size + rms_ffn_size
+            input_layernorm_size + post_attention_layernorm_size +
+            pre_feedforward_layernorm_size + post_feedforward_layernorm_size +
+            q_norm_size + k_norm_size + layer_scalar_size
         )
         var raw_bytes_size = total_floats * 4
         return ((raw_bytes_size + 4095) // 4096) * 4096
@@ -120,8 +130,13 @@ struct LayerWeights:
     var w1: UnsafePointer[Float32, MutExternalOrigin]
     var w2: UnsafePointer[Float32, MutExternalOrigin]
     var w3: UnsafePointer[Float32, MutExternalOrigin]
-    var rms_attn_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var rms_ffn_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var input_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var post_attention_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var pre_feedforward_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var post_feedforward_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var q_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var k_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
+    var layer_scalar: UnsafePointer[Float32, MutExternalOrigin]
 
     def __init__(
         out self,
@@ -132,8 +147,13 @@ struct LayerWeights:
         w1: UnsafePointer[Float32, MutExternalOrigin],
         w2: UnsafePointer[Float32, MutExternalOrigin],
         w3: UnsafePointer[Float32, MutExternalOrigin],
-        rms_attn: UnsafePointer[Float32, MutExternalOrigin],
-        rms_ffn: UnsafePointer[Float32, MutExternalOrigin]
+        input_layernorm: UnsafePointer[Float32, MutExternalOrigin],
+        post_attention_layernorm: UnsafePointer[Float32, MutExternalOrigin],
+        pre_feedforward_layernorm: UnsafePointer[Float32, MutExternalOrigin],
+        post_feedforward_layernorm: UnsafePointer[Float32, MutExternalOrigin],
+        q_norm: UnsafePointer[Float32, MutExternalOrigin],
+        k_norm: UnsafePointer[Float32, MutExternalOrigin],
+        layer_scalar: UnsafePointer[Float32, MutExternalOrigin]
     ):
         self.wq = wq
         self.wk = wk
@@ -142,8 +162,13 @@ struct LayerWeights:
         self.w1 = w1
         self.w2 = w2
         self.w3 = w3
-        self.rms_attn_weight = rms_attn
-        self.rms_ffn_weight = rms_ffn
+        self.input_layernorm_weight = input_layernorm
+        self.post_attention_layernorm_weight = post_attention_layernorm
+        self.pre_feedforward_layernorm_weight = pre_feedforward_layernorm
+        self.post_feedforward_layernorm_weight = post_feedforward_layernorm
+        self.q_norm_weight = q_norm
+        self.k_norm_weight = k_norm
+        self.layer_scalar = layer_scalar
 
 # -----------------------------------------------------------------------------
 # 3. High-Performance Vectorized Math Kernels
@@ -155,11 +180,23 @@ def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr
         var v = x.load[8](i)
         acc = acc + v * v
     var sum_sq = acc.reduce_add()
-    var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-5)
+    var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
     for i in range(0, size, 8):
         var v = x.load[8](i)
         var weight = w.load[8](i)
         out_ptr.store[8](i, v * inv_rms * weight)
+
+@always_inline
+def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+    var acc = SIMD[DType.float32, 8](0.0)
+    for i in range(0, size, 8):
+        var v = x.load[8](i)
+        acc = acc + v * v
+    var sum_sq = acc.reduce_add()
+    var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
+    for i in range(0, size, 8):
+        var v = x.load[8](i)
+        out_ptr.store[8](i, v * inv_rms)
 
 @always_inline
 def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], c_in: Int, c_out: Int):
@@ -184,17 +221,26 @@ def silu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], o
             out_ptr[i + lane] = silu * x2
 
 @always_inline
-def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int):
+def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
+    var half_dim = head_dim // 2
+    var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
+    var rope_dim = 512 if is_global else 256
+    
     for h in range(num_heads):
         var h_offset = h * head_dim
-        for i in range(0, head_dim, 2):
-            var val_even = vec[h_offset + i]
-            var val_odd = vec[h_offset + i + 1]
-            var theta = Float32(pos) / (10000.0 ** (Float32(i) / Float32(head_dim)))
+        for i in range(half_dim):
+            var theta: Float32 = 0.0
+            if (not is_global) or (i < 64):
+                theta = Float32(pos) / (base ** (Float32(2 * i) / Float32(rope_dim)))
+                
             var cos_theta = cos(theta)
             var sin_theta = sin(theta)
-            vec[h_offset + i] = val_even * cos_theta - val_odd * sin_theta
-            vec[h_offset + i + 1] = val_even * sin_theta + val_odd * cos_theta
+            
+            var val1 = vec[h_offset + i]
+            var val2 = vec[h_offset + half_dim + i]
+            
+            vec[h_offset + i] = val1 * cos_theta - val2 * sin_theta
+            vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
 
 @always_inline
 def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
@@ -335,12 +381,12 @@ def main() raises:
     # 4. Allocate Activations and Cache Buffers
     var x = alloc[Float32](CONFIG.embed_dim)
     var norm_x = alloc[Float32](CONFIG.embed_dim)
-    # Use max possible heads (32 query heads, 8 kv heads) for allocations
-    var q = alloc[Float32](32 * CONFIG.head_dim)
-    var k_vec = alloc[Float32](8 * CONFIG.head_dim)
-    var v_vec = alloc[Float32](8 * CONFIG.head_dim)
+    # Use max possible heads (16 query heads with 512 dim, or 8 kv heads with 256 dim) for allocations
+    var q = alloc[Float32](8192) # 16 heads * 512 dim
+    var k_vec = alloc[Float32](2048) # 8 heads * 256 dim
+    var v_vec = alloc[Float32](2048) # 8 heads * 256 dim
     var attn_scores = alloc[Float32](CONFIG.max_seq_len)
-    var attn_out = alloc[Float32](32 * CONFIG.head_dim)
+    var attn_out = alloc[Float32](8192) # 16 heads * 512 dim
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     var h1 = alloc[Float32](CONFIG.intermediate_dim)
     var h2 = alloc[Float32](CONFIG.intermediate_dim)
@@ -352,8 +398,10 @@ def main() raises:
     var current_cache_offset = 0
     for i in range(CONFIG.num_layers):
         layer_cache_offsets.append(current_cache_offset)
-        var layer_kv_heads = 2 if CONFIG.is_global_layer(i) else 8
-        current_cache_offset += CONFIG.max_seq_len * layer_kv_heads * CONFIG.head_dim
+        var is_global = CONFIG.is_global_layer(i)
+        var layer_kv_heads = 1 if is_global else 8
+        var layer_head_dim = 512 if is_global else 256
+        current_cache_offset += CONFIG.max_seq_len * layer_kv_heads * layer_head_dim
     var total_cache_size = current_cache_offset
 
     # Global continuous KV-cache
@@ -434,18 +482,37 @@ def main() raises:
                     _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), size_next, offset_next, tag_next)
                     
                 var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr.bitcast[Float32]())
-                rms_norm(x, weights.rms_attn_weight, norm_x, CONFIG.embed_dim)
+                var is_global = CONFIG.is_global_layer(layer_idx)
+                rms_norm(x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
-                var num_heads = 32 if CONFIG.is_global_layer(layer_idx) else 16
-                var num_kv_heads = 2 if CONFIG.is_global_layer(layer_idx) else 8
-                var kv_stride = num_kv_heads * CONFIG.head_dim
+                var layer_heads = 16
+                var layer_kv_heads = 1 if is_global else 8
+                var layer_head_dim = 512 if is_global else 256
+                var kv_stride = layer_kv_heads * layer_head_dim
                 
-                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, num_heads * CONFIG.head_dim)
-                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, num_kv_heads * CONFIG.head_dim)
-                matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, num_kv_heads * CONFIG.head_dim)
+                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim)
+                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
                 
-                apply_rope(q, num_heads, CONFIG.head_dim, pos)
-                apply_rope(k_vec, num_kv_heads, CONFIG.head_dim, pos)
+                if is_global:
+                    for i in range(kv_stride):
+                        v_vec[i] = k_vec[i]
+                else:
+                    matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                
+                # Apply head-wise RMS normalization
+                for h in range(layer_heads):
+                    var head_ptr = q + h * layer_head_dim
+                    rms_norm(head_ptr, weights.q_norm_weight, head_ptr, layer_head_dim)
+                for h in range(layer_kv_heads):
+                    var head_ptr = k_vec + h * layer_head_dim
+                    rms_norm(head_ptr, weights.k_norm_weight, head_ptr, layer_head_dim)
+                if is_global:
+                    for h in range(layer_kv_heads):
+                        var head_ptr = v_vec + h * layer_head_dim
+                        rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
+                
+                apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
+                apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
                 
                 var layer_cache_offset = layer_cache_offsets[layer_idx]
                 var step_cache_offset = layer_cache_offset + pos * kv_stride
@@ -453,40 +520,51 @@ def main() raises:
                     k_cache[step_cache_offset + i] = k_vec[i]
                     v_cache[step_cache_offset + i] = v_vec[i]
                     
-                var ratio = num_heads // num_kv_heads
-                for h in range(num_heads):
-                    var h_offset = h * CONFIG.head_dim
+                var ratio = layer_heads // layer_kv_heads
+                for h in range(layer_heads):
+                    var h_offset = h * layer_head_dim
                     var g = h // ratio
-                    var g_offset = g * CONFIG.head_dim
+                    var g_offset = g * layer_head_dim
                     
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
-                        for d in range(CONFIG.head_dim):
+                        for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score / sqrt(Float32(CONFIG.head_dim))
+                        attn_scores[t] = score / sqrt(Float32(layer_head_dim))
                         
                     softmax(attn_scores, pos + 1)
                     
-                    for d in range(CONFIG.head_dim):
+                    for d in range(layer_head_dim):
                         var val_sum: Float32 = 0.0
                         for t in range(pos + 1):
                             var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                             val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
                         attn_out[h_offset + d] = val_sum
                         
-                matmul_vec(weights.wo, attn_out, proj_attn_out, num_heads * CONFIG.head_dim, CONFIG.embed_dim)
+                matmul_vec(weights.wo, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim)
+                
+                # Post-attention normalization on projected attention output
+                rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
                 for i in range(CONFIG.embed_dim):
                     x[i] += proj_attn_out[i]
                     
-                rms_norm(x, weights.rms_ffn_weight, norm_x, CONFIG.embed_dim)
+                # Pre-feedforward normalization
+                rms_norm(x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
                 matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim)
                 matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim)
                 silu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim)
                 
+                # Post-feedforward normalization on MLP output
+                rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
                 for i in range(CONFIG.embed_dim):
                     x[i] += ffn_out[i]
+                
+                # Scale hidden state by layer_scalar
+                var scalar = weights.layer_scalar[0]
+                for i in range(CONFIG.embed_dim):
+                    x[i] *= scalar
                     
                 if layer_idx + 1 < CONFIG.num_layers:
                     var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)

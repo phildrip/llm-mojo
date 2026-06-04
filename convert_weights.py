@@ -208,33 +208,51 @@ def main():
     
     with open(args.output, "wb") as f_out:
         for i in range(num_layers):
-            print(f"Processing Layer {i}/{num_layers}...", end="", flush=True)
+            is_global = (i % 6 == 5)
+            print(f"Processing Layer {i}/{num_layers} ({'global' if is_global else 'sliding'})...", end="", flush=True)
             # Extract weights for Layer i
             try:
                 wq = load_tensor_flat(f"{prefix}layers.{i}.self_attn.q_proj.weight")
                 wk = load_tensor_flat(f"{prefix}layers.{i}.self_attn.k_proj.weight")
                 
-                v_key = f"{prefix}layers.{i}.self_attn.v_proj.weight"
-                if v_key in tensor_catalog:
+                if not is_global:
+                    v_key = f"{prefix}layers.{i}.self_attn.v_proj.weight"
                     wv = load_tensor_flat(v_key)
-                else:
-                    print(f" (attention_k_eq_v fallback: copying k_proj to v_proj for layer {i})", end="", flush=True)
-                    wv = wk.copy()
-                    
+                
                 wo = load_tensor_flat(f"{prefix}layers.{i}.self_attn.o_proj.weight")
                 
                 w1 = load_tensor_flat(f"{prefix}layers.{i}.mlp.gate_proj.weight")
                 w2 = load_tensor_flat(f"{prefix}layers.{i}.mlp.down_proj.weight")
                 w3 = load_tensor_flat(f"{prefix}layers.{i}.mlp.up_proj.weight")
                 
-                rms_attn = load_tensor_flat(f"{prefix}layers.{i}.input_layernorm.weight")
-                rms_ffn = load_tensor_flat(f"{prefix}layers.{i}.post_attention_layernorm.weight")
+                input_layernorm = load_tensor_flat(f"{prefix}layers.{i}.input_layernorm.weight")
+                post_attention_layernorm = load_tensor_flat(f"{prefix}layers.{i}.post_attention_layernorm.weight")
+                pre_feedforward_layernorm = load_tensor_flat(f"{prefix}layers.{i}.pre_feedforward_layernorm.weight")
+                post_feedforward_layernorm = load_tensor_flat(f"{prefix}layers.{i}.post_feedforward_layernorm.weight")
+                
+                q_norm = load_tensor_flat(f"{prefix}layers.{i}.self_attn.q_norm.weight")
+                k_norm = load_tensor_flat(f"{prefix}layers.{i}.self_attn.k_norm.weight")
+                layer_scalar = load_tensor_flat(f"{prefix}layers.{i}.layer_scalar")
             except KeyError as e:
                 print(f"\nCRITICAL: Missing expected tensor in layer {i}: {e}")
                 sys.exit(1)
             
             # Combine all weights in our exact binary struct sequence
-            layer_payload = np.concatenate([wq, wk, wv, wo, w1, w2, w3, rms_attn, rms_ffn])
+            if not is_global:
+                layer_payload = np.concatenate([
+                    wq, wk, wv, wo, w1, w2, w3,
+                    input_layernorm, post_attention_layernorm,
+                    pre_feedforward_layernorm, post_feedforward_layernorm,
+                    q_norm, k_norm, layer_scalar
+                ])
+            else:
+                layer_payload = np.concatenate([
+                    wq, wk, wo, w1, w2, w3,
+                    input_layernorm, post_attention_layernorm,
+                    pre_feedforward_layernorm, post_feedforward_layernorm,
+                    q_norm, k_norm, layer_scalar
+                ])
+                
             layer_bytes = layer_payload.tobytes()
             
             # Pad to multiple of 4096 bytes (O_DIRECT block size alignment)
