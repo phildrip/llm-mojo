@@ -1,0 +1,6 @@
+.venv/
+.agents/
+scratch/
+*.bin
+*.so
+liburing/
