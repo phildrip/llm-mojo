@@ -4,6 +4,7 @@ from std.math import sqrt, exp, cos, sin
 from std.python import Python
 import std.os
 from uring import IoUring
+from std.algorithm import parallelize
 
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
@@ -496,21 +497,47 @@ def main() raises:
                 # Prompt ingestion phase: update token from prompt list
                 current_token = prompt_tokens[pos + 1]
             else:
-                # Generation phase: compute logits and select next token
+                # Generation phase: compute logits in parallel across CPU cores and select next token
+                comptime NUM_TASKS = 16
+                var chunk_size = CONFIG.vocab_size // NUM_TASKS
+                
+                var local_max_logits = alloc[Float32](NUM_TASKS)
+                var local_next_tokens = alloc[Int](NUM_TASKS)
+                
+                def proj_worker(t: Int) capturing -> None:
+                    var start_r = t * chunk_size
+                    var end_r = (t + 1) * chunk_size if t < NUM_TASKS - 1 else CONFIG.vocab_size
+                    
+                    var local_max_l: Float32 = -999999.0
+                    var local_tok = 0
+                    
+                    for r in range(start_r, end_r):
+                        var r_offset = r * CONFIG.embed_dim
+                        var acc = SIMD[DType.float32, 8](0.0)
+                        for c in range(0, CONFIG.embed_dim, 8):
+                            acc = acc + x.load[8](c) * embed_ptr.load[8](r_offset + c)
+                        var logit = acc.reduce_add()
+                        
+                        if logit > local_max_l:
+                            local_max_l = logit
+                            local_tok = r
+                            
+                    local_max_logits[t] = local_max_l
+                    local_next_tokens[t] = local_tok
+                    
+                parallelize[proj_worker](NUM_TASKS)
+                
+                # Reduce to find global max
                 var max_logit: Float32 = -999999.0
                 var next_token = 0
-                for r in range(CONFIG.vocab_size):
-                    var r_offset = r * CONFIG.embed_dim
-                    
-                    var acc = SIMD[DType.float32, 8](0.0)
-                    for c in range(0, CONFIG.embed_dim, 8):
-                        acc = acc + x.load[8](c) * embed_ptr.load[8](r_offset + c)
-                    var logit = acc.reduce_add()
-                    
-                    if logit > max_logit:
-                        max_logit = logit
-                        next_token = r
+                for t in range(NUM_TASKS):
+                    if local_max_logits[t] > max_logit:
+                        max_logit = local_max_logits[t]
+                        next_token = local_next_tokens[t]
                         
+                local_max_logits.free()
+                local_next_tokens.free()
+                
                 # Print the generated token in real-time
                 var next_token_list = list_cls()
                 next_token_list.append(next_token)
