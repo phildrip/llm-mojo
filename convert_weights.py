@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description="Convert Hugging Face Gemma 4 / Gemma weights to Mojo O_DIRECT page-aligned binary format.")
     parser.add_argument("--model_id", type=str, default="google/gemma-4-12B-it", help="Hugging Face Model ID or local directory containing .safetensors files")
     parser.add_argument("--output", type=str, default="gemma4_weights.bin", help="Output bin path for Mojo weight paging")
+    parser.add_argument("--only_embeddings", action="store_true", help="Only extract and save token embedding weights to gemma4_embed.bin")
     args = parser.parse_args()
 
     model_path = args.model_id
@@ -178,6 +179,29 @@ def main():
     except Exception as e:
         print(f"CRITICAL: Error detecting tensor name prefix: {e}")
         sys.exit(1)
+
+    if args.only_embeddings:
+        output_embed = "gemma4_embed.bin"
+        print(f"Extracting token embeddings to {output_embed}...")
+        try:
+            # Gemma 4 embeddings key: model.language_model.embed_tokens.weight
+            embed_key = f"{prefix}embed_tokens.weight"
+            embed_tokens = load_tensor_flat(embed_key)
+        except KeyError as e:
+            print(f"\nCRITICAL: Missing embed_tokens tensor: {e}")
+            sys.exit(1)
+        
+        embed_bytes = embed_tokens.tobytes()
+        raw_size = len(embed_bytes)
+        aligned_size = ((raw_size + 4095) // 4096) * 4096
+        padding_needed = aligned_size - raw_size
+        
+        with open(output_embed, "wb") as f_embed:
+            f_embed.write(embed_bytes)
+            if padding_needed > 0:
+                f_embed.write(b'\x00' * padding_needed)
+        print(f"Success! Packed and page-aligned embeddings written to {output_embed} ({aligned_size} bytes)")
+        return
 
     # 4. Pack layer weights sequentially
     print(f"Writing packed and page-aligned weights to {args.output}...")
