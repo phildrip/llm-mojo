@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "mojo-gpu-fundamentals": {
+      "source": "modular/skills",
+      "sourceType": "github",
+      "skillPath": "mojo-gpu-fundamentals/SKILL.md",
+      "computedHash": "592051baa9ae913eb1ea691ea19d94192bb88370ed5fd7cef287ea5147be9bf2"
+    },
+    "mojo-syntax": {
+      "source": "modular/skills",
+      "sourceType": "github",
+      "skillPath": "mojo-syntax/SKILL.md",
+      "computedHash": "8d28d5365b59ece76d4b45e7876c61b9ff7b06e9d9a1ff2bcd1d40569fc2e11b"
+    }
+  }
+}
