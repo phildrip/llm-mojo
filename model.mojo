@@ -38,16 +38,31 @@ struct TransformerConfig[
     comptime aligned_bytes_size: Int = ((Self.raw_bytes_size + 4095) // 4096) * 4096
     
     @always_inline
-    def get_layer_weights(self, base_ptr: UnsafePointer[Float32, _]) -> LayerWeights:
+    def is_global_layer(self, layer_idx: Int) -> Bool:
+        return layer_idx % 6 == 5
+
+    @always_inline
+    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[Float32, _]) -> LayerWeights:
+        var layer_heads = 32 if self.is_global_layer(layer_idx) else 16
+        var layer_kv_heads = 2 if self.is_global_layer(layer_idx) else 8
+        
+        var wq_size = layer_heads * Self.head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * Self.head_dim * Self.embed_dim
+        var wv_size = layer_kv_heads * Self.head_dim * Self.embed_dim
+        var wo_size = Self.embed_dim * layer_heads * Self.head_dim
+        var w1_size = Self.intermediate_dim * Self.embed_dim
+        var w2_size = Self.embed_dim * Self.intermediate_dim
+        var w3_size = Self.intermediate_dim * Self.embed_dim
+        
         var wq = base_ptr
-        var wk = wq + Self.wq_size
-        var wv = wk + Self.wk_size
-        var wo = wv + Self.wv_size
-        var w1 = wo + Self.wo_size
-        var w2 = w1 + Self.w1_size
-        var w3 = w2 + Self.w2_size
-        var rms_attn = w3 + Self.w3_size
-        var rms_ffn = rms_attn + Self.rms_attn_size
+        var wk = wq + wq_size
+        var wv = wk + wk_size
+        var wo = wv + wv_size
+        var w1 = wo + wo_size
+        var w2 = w1 + w1_size
+        var w3 = w2 + w2_size
+        var rms_attn = w3 + w3_size
+        var rms_ffn = rms_attn + Self.embed_dim
         
         return LayerWeights(
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wq.__int__()),
@@ -60,6 +75,35 @@ struct TransformerConfig[
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=rms_attn.__int__()),
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=rms_ffn.__int__())
         )
+
+    @always_inline
+    def get_layer_aligned_size(self, layer_idx: Int) -> Int:
+        var layer_heads = 32 if self.is_global_layer(layer_idx) else 16
+        var layer_kv_heads = 2 if self.is_global_layer(layer_idx) else 8
+        
+        var wq_size = layer_heads * Self.head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * Self.head_dim * Self.embed_dim
+        var wv_size = layer_kv_heads * Self.head_dim * Self.embed_dim
+        var wo_size = Self.embed_dim * layer_heads * Self.head_dim
+        var w1_size = Self.intermediate_dim * Self.embed_dim
+        var w2_size = Self.embed_dim * Self.intermediate_dim
+        var w3_size = Self.intermediate_dim * Self.embed_dim
+        var rms_attn_size = Self.embed_dim
+        var rms_ffn_size = Self.embed_dim
+        
+        var total_floats = (
+            wq_size + wk_size + wv_size + wo_size +
+            w1_size + w2_size + w3_size +
+            rms_attn_size + rms_ffn_size
+        )
+        var raw_bytes_size = total_floats * 4
+        return ((raw_bytes_size + 4095) // 4096) * 4096
+
+    def get_layer_offset(self, layer_idx: Int) -> Int:
+        var offset = 0
+        for i in range(layer_idx):
+            offset += self.get_layer_aligned_size(i)
+        return offset
 
     def __init__(out self):
         pass
@@ -185,19 +229,19 @@ def main() raises:
     print("=========================================================")
     print("   GEMMA 4 12B-SCALE DEEP TRANSCO-PROCESSOR RUNNER       ")
     print("=========================================================")
-    print("Embedding Size:      256")
-    print("Attention Heads:     8 Query Heads / 4 KV Heads (GQA/MQA)")
+    print("Embedding Size:      3840")
+    print("Attention Heads:     16 Query Heads / 8 KV Heads (GQA/MQA)")
     print("Model Parameters:    12B Scale Causal Layout")
     print("Kernel Paging I/O:   Linux io_uring (Direct NVMe double-buf)")
     print("---------------------------------------------------------")
 
     var CONFIG = TransformerConfig[
-        embed_dim = 256,
-        head_dim = 32,
-        num_heads = 8,
-        num_kv_heads = 4,
-        intermediate_dim = 512,
-        num_layers = 4,
+        embed_dim = 3840,
+        head_dim = 256,
+        num_heads = 16,
+        num_kv_heads = 8,
+        intermediate_dim = 15360,
+        num_layers = 48,
         vocab_size = 26,
         max_seq_len = 100
     ]()
@@ -208,27 +252,32 @@ def main() raises:
     var c_close = libc.get_function[def(Int32) -> Int32]("close")
     var posix_memalign = libc.get_function[def(Int, Int, Int) -> Int32]("posix_memalign")
     var free_c = libc.get_function[def(Int) -> NoneType]("free")
-    var c_write = libc.get_function[def(Int32, Int, Int) -> Int]("write")
     var py = Python.import_module("time")
 
     var ring = IoUring(16)
     var out_tag_ptr = alloc[UInt64](1)
     out_tag_ptr[0] = 0
 
-    # 2. Setup Page-Aligned Layer Weight Buffers (Double-buffering)
+    # 2. Find max layer size and Setup Page-Aligned Layer Weight Buffers (Double-buffering)
+    var max_layer_bytes = 0
+    for i in range(CONFIG.num_layers):
+        var sz = CONFIG.get_layer_aligned_size(i)
+        if sz > max_layer_bytes:
+            max_layer_bytes = sz
+
     var memptr_w_a = alloc[Int](1)
-    _ = posix_memalign(memptr_w_a.__int__(), 4096, CONFIG.aligned_bytes_size)
+    _ = posix_memalign(memptr_w_a.__int__(), 4096, max_layer_bytes)
     var w_a_addr = memptr_w_a[0]
     var w_a_ptr = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=w_a_addr)
 
     var memptr_w_b = alloc[Int](1)
-    _ = posix_memalign(memptr_w_b.__int__(), 4096, CONFIG.aligned_bytes_size)
+    _ = posix_memalign(memptr_w_b.__int__(), 4096, max_layer_bytes)
     var w_b_addr = memptr_w_b[0]
     var w_b_ptr = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=w_b_addr)
 
-    # 3. Create mock weights on NVMe
+    # 3. Open converted real weights file on NVMe with O_DIRECT
     var weights_file = "gemma4_weights.bin"
-    print("Initializing weights file on disk with O_DIRECT aligned structures...")
+    print("Opening converted weights file 'gemma4_weights.bin' with O_DIRECT read-only...")
     
     var path_bytes = weights_file.as_bytes()
     var path_ptr = alloc[UInt8](len(path_bytes) + 1)
@@ -236,49 +285,45 @@ def main() raises:
         path_ptr[i] = path_bytes[i]
     path_ptr[len(path_bytes)] = 0
 
-    # Flags: O_RDWR (2) | O_CREAT (64) | O_TRUNC (512) | O_DIRECT (16384) = 16962
-    var weights_fd = c_open(path_ptr.__int__(), 16962, 420)
+    # Flags: O_RDONLY (0) | O_DIRECT (16384) = 16384
+    var weights_fd = c_open(path_ptr.__int__(), 16384, 0)
     if weights_fd < 0:
-        print("CRITICAL: Failed to open weights storage file with O_DIRECT")
+        print("CRITICAL: Failed to open 'gemma4_weights.bin' weights file with O_DIRECT. Make sure you converted weights first!")
         return
 
-    # Populate and write mock layers
-    var mock_layer_buf = w_a_ptr.bitcast[Float32]()
-    for i in range(CONFIG.aligned_bytes_size // 4):
-        mock_layer_buf[i] = 0.0
-
-    # Set up RMSNorm parameters to 1.0 (identity scale)
-    var rms_attn_offset = CONFIG.total_floats - 2 * CONFIG.embed_dim
-    for i in range(CONFIG.embed_dim):
-        mock_layer_buf[rms_attn_offset + i] = 1.0
-        mock_layer_buf[rms_attn_offset + CONFIG.embed_dim + i] = 1.0
-
-    # Write layer configurations sequentially
-    for _ in range(CONFIG.num_layers):
-        _ = c_write(weights_fd, w_a_addr, CONFIG.aligned_bytes_size)
-
-    print("Weights file populated and synced successfully. Active size: " + String(CONFIG.num_layers * CONFIG.aligned_bytes_size) + " bytes")
+    print("Weights file opened successfully. Active size: " + String(CONFIG.get_layer_offset(CONFIG.num_layers)) + " bytes")
     print("---------------------------------------------------------")
 
     # 4. Allocate Activations and Cache Buffers
     var x = alloc[Float32](CONFIG.embed_dim)
     var norm_x = alloc[Float32](CONFIG.embed_dim)
-    var q = alloc[Float32](CONFIG.num_heads * CONFIG.head_dim)
-    var k_vec = alloc[Float32](CONFIG.num_kv_heads * CONFIG.head_dim)
-    var v_vec = alloc[Float32](CONFIG.num_kv_heads * CONFIG.head_dim)
+    var dual_hot = alloc[Float32](CONFIG.embed_dim)
+    # Use max possible heads (32 query heads, 8 kv heads) for allocations
+    var q = alloc[Float32](32 * CONFIG.head_dim)
+    var k_vec = alloc[Float32](8 * CONFIG.head_dim)
+    var v_vec = alloc[Float32](8 * CONFIG.head_dim)
     var attn_scores = alloc[Float32](CONFIG.max_seq_len)
-    var attn_out = alloc[Float32](CONFIG.num_heads * CONFIG.head_dim)
+    var attn_out = alloc[Float32](32 * CONFIG.head_dim)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     var h1 = alloc[Float32](CONFIG.intermediate_dim)
     var h2 = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out_gate = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out = alloc[Float32](CONFIG.embed_dim)
 
+    # Precompute layer cache offsets and total cache size
+    var layer_cache_offsets = List[Int]()
+    var current_cache_offset = 0
+    for i in range(CONFIG.num_layers):
+        layer_cache_offsets.append(current_cache_offset)
+        var layer_kv_heads = 2 if CONFIG.is_global_layer(i) else 8
+        current_cache_offset += CONFIG.max_seq_len * layer_kv_heads * CONFIG.head_dim
+    var total_cache_size = current_cache_offset
+
     # Global continuous KV-cache
-    var k_cache = alloc[Float32](CONFIG.num_layers * CONFIG.max_seq_len * CONFIG.num_kv_heads * CONFIG.head_dim)
-    var v_cache = alloc[Float32](CONFIG.num_layers * CONFIG.max_seq_len * CONFIG.num_kv_heads * CONFIG.head_dim)
+    var k_cache = alloc[Float32](total_cache_size)
+    var v_cache = alloc[Float32](total_cache_size)
     # Zero out caches
-    for i in range(CONFIG.num_layers * CONFIG.max_seq_len * CONFIG.num_kv_heads * CONFIG.head_dim):
+    for i in range(total_cache_size):
         k_cache[i] = 0.0
         v_cache[i] = 0.0
 
@@ -330,133 +375,168 @@ def main() raises:
     # the -> blue (19) if prev was in (18)
     lm_head[19 * CONFIG.embed_dim + CONFIG.vocab_size + 18] = 10.0
 
-    # 5. Causal Autoregressive Decoded Loop
-    print("Starting Gemma 4 12B autoregressive inference with double-buffered weight paging...")
+    # 5. Interactive Chat Agent Loop
+    print("=========================================================")
+    print("   GEMMA 4 12B-SCALE DEEP TRANSCO-PROCESSOR CHAT AGENT   ")
+    print("=========================================================")
+    print("Embedding Size:      3840")
+    print("Attention Heads:     16 Query Heads / 8 KV Heads (GQA/MQA)")
+    print("Model Parameters:    12B Scale Causal Layout")
+    print("Kernel Paging I/O:   Linux io_uring (Direct NVMe double-buf)")
     print("---------------------------------------------------------")
-    
-    var current_token = 0
-    var previous_token = 0
-    print(vocab[current_token] + " ", end="")
-    py.sleep(0.1)
+    print("Vocabulary words you can use in your prompt:")
+    var vocab_str = String("")
+    for i in range(len(vocab)):
+        vocab_str += vocab[i] + " "
+    print(vocab_str)
+    print("---------------------------------------------------------")
+    print("(Type 'exit' or 'quit' to end the conversation)")
 
-    # Sequence positional loops
-    for pos in range(1, 50):
-        # Layer 0 weight prefetch (warmup start for the current step)
-        var tag_0: UInt64 = UInt64(2000)
-        _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.aligned_bytes_size, 0, tag_0)
-        wait_for_tag(ring, tag_0, out_tag_ptr)
+    var py_builtins = Python.import_module("builtins")
 
-        # Embedding layer: dual-hot representation vector projection (current + previous contextual offset)
-        for i in range(CONFIG.embed_dim):
-            x[i] = 0.0
-        x[current_token] = 1.0
-        x[CONFIG.vocab_size + previous_token] = 1.0
-
-        # Layer-by-layer forward execution
-        for layer_idx in range(CONFIG.num_layers):
-            # Double buffer pointers swapping
-            var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
-            var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
+    while True:
+        print()
+        var user_input = py_builtins.input("User > ")
+        var user_input_str = String(user_input).strip()
+        if user_input_str == "exit" or user_input_str == "quit":
+            break
             
-            # A. Background Read the next layer's weights asynchronously
-            if layer_idx + 1 < CONFIG.num_layers:
-                var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
-                var offset_next = (layer_idx + 1) * CONFIG.aligned_bytes_size
-                _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), CONFIG.aligned_bytes_size, offset_next, tag_next)
-
-            # B. Get remapped structured weight matrices for active layer
-            var weights = CONFIG.get_layer_weights(active_weights_ptr.bitcast[Float32]())
-
-            # C. RMSNorm
-            rms_norm(x, weights.rms_attn_weight, norm_x, CONFIG.embed_dim)
-
-            # D. Projections Q, K, V
-            matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, CONFIG.num_heads * CONFIG.head_dim)
-            matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, CONFIG.num_kv_heads * CONFIG.head_dim)
-            matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, CONFIG.num_kv_heads * CONFIG.head_dim)
-
-            # E. Rotary Positional Embeddings (RoPE)
-            apply_rope(q, CONFIG.num_heads, CONFIG.head_dim, pos)
-            apply_rope(k_vec, CONFIG.num_kv_heads, CONFIG.head_dim, pos)
-
-            # F. Write QKV states into Cache buffers
-            var kv_stride = CONFIG.num_kv_heads * CONFIG.head_dim
-            var layer_cache_offset = layer_idx * (CONFIG.max_seq_len * kv_stride)
-            var step_cache_offset = layer_cache_offset + pos * kv_stride
-            for i in range(kv_stride):
-                k_cache[step_cache_offset + i] = k_vec[i]
-                v_cache[step_cache_offset + i] = v_vec[i]
-
-            # G. Grouped/Multi-Query Attention over steps [0, pos]
-            var ratio = CONFIG.num_heads // CONFIG.num_kv_heads
-            for h in range(CONFIG.num_heads):
-                var h_offset = h * CONFIG.head_dim
-                var g = h // ratio
-                var g_offset = g * CONFIG.head_dim
+        var prompt_tokens = List[Int]()
+        prompt_tokens.append(0) # <bos>
+        
+        var words = user_input.lower().strip().split(" ")
+        for i in range(len(words)):
+            var word = String(words[i])
+            for idx in range(len(vocab)):
+                if vocab[idx] == word:
+                    prompt_tokens.append(idx)
+                    break
+                    
+        if len(prompt_tokens) <= 1:
+            print("Agent > (Please use some vocabulary words from the list above!)")
+            continue
+            
+        print("Agent > ", end="")
+        
+        var current_token = prompt_tokens[1]
+        var previous_token = prompt_tokens[0]
+        
+        # We start pos from 1 to the end of ingestion + 30 generation steps
+        var num_prompt_tokens = len(prompt_tokens)
+        var max_steps = num_prompt_tokens + 30
+        if max_steps > CONFIG.max_seq_len:
+            max_steps = CONFIG.max_seq_len
+            
+        for pos in range(1, max_steps):
+            # Layer 0 weight prefetch
+            var tag_0: UInt64 = UInt64(2000)
+            _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
+            wait_for_tag(ring, tag_0, out_tag_ptr)
+            
+            # Setup dual-hot and input activations x
+            for i in range(CONFIG.embed_dim):
+                dual_hot[i] = 0.0
+                x[i] = 0.0
+            dual_hot[current_token] = 1.0
+            dual_hot[CONFIG.vocab_size + previous_token] = 1.0
+            x[current_token] = 1.0
+            x[CONFIG.vocab_size + previous_token] = 1.0
+            
+            # Run the 48 layers of Transformer forward pass
+            for layer_idx in range(CONFIG.num_layers):
+                var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
+                var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
                 
-                # Compute scores
-                for t in range(pos + 1):
-                    var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                    var score: Float32 = 0.0
-                    for d in range(CONFIG.head_dim):
-                        score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                    attn_scores[t] = score / sqrt(Float32(CONFIG.head_dim))
+                if layer_idx + 1 < CONFIG.num_layers:
+                    var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
+                    var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
+                    var size_next = CONFIG.get_layer_aligned_size(layer_idx + 1)
+                    _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), size_next, offset_next, tag_next)
+                    
+                var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr.bitcast[Float32]())
+                rms_norm(x, weights.rms_attn_weight, norm_x, CONFIG.embed_dim)
                 
-                # Softmax
-                softmax(attn_scores, pos + 1)
+                var num_heads = 32 if CONFIG.is_global_layer(layer_idx) else 16
+                var num_kv_heads = 2 if CONFIG.is_global_layer(layer_idx) else 8
+                var kv_stride = num_kv_heads * CONFIG.head_dim
                 
-                # Value weighted aggregation
-                for d in range(CONFIG.head_dim):
-                    var val_sum: Float32 = 0.0
+                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, num_heads * CONFIG.head_dim)
+                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, num_kv_heads * CONFIG.head_dim)
+                matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, num_kv_heads * CONFIG.head_dim)
+                
+                apply_rope(q, num_heads, CONFIG.head_dim, pos)
+                apply_rope(k_vec, num_kv_heads, CONFIG.head_dim, pos)
+                
+                var layer_cache_offset = layer_cache_offsets[layer_idx]
+                var step_cache_offset = layer_cache_offset + pos * kv_stride
+                for i in range(kv_stride):
+                    k_cache[step_cache_offset + i] = k_vec[i]
+                    v_cache[step_cache_offset + i] = v_vec[i]
+                    
+                var ratio = num_heads // num_kv_heads
+                for h in range(num_heads):
+                    var h_offset = h * CONFIG.head_dim
+                    var g = h // ratio
+                    var g_offset = g * CONFIG.head_dim
+                    
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                        val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
-                    attn_out[h_offset + d] = val_sum
-
-            # H. Out projection + Residual connection
-            matmul_vec(weights.wo, attn_out, proj_attn_out, CONFIG.num_heads * CONFIG.head_dim, CONFIG.embed_dim)
-            for i in range(CONFIG.embed_dim):
-                x[i] += proj_attn_out[i]
-
-            # I. SwiGLU Feed-Forward Network Layer
-            rms_norm(x, weights.rms_ffn_weight, norm_x, CONFIG.embed_dim)
-            matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim)
-            matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim)
-            silu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-            matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim)
-            
-            for i in range(CONFIG.embed_dim):
-                x[i] += ffn_out[i]
-
-            # J. Synchronize / Wait on background I/O for next layer weights
-            if layer_idx + 1 < CONFIG.num_layers:
-                var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
-                wait_for_tag(ring, tag_next, out_tag_ptr)
-
-        # 6. LM Head Projection & Argmax next-token selection
-        # Output Logits
-        var max_logit: Float32 = -999999.0
-        var next_token = 0
-        for r in range(CONFIG.vocab_size):
-            var logit: Float32 = 0.0
-            var r_offset = r * CONFIG.embed_dim
-            for c in range(CONFIG.embed_dim):
-                logit += lm_head[r_offset + c] * x[c]
-            if logit > max_logit:
-                max_logit = logit
-                next_token = r
-
-        # State transition updates
-        previous_token = current_token
-        current_token = next_token
-
-        # Print the decoded token in real-time
-        var word = vocab[current_token]
-        if word == "<bos>":
-            print("\n" + word + " ", end="")
-        else:
-            print(word + " ", end="")
-        py.sleep(0.12) # Typist delay
+                        var score: Float32 = 0.0
+                        for d in range(CONFIG.head_dim):
+                            score += q[h_offset + d] * k_cache[t_cache_offset + d]
+                        attn_scores[t] = score / sqrt(Float32(CONFIG.head_dim))
+                        
+                    softmax(attn_scores, pos + 1)
+                    
+                    for d in range(CONFIG.head_dim):
+                        var val_sum: Float32 = 0.0
+                        for t in range(pos + 1):
+                            var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                            val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
+                        attn_out[h_offset + d] = val_sum
+                        
+                matmul_vec(weights.wo, attn_out, proj_attn_out, num_heads * CONFIG.head_dim, CONFIG.embed_dim)
+                for i in range(CONFIG.embed_dim):
+                    x[i] += proj_attn_out[i]
+                    
+                rms_norm(x, weights.rms_ffn_weight, norm_x, CONFIG.embed_dim)
+                matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim)
+                matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim)
+                silu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
+                matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim)
+                
+                for i in range(CONFIG.embed_dim):
+                    x[i] += ffn_out[i]
+                    
+                if layer_idx + 1 < CONFIG.num_layers:
+                    var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
+                    wait_for_tag(ring, tag_next, out_tag_ptr)
+                    
+            # Check if we are still ingesting prompt or generating
+            if pos < num_prompt_tokens - 1:
+                # Prompt ingestion phase: update tokens from the prompt list
+                previous_token = current_token
+                current_token = prompt_tokens[pos + 1]
+            else:
+                # Generation phase: compute logits and select next token
+                var max_logit: Float32 = -999999.0
+                var next_token = 0
+                for r in range(CONFIG.vocab_size):
+                    var logit: Float32 = 0.0
+                    var r_offset = r * CONFIG.embed_dim
+                    for c in range(CONFIG.embed_dim):
+                        logit += lm_head[r_offset + c] * dual_hot[c]
+                    if logit > max_logit:
+                        max_logit = logit
+                        next_token = r
+                        
+                # Print the generated token in real-time
+                var word = vocab[next_token]
+                print(word + " ", end="")
+                py.sleep(0.12)
+                
+                previous_token = current_token
+                current_token = next_token
 
     print("\n---------------------------------------------------------")
     print("Inference generation loop complete!")
@@ -486,9 +566,8 @@ def main() raises:
     k_cache.free()
     v_cache.free()
     lm_head.free()
+    dual_hot.free()
 
-    # Safely remove weight cache file
-    try:
-        std.os.unlink(weights_file)
-    except:
-        pass
+
+    # Real weights paged via O_DIRECT are kept intact on NVMe disk.
+
