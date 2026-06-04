@@ -253,6 +253,12 @@ def main() raises:
     var posix_memalign = libc.get_function[def(Int, Int, Int) -> Int32]("posix_memalign")
     var free_c = libc.get_function[def(Int) -> NoneType]("free")
     var py = Python.import_module("time")
+    var sys = Python.import_module("sys")
+    sys.path.append("/home/phil/git/llm-mojo/.venv/lib/python3.12/site-packages")
+    var transformers = Python.import_module("transformers")
+    print("Loading Gemma 4 tokenizer...")
+    var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
+    print("Tokenizer loaded successfully!")
 
     var ring = IoUring(16)
     var out_tag_ptr = alloc[UInt64](1)
@@ -401,20 +407,21 @@ def main() raises:
         if user_input_str == "exit" or user_input_str == "quit":
             break
             
-        var prompt_tokens = List[Int]()
-        prompt_tokens.append(0) # <bos>
-        
-        var words = user_input.lower().strip().split(" ")
-        for i in range(len(words)):
-            var word = String(words[i])
-            for idx in range(len(vocab)):
-                if vocab[idx] == word:
-                    prompt_tokens.append(idx)
-                    break
-                    
-        if len(prompt_tokens) <= 1:
-            print("Agent > (Please use some vocabulary words from the list above!)")
+        var encoded = tokenizer.encode(user_input_str)
+        var num_encoded = len(encoded)
+        if num_encoded == 0:
+            print("Agent > (Please type something!)")
             continue
+            
+        print("[Tokenizer] Encoded input into", num_encoded, "real sub-word token IDs:")
+        var token_ids_str = String("")
+        var prompt_tokens = List[Int]()
+        for i in range(num_encoded):
+            var tid = Int(py=encoded[i])
+            token_ids_str += String(tid) + " "
+            # For Step 1, map to mock vocabulary to prevent out-of-bounds in mock model
+            prompt_tokens.append(tid % CONFIG.vocab_size)
+        print(token_ids_str)
             
         print("Agent > ", end="")
         
