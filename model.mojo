@@ -242,7 +242,7 @@ def main() raises:
         num_kv_heads = 8,
         intermediate_dim = 15360,
         num_layers = 48,
-        vocab_size = 26,
+        vocab_size = 262144,
         max_seq_len = 100
     ]()
 
@@ -298,12 +298,42 @@ def main() raises:
         return
 
     print("Weights file opened successfully. Active size: " + String(CONFIG.get_layer_offset(CONFIG.num_layers)) + " bytes")
+
+    # 3b. Open and Load Real Embedding weights (tied to LM Head)
+    var embed_file = "gemma4_embed.bin"
+    print("Opening embedding weights file 'gemma4_embed.bin'...")
+    var embed_path_bytes = embed_file.as_bytes()
+    var embed_path_ptr = alloc[UInt8](len(embed_path_bytes) + 1)
+    for i in range(len(embed_path_bytes)):
+        embed_path_ptr[i] = embed_path_bytes[i]
+    embed_path_ptr[len(embed_path_bytes)] = 0
+
+    var embed_fd = c_open(embed_path_ptr.__int__(), 0, 0)
+    if embed_fd < 0:
+        print("CRITICAL: Failed to open 'gemma4_embed.bin' weights file!")
+        return
+
+    var embed_size_bytes = CONFIG.vocab_size * CONFIG.embed_dim * 4
+    var memptr_embed = alloc[Int](1)
+    _ = posix_memalign(memptr_embed.__int__(), 4096, embed_size_bytes)
+    var embed_addr = memptr_embed[0]
+    var embed_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=embed_addr)
+
+    var c_read = libc.get_function[def(Int32, Int, Int) -> Int]("read")
+    var total_read = 0
+    while total_read < embed_size_bytes:
+        var bytes_to_read = embed_size_bytes - total_read
+        var read_res = c_read(embed_fd, embed_addr + total_read, bytes_to_read)
+        if read_res <= 0:
+            print("CRITICAL: Failed to read from gemma4_embed.bin!")
+            return
+        total_read += read_res
+    print("Loaded embeddings into memory: " + String(total_read) + " bytes")
     print("---------------------------------------------------------")
 
     # 4. Allocate Activations and Cache Buffers
     var x = alloc[Float32](CONFIG.embed_dim)
     var norm_x = alloc[Float32](CONFIG.embed_dim)
-    var dual_hot = alloc[Float32](CONFIG.embed_dim)
     # Use max possible heads (32 query heads, 8 kv heads) for allocations
     var q = alloc[Float32](32 * CONFIG.head_dim)
     var k_vec = alloc[Float32](8 * CONFIG.head_dim)
@@ -333,54 +363,6 @@ def main() raises:
         k_cache[i] = 0.0
         v_cache[i] = 0.0
 
-    # Vocabulary mapping and LM state-machine (exact same transition matrix as generate.mojo)
-    var vocab: List[String] = [
-        "<bos>", "the", "cat", "sat", "on", "warm", "mat", "and", "slept", "happily",
-        "under", "bright", "sun", "while", "sweet", "birds", "sang", "songs", "in",
-        "blue", "sky", "bringing", "peace", "to", "our", "world"
-    ]
-
-    var lm_head = alloc[Float32](CONFIG.vocab_size * CONFIG.embed_dim)
-    for i in range(CONFIG.vocab_size * CONFIG.embed_dim):
-        lm_head[i] = 0.0
-
-    # Grammatical transitions
-    lm_head[1 * CONFIG.embed_dim + 0] = 10.0  # <bos> -> the
-    lm_head[3 * CONFIG.embed_dim + 2] = 10.0  # cat -> sat
-    lm_head[4 * CONFIG.embed_dim + 3] = 10.0  # sat -> on
-    lm_head[1 * CONFIG.embed_dim + 4] = 10.0  # on -> the
-    lm_head[6 * CONFIG.embed_dim + 5] = 10.0  # warm -> mat
-    lm_head[7 * CONFIG.embed_dim + 6] = 10.0  # mat -> and
-    lm_head[8 * CONFIG.embed_dim + 7] = 10.0  # and -> slept
-    lm_head[9 * CONFIG.embed_dim + 8] = 10.0  # slept -> happily
-    lm_head[10 * CONFIG.embed_dim + 9] = 10.0 # happily -> under
-    lm_head[1 * CONFIG.embed_dim + 10] = 10.0 # under -> the
-    lm_head[12 * CONFIG.embed_dim + 11] = 10.0 # bright -> sun
-    lm_head[13 * CONFIG.embed_dim + 12] = 10.0 # sun -> while
-    lm_head[14 * CONFIG.embed_dim + 13] = 10.0 # while -> sweet
-    lm_head[15 * CONFIG.embed_dim + 14] = 10.0 # sweet -> birds
-    lm_head[16 * CONFIG.embed_dim + 15] = 10.0 # birds -> sang
-    lm_head[17 * CONFIG.embed_dim + 16] = 10.0 # sang -> songs
-    lm_head[18 * CONFIG.embed_dim + 17] = 10.0 # songs -> in
-    lm_head[1 * CONFIG.embed_dim + 18] = 10.0  # in -> the
-    lm_head[20 * CONFIG.embed_dim + 19] = 10.0 # blue -> sky
-    lm_head[21 * CONFIG.embed_dim + 20] = 10.0 # sky -> bringing
-    lm_head[22 * CONFIG.embed_dim + 21] = 10.0 # bringing -> peace
-    lm_head[23 * CONFIG.embed_dim + 22] = 10.0 # peace -> to
-    lm_head[24 * CONFIG.embed_dim + 23] = 10.0 # to -> our
-    lm_head[25 * CONFIG.embed_dim + 24] = 10.0 # our -> world
-    lm_head[0 * CONFIG.embed_dim + 25] = 10.0  # world -> <bos>
-
-    # Embed disambiguation based on past token dimensions (offset by CONFIG.vocab_size)
-    # the -> cat (2) if prev was <bos> (0)
-    lm_head[2 * CONFIG.embed_dim + CONFIG.vocab_size + 0] = 10.0
-    # the -> warm (5) if prev was on (4)
-    lm_head[5 * CONFIG.embed_dim + CONFIG.vocab_size + 4] = 10.0
-    # the -> bright (11) if prev was under (10)
-    lm_head[11 * CONFIG.embed_dim + CONFIG.vocab_size + 10] = 10.0
-    # the -> blue (19) if prev was in (18)
-    lm_head[19 * CONFIG.embed_dim + CONFIG.vocab_size + 18] = 10.0
-
     # 5. Interactive Chat Agent Loop
     print("=========================================================")
     print("   GEMMA 4 12B-SCALE DEEP TRANSCO-PROCESSOR CHAT AGENT   ")
@@ -390,15 +372,10 @@ def main() raises:
     print("Model Parameters:    12B Scale Causal Layout")
     print("Kernel Paging I/O:   Linux io_uring (Direct NVMe double-buf)")
     print("---------------------------------------------------------")
-    print("Vocabulary words you can use in your prompt:")
-    var vocab_str = String("")
-    for i in range(len(vocab)):
-        vocab_str += vocab[i] + " "
-    print(vocab_str)
-    print("---------------------------------------------------------")
     print("(Type 'exit' or 'quit' to end the conversation)")
 
     var py_builtins = Python.import_module("builtins")
+    var list_cls = py_builtins.list
 
     while True:
         print()
@@ -419,35 +396,30 @@ def main() raises:
         for i in range(num_encoded):
             var tid = Int(py=encoded[i])
             token_ids_str += String(tid) + " "
-            # For Step 1, map to mock vocabulary to prevent out-of-bounds in mock model
-            prompt_tokens.append(tid % CONFIG.vocab_size)
+            prompt_tokens.append(tid)
         print(token_ids_str)
             
         print("Agent > ", end="")
         
-        var current_token = prompt_tokens[1]
-        var previous_token = prompt_tokens[0]
+        var current_token = prompt_tokens[0]
         
-        # We start pos from 1 to the end of ingestion + 30 generation steps
+        # We start pos from 0 to the end of ingestion + 30 generation steps
         var num_prompt_tokens = len(prompt_tokens)
         var max_steps = num_prompt_tokens + 30
         if max_steps > CONFIG.max_seq_len:
             max_steps = CONFIG.max_seq_len
             
-        for pos in range(1, max_steps):
+        for pos in range(0, max_steps):
             # Layer 0 weight prefetch
             var tag_0: UInt64 = UInt64(2000)
             _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
             wait_for_tag(ring, tag_0, out_tag_ptr)
             
-            # Setup dual-hot and input activations x
+            # Setup input activations x with the dense embedding of current_token (scaled)
+            var token_emb_offset = current_token * CONFIG.embed_dim
+            var scale = sqrt(Float32(CONFIG.embed_dim))
             for i in range(CONFIG.embed_dim):
-                dual_hot[i] = 0.0
-                x[i] = 0.0
-            dual_hot[current_token] = 1.0
-            dual_hot[CONFIG.vocab_size + previous_token] = 1.0
-            x[current_token] = 1.0
-            x[CONFIG.vocab_size + previous_token] = 1.0
+                x[i] = embed_ptr[token_emb_offset + i] * scale
             
             # Run the 48 layers of Transformer forward pass
             for layer_idx in range(CONFIG.num_layers):
@@ -521,28 +493,34 @@ def main() raises:
                     
             # Check if we are still ingesting prompt or generating
             if pos < num_prompt_tokens - 1:
-                # Prompt ingestion phase: update tokens from the prompt list
-                previous_token = current_token
+                # Prompt ingestion phase: update token from prompt list
                 current_token = prompt_tokens[pos + 1]
             else:
                 # Generation phase: compute logits and select next token
                 var max_logit: Float32 = -999999.0
                 var next_token = 0
                 for r in range(CONFIG.vocab_size):
-                    var logit: Float32 = 0.0
                     var r_offset = r * CONFIG.embed_dim
-                    for c in range(CONFIG.embed_dim):
-                        logit += lm_head[r_offset + c] * dual_hot[c]
+                    
+                    var acc = SIMD[DType.float32, 8](0.0)
+                    for c in range(0, CONFIG.embed_dim, 8):
+                        acc = acc + x.load[8](c) * embed_ptr.load[8](r_offset + c)
+                    var logit = acc.reduce_add()
+                    
                     if logit > max_logit:
                         max_logit = logit
                         next_token = r
                         
                 # Print the generated token in real-time
-                var word = vocab[next_token]
-                print(word + " ", end="")
-                py.sleep(0.12)
+                var next_token_list = list_cls()
+                next_token_list.append(next_token)
+                var word = String(tokenizer.decode(next_token_list))
+                print(word, end="")
                 
-                previous_token = current_token
+                if next_token == 1 or next_token == 106: # <eos> or <turn|>
+                    print()
+                    break
+                
                 current_token = next_token
 
     print("\n---------------------------------------------------------")
@@ -551,11 +529,15 @@ def main() raises:
     # Cleanup open file handles and memory
     free_c(w_a_addr)
     free_c(w_b_addr)
+    free_c(embed_addr)
     memptr_w_a.free()
     memptr_w_b.free()
+    memptr_embed.free()
     out_tag_ptr.free()
     path_ptr.free()
+    embed_path_ptr.free()
     _ = c_close(weights_fd)
+    _ = c_close(embed_fd)
 
     # Deallocate activation memory pointers
     x.free()
@@ -572,8 +554,6 @@ def main() raises:
     ffn_out.free()
     k_cache.free()
     v_cache.free()
-    lm_head.free()
-    dual_hot.free()
 
 
     # Real weights paged via O_DIRECT are kept intact on NVMe disk.
