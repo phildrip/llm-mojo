@@ -180,6 +180,19 @@ def main():
         print(f"CRITICAL: Error detecting tensor name prefix: {e}")
         sys.exit(1)
 
+    # Always extract and write the final norm weight to 'gemma4_final_norm.bin'
+    output_norm = "gemma4_final_norm.bin"
+    print(f"Extracting final layer norm weights to {output_norm}...")
+    try:
+        norm_key = f"{prefix}norm.weight"
+        norm_weight = load_tensor_flat(norm_key)
+        norm_bytes = norm_weight.tobytes()
+        with open(output_norm, "wb") as f_norm:
+            f_norm.write(norm_bytes)
+        print(f"Success! Final layer norm written to {output_norm} ({len(norm_bytes)} bytes)")
+    except KeyError as e:
+        print(f"Warning: Could not find final layer norm '{prefix}norm.weight'. Skipping output.")
+
     if args.only_embeddings:
         output_embed = "gemma4_embed.bin"
         print(f"Extracting token embeddings to {output_embed}...")

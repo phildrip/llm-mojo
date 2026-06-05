@@ -210,15 +210,25 @@ def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_p
         out_ptr[r] = acc.reduce_add()
 
 @always_inline
-def silu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def fast_tanh(x: Float32) -> Float32:
+    if x > 15.0:
+        return 1.0
+    elif x < -15.0:
+        return -1.0
+    var e2x = exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+
+@always_inline
+def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
     for i in range(0, size, 8):
         var v1 = h1.load[8](i)
         var v2 = h2.load[8](i)
         for lane in range(8):
             var x1 = v1[lane]
             var x2 = v2[lane]
-            var silu = x1 / (1.0 + exp(-x1))
-            out_ptr[i + lane] = silu * x2
+            var tanh_arg = 0.79788456 * x1 * (1.0 + 0.044715 * x1 * x1)
+            var gelu = 0.5 * x1 * (1.0 + fast_tanh(tanh_arg))
+            out_ptr[i + lane] = gelu * x2
 
 @always_inline
 def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
@@ -378,9 +388,39 @@ def main() raises:
     print("Loaded embeddings into memory: " + String(total_read) + " bytes")
     print("---------------------------------------------------------")
 
+    # 3c. Open and Load Real Final Layer Norm weights
+    var final_norm_file = "gemma4_final_norm.bin"
+    print("Opening final norm weights file 'gemma4_final_norm.bin'...")
+    var final_norm_path_bytes = final_norm_file.as_bytes()
+    var final_norm_path_ptr = alloc[UInt8](len(final_norm_path_bytes) + 1)
+    for i in range(len(final_norm_path_bytes)):
+        final_norm_path_ptr[i] = final_norm_path_bytes[i]
+    final_norm_path_ptr[len(final_norm_path_bytes)] = 0
+
+    var final_norm_fd = c_open(final_norm_path_ptr.__int__(), 0, 0)
+    if final_norm_fd < 0:
+        print("CRITICAL: Failed to open 'gemma4_final_norm.bin' weights file!")
+        return
+
+    var final_norm_weight = alloc[Float32](CONFIG.embed_dim)
+    var final_norm_size_bytes = CONFIG.embed_dim * 4
+    total_read = 0
+    while total_read < final_norm_size_bytes:
+        var bytes_to_read = final_norm_size_bytes - total_read
+        var read_res = c_read(final_norm_fd, final_norm_weight.__int__() + total_read, bytes_to_read)
+        if read_res <= 0:
+            print("CRITICAL: Failed to read from gemma4_final_norm.bin!")
+            return
+        total_read += read_res
+    print("Loaded final norm weights into memory: " + String(total_read) + " bytes")
+    print("---------------------------------------------------------")
+    _ = c_close(final_norm_fd)
+    final_norm_path_ptr.free()
+
     # 4. Allocate Activations and Cache Buffers
     var x = alloc[Float32](CONFIG.embed_dim)
     var norm_x = alloc[Float32](CONFIG.embed_dim)
+    var final_norm_x = alloc[Float32](CONFIG.embed_dim)
     # Use max possible heads (16 query heads with 512 dim, or 8 kv heads with 256 dim) for allocations
     var q = alloc[Float32](8192) # 16 heads * 512 dim
     var k_vec = alloc[Float32](2048) # 8 heads * 256 dim
@@ -433,7 +473,8 @@ def main() raises:
         if user_input_str == "exit" or user_input_str == "quit":
             break
             
-        var encoded = tokenizer.encode(user_input_str)
+        var formatted_prompt = "<bos><|turn>user\n" + user_input_str + "<turn|>\n<|turn>model\n"
+        var encoded = tokenizer.encode(formatted_prompt, add_special_tokens=False)
         var num_encoded = len(encoded)
         if num_encoded == 0:
             print("Agent > (Please type something!)")
@@ -506,10 +547,9 @@ def main() raises:
                 for h in range(layer_kv_heads):
                     var head_ptr = k_vec + h * layer_head_dim
                     rms_norm(head_ptr, weights.k_norm_weight, head_ptr, layer_head_dim)
-                if is_global:
-                    for h in range(layer_kv_heads):
-                        var head_ptr = v_vec + h * layer_head_dim
-                        rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
+                for h in range(layer_kv_heads):
+                    var head_ptr = v_vec + h * layer_head_dim
+                    rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
                 
                 apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
                 apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
@@ -531,7 +571,7 @@ def main() raises:
                         var score: Float32 = 0.0
                         for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score / sqrt(Float32(layer_head_dim))
+                        attn_scores[t] = score
                         
                     softmax(attn_scores, pos + 1)
                     
@@ -553,7 +593,7 @@ def main() raises:
                 rms_norm(x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
                 matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim)
                 matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim)
-                silu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
+                gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim)
                 
                 # Post-feedforward normalization on MLP output
@@ -576,6 +616,8 @@ def main() raises:
                 current_token = prompt_tokens[pos + 1]
             else:
                 # Generation phase: compute logits in parallel across CPU cores and select next token
+                rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
+
                 comptime NUM_TASKS = 16
                 var chunk_size = CONFIG.vocab_size // NUM_TASKS
                 
@@ -593,8 +635,11 @@ def main() raises:
                         var r_offset = r * CONFIG.embed_dim
                         var acc = SIMD[DType.float32, 8](0.0)
                         for c in range(0, CONFIG.embed_dim, 8):
-                            acc = acc + x.load[8](c) * embed_ptr.load[8](r_offset + c)
+                            acc = acc + final_norm_x.load[8](c) * embed_ptr.load[8](r_offset + c)
                         var logit = acc.reduce_add()
+                        
+                        # Apply logit soft-capping (final_logit_softcapping = 30.0 for Gemma 4)
+                        logit = Float32(30.0) * fast_tanh(logit / Float32(30.0))
                         
                         if logit > local_max_l:
                             local_max_l = logit
@@ -647,6 +692,8 @@ def main() raises:
     # Deallocate activation memory pointers
     x.free()
     norm_x.free()
+    final_norm_x.free()
+    final_norm_weight.free()
     q.free()
     k_vec.free()
     v_vec.free()
