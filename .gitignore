@@ -4,3 +4,5 @@ scratch/
 *.bin
 *.so
 liburing/
+*.gguf
+*.log

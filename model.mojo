@@ -5,6 +5,7 @@ from std.python import Python
 import std.os
 from uring import IoUring
 from std.algorithm import parallelize
+from std.sys.info import num_physical_cores
 
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
@@ -199,15 +200,27 @@ def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float3
         out_ptr.store[8](i, v * inv_rms)
 
 @always_inline
-def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], c_in: Int, c_out: Int):
-    for r in range(c_out):
-        var acc = SIMD[DType.float32, 8](0.0)
-        var r_offset = r * c_in
-        for c in range(0, c_in, 8):
-            var w_val = W.load[8](r_offset + c)
-            var x_val = x.load[8](c)
-            acc = acc + w_val * x_val
-        out_ptr[r] = acc.reduce_add()
+def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], c_in: Int, c_out: Int, num_tasks: Int):
+    var chunk_size = c_out // num_tasks
+    
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc0 = SIMD[DType.float32, 8](0.0)
+            var acc1 = SIMD[DType.float32, 8](0.0)
+            var acc2 = SIMD[DType.float32, 8](0.0)
+            var acc3 = SIMD[DType.float32, 8](0.0)
+            var r_offset = r * c_in
+            for c in range(0, c_in, 32):
+                acc0 = acc0 + W.load[8](r_offset + c)      * x.load[8](c)
+                acc1 = acc1 + W.load[8](r_offset + c + 8)  * x.load[8](c + 8)
+                acc2 = acc2 + W.load[8](r_offset + c + 16) * x.load[8](c + 16)
+                acc3 = acc3 + W.load[8](r_offset + c + 24) * x.load[8](c + 24)
+            out_ptr[r] = (acc0 + acc1 + acc2 + acc3).reduce_add()
+            
+    parallelize[worker](num_tasks)
 
 @always_inline
 def fast_tanh(x: Float32) -> Float32:
@@ -283,6 +296,7 @@ def wait_for_tag(ring: IoUring, expected_tag: UInt64, out_tag_ptr: UnsafePointer
 # 4. Standalone Test Executable & Story Generator
 # -----------------------------------------------------------------------------
 def main() raises:
+    var num_tasks = num_physical_cores()
     print("=========================================================")
     print("   GEMMA 4 12B-SCALE DEEP TRANSCO-PROCESSOR RUNNER       ")
     print("=========================================================")
@@ -491,15 +505,201 @@ def main() raises:
             
         print("Agent > ", end="")
         
-        var current_token = prompt_tokens[0]
-        
-        # We start pos from 0 to the end of ingestion + 30 generation steps
+        var current_token: Int
         var num_prompt_tokens = len(prompt_tokens)
         var max_steps = num_prompt_tokens + 30
         if max_steps > CONFIG.max_seq_len:
             max_steps = CONFIG.max_seq_len
             
-        for pos in range(0, max_steps):
+        var scale = sqrt(Float32(CONFIG.embed_dim))
+        
+        # 1. Prefill phase: process all prompt tokens layer-by-layer
+        # This streams/pages each layer weights from NVMe EXACTLY ONCE!
+        var t_prefill_start = py.time()
+        var prompt_x = alloc[Float32](num_prompt_tokens * CONFIG.embed_dim)
+        for pos in range(num_prompt_tokens):
+            var token_emb_offset = prompt_tokens[pos] * CONFIG.embed_dim
+            var px_offset = pos * CONFIG.embed_dim
+            for i in range(CONFIG.embed_dim):
+                prompt_x[px_offset + i] = embed_ptr[token_emb_offset + i] * scale
+                
+        # Load Layer 0 weights before the layer loop
+        var tag_0: UInt64 = UInt64(8000)
+        _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
+        wait_for_tag(ring, tag_0, out_tag_ptr)
+
+        for layer_idx in range(CONFIG.num_layers):
+            var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
+            var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
+            
+            # Prefetch next layer's weights
+            if layer_idx + 1 < CONFIG.num_layers:
+                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
+                var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
+                var size_next = CONFIG.get_layer_aligned_size(layer_idx + 1)
+                _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), size_next, offset_next, tag_next)
+                
+            var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr.bitcast[Float32]())
+            var is_global = CONFIG.is_global_layer(layer_idx)
+            var layer_heads = 16
+            var layer_kv_heads = 1 if is_global else 8
+            var layer_head_dim = 512 if is_global else 256
+            var kv_stride = layer_kv_heads * layer_head_dim
+            var ratio = layer_heads // layer_kv_heads
+            
+            # Loop over all prompt positions
+            for pos in range(num_prompt_tokens):
+                var px_offset = pos * CONFIG.embed_dim
+                var local_x = prompt_x + px_offset
+                
+                # Setup norm_x
+                rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                
+                # Compute q, k
+                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                
+                if is_global:
+                    for i in range(kv_stride):
+                        v_vec[i] = k_vec[i]
+                else:
+                    matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    
+                # Apply head-wise RMS normalization
+                for h in range(layer_heads):
+                    var head_ptr = q + h * layer_head_dim
+                    rms_norm(head_ptr, weights.q_norm_weight, head_ptr, layer_head_dim)
+                for h in range(layer_kv_heads):
+                    var head_ptr = k_vec + h * layer_head_dim
+                    rms_norm(head_ptr, weights.k_norm_weight, head_ptr, layer_head_dim)
+                for h in range(layer_kv_heads):
+                    var head_ptr = v_vec + h * layer_head_dim
+                    rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
+                    
+                apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
+                apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                
+                var layer_cache_offset = layer_cache_offsets[layer_idx]
+                var step_cache_offset = layer_cache_offset + pos * kv_stride
+                for i in range(kv_stride):
+                    k_cache[step_cache_offset + i] = k_vec[i]
+                    v_cache[step_cache_offset + i] = v_vec[i]
+                    
+                for h in range(layer_heads):
+                    var h_offset = h * layer_head_dim
+                    var g = h // ratio
+                    var g_offset = g * layer_head_dim
+                    
+                    for t in range(pos + 1):
+                        var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                        var score: Float32 = 0.0
+                        for d in range(layer_head_dim):
+                            score += q[h_offset + d] * k_cache[t_cache_offset + d]
+                        attn_scores[t] = score
+                        
+                    softmax(attn_scores, pos + 1)
+                    
+                    for d in range(layer_head_dim):
+                        var val_sum: Float32 = 0.0
+                        for t in range(pos + 1):
+                            var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                            val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
+                        attn_out[h_offset + d] = val_sum
+                        
+                matmul_vec(weights.wo, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
+                
+                # Post-attention normalization on projected attention output
+                rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
+                for i in range(CONFIG.embed_dim):
+                    local_x[i] += proj_attn_out[i]
+                    
+                # Pre-feedforward normalization
+                rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
+                matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
+                gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
+                matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
+                
+                # Post-feedforward normalization on MLP output
+                rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
+                for i in range(CONFIG.embed_dim):
+                    local_x[i] += ffn_out[i]
+                    
+                # Scale hidden state by layer_scalar
+                var scalar = weights.layer_scalar[0]
+                for i in range(CONFIG.embed_dim):
+                    local_x[i] *= scalar
+
+            if layer_idx + 1 < CONFIG.num_layers:
+                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
+                wait_for_tag(ring, tag_next, out_tag_ptr)
+
+        # Copy the last prompt token's hidden state to x
+        var last_px_offset = (num_prompt_tokens - 1) * CONFIG.embed_dim
+        for i in range(CONFIG.embed_dim):
+            x[i] = prompt_x[last_px_offset + i]
+        prompt_x.free()
+        
+        var t_prefill_end = py.time()
+        var prefill_time = Float64(py=(t_prefill_end - t_prefill_start))
+        print("\n[Mojo Bench] Prefill completed in", prefill_time, "sec (" + String(Float64(num_prompt_tokens) / prefill_time) + " t/s)")
+        
+        # 2. Setup parallel projection worker and select first generated token
+        rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
+
+        # Uses the pre-detected core count (num_tasks) to compute chunk_size for vocabulary projection
+        var chunk_size = CONFIG.vocab_size // num_tasks
+        
+        var local_max_logits = alloc[Float32](num_tasks)
+        var local_next_tokens = alloc[Int](num_tasks)
+        
+        def proj_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else CONFIG.vocab_size
+            
+            var local_max_l: Float32 = -999999.0
+            var local_tok = 0
+            
+            for r in range(start_r, end_r):
+                var r_offset = r * CONFIG.embed_dim
+                var acc = SIMD[DType.float32, 8](0.0)
+                for c in range(0, CONFIG.embed_dim, 8):
+                    acc = acc + final_norm_x.load[8](c) * embed_ptr.load[8](r_offset + c)
+                var logit = acc.reduce_add()
+                
+                # Apply logit soft-capping (30.0 for Gemma 4)
+                logit = Float32(30.0) * fast_tanh(logit / Float32(30.0))
+                
+                if logit > local_max_l:
+                    local_max_l = logit
+                    local_tok = r
+                    
+            local_max_logits[t] = local_max_l
+            local_next_tokens[t] = local_tok
+            
+        parallelize[proj_worker](num_tasks)
+        
+        # Reduce to find global max
+        var max_logit: Float32 = -999999.0
+        var next_token = 0
+        for t in range(num_tasks):
+            if local_max_logits[t] > max_logit:
+                max_logit = local_max_logits[t]
+                next_token = local_next_tokens[t]
+                
+        # Print the first generated token
+        var next_token_list = list_cls()
+        _ = next_token_list.append(next_token)
+        var decoded = tokenizer.decode(next_token_list)
+        print(decoded, end="")
+        sys.stdout.flush()
+        
+        current_token = next_token
+        
+        # 3. Subsequent generation steps
+        var tokens_generated = 1
+        var t_gen_start = py.time()
+        for pos in range(num_prompt_tokens, max_steps):
             # Layer 0 weight prefetch
             var tag_0: UInt64 = UInt64(2000)
             _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
@@ -507,10 +707,9 @@ def main() raises:
             
             # Setup input activations x with the dense embedding of current_token (scaled)
             var token_emb_offset = current_token * CONFIG.embed_dim
-            var scale = sqrt(Float32(CONFIG.embed_dim))
             for i in range(CONFIG.embed_dim):
                 x[i] = embed_ptr[token_emb_offset + i] * scale
-            
+                
             # Run the 48 layers of Transformer forward pass
             for layer_idx in range(CONFIG.num_layers):
                 var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
@@ -531,15 +730,15 @@ def main() raises:
                 var layer_head_dim = 512 if is_global else 256
                 var kv_stride = layer_kv_heads * layer_head_dim
                 
-                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim)
-                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                matmul_vec(weights.wq, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                matmul_vec(weights.wk, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                 
                 if is_global:
                     for i in range(kv_stride):
                         v_vec[i] = k_vec[i]
                 else:
-                    matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
-                
+                    matmul_vec(weights.wv, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    
                 # Apply head-wise RMS normalization
                 for h in range(layer_heads):
                     var head_ptr = q + h * layer_head_dim
@@ -550,7 +749,7 @@ def main() raises:
                 for h in range(layer_kv_heads):
                     var head_ptr = v_vec + h * layer_head_dim
                     rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
-                
+                    
                 apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
                 apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
                 
@@ -582,7 +781,7 @@ def main() raises:
                             val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
                         attn_out[h_offset + d] = val_sum
                         
-                matmul_vec(weights.wo, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim)
+                matmul_vec(weights.wo, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                 
                 # Post-attention normalization on projected attention output
                 rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -591,16 +790,16 @@ def main() raises:
                     
                 # Pre-feedforward normalization
                 rms_norm(x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-                matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim)
-                matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim)
+                matmul_vec(weights.w1, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
+                matmul_vec(weights.w3, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-                matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim)
+                matmul_vec(weights.w2, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
                 for i in range(CONFIG.embed_dim):
                     x[i] += ffn_out[i]
-                
+                    
                 # Scale hidden state by layer_scalar
                 var scalar = weights.layer_scalar[0]
                 for i in range(CONFIG.embed_dim):
@@ -610,68 +809,39 @@ def main() raises:
                     var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
                     wait_for_tag(ring, tag_next, out_tag_ptr)
                     
-            # Check if we are still ingesting prompt or generating
-            if pos < num_prompt_tokens - 1:
-                # Prompt ingestion phase: update token from prompt list
-                current_token = prompt_tokens[pos + 1]
-            else:
-                # Generation phase: compute logits in parallel across CPU cores and select next token
-                rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
-
-                comptime NUM_TASKS = 16
-                var chunk_size = CONFIG.vocab_size // NUM_TASKS
-                
-                var local_max_logits = alloc[Float32](NUM_TASKS)
-                var local_next_tokens = alloc[Int](NUM_TASKS)
-                
-                def proj_worker(t: Int) capturing -> None:
-                    var start_r = t * chunk_size
-                    var end_r = (t + 1) * chunk_size if t < NUM_TASKS - 1 else CONFIG.vocab_size
+            # Predict the next token
+            rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
+            
+            parallelize[proj_worker](num_tasks)
+            
+            # Reduce to find global max
+            max_logit = -999999.0
+            next_token = 0
+            for t in range(num_tasks):
+                if local_max_logits[t] > max_logit:
+                    max_logit = local_max_logits[t]
+                    next_token = local_next_tokens[t]
                     
-                    var local_max_l: Float32 = -999999.0
-                    var local_tok = 0
-                    
-                    for r in range(start_r, end_r):
-                        var r_offset = r * CONFIG.embed_dim
-                        var acc = SIMD[DType.float32, 8](0.0)
-                        for c in range(0, CONFIG.embed_dim, 8):
-                            acc = acc + final_norm_x.load[8](c) * embed_ptr.load[8](r_offset + c)
-                        var logit = acc.reduce_add()
-                        
-                        # Apply logit soft-capping (final_logit_softcapping = 30.0 for Gemma 4)
-                        logit = Float32(30.0) * fast_tanh(logit / Float32(30.0))
-                        
-                        if logit > local_max_l:
-                            local_max_l = logit
-                            local_tok = r
-                            
-                    local_max_logits[t] = local_max_l
-                    local_next_tokens[t] = local_tok
-                    
-                parallelize[proj_worker](NUM_TASKS)
+            # Print the generated token in real-time
+            var next_token_list_inner = list_cls()
+            _ = next_token_list_inner.append(next_token)
+            var word = String(tokenizer.decode(next_token_list_inner))
+            print(word, end="")
+            sys.stdout.flush()
+            
+            if next_token == 1 or next_token == 106: # <eos> or <turn|>
+                print()
+                break
                 
-                # Reduce to find global max
-                var max_logit: Float32 = -999999.0
-                var next_token = 0
-                for t in range(NUM_TASKS):
-                    if local_max_logits[t] > max_logit:
-                        max_logit = local_max_logits[t]
-                        next_token = local_next_tokens[t]
-                        
-                local_max_logits.free()
-                local_next_tokens.free()
-                
-                # Print the generated token in real-time
-                var next_token_list = list_cls()
-                next_token_list.append(next_token)
-                var word = String(tokenizer.decode(next_token_list))
-                print(word, end="")
-                
-                if next_token == 1 or next_token == 106: # <eos> or <turn|>
-                    print()
-                    break
-                
-                current_token = next_token
+            current_token = next_token
+            tokens_generated += 1
+            
+        var t_gen_end = py.time()
+        var gen_time = Float64(py=(t_gen_end - t_gen_start))
+        print("\n[Mojo Bench] Generation completed in", gen_time, "sec (" + String(Float64(tokens_generated) / gen_time) + " t/s)")
+        
+        local_max_logits.free()
+        local_next_tokens.free()
 
     print("\n---------------------------------------------------------")
     print("Inference generation loop complete!")
