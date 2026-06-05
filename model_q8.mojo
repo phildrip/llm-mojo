@@ -278,38 +278,88 @@ def q8_matmul_vec(
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
+    threshold: Float32 = 0.0,
 ):
-    var chunk_size = c_out // num_tasks
     var c_in_blocks = c_in // 32
     
-    def worker(t: Int) capturing -> None:
-        var start_r = t * chunk_size
-        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+    if threshold > 0.0:
+        var active_blocks = List[Int]()
+        for b in range(c_in_blocks):
+            var active = False
+            var x_offset = b * 32
+            for i in range(32):
+                if abs(x[x_offset + i]) > threshold:
+                    active = True
+                    break
+            if active:
+                active_blocks.append(b)
+                
+        var num_active = len(active_blocks)
+        if num_active == 0:
+            for r in range(c_out):
+                out_ptr[r] = 0.0
+            return
+            
+        var chunk_size = c_out // num_tasks
         
-        for r in range(start_r, end_r):
-            var acc = SIMD[DType.float32, 8](0.0)
+        def sparse_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
             
-            var r_offset_packed = r * c_in
-            var r_offset_scales = r * c_in_blocks
+            for r in range(start_r, end_r):
+                var acc = SIMD[DType.float32, 8](0.0)
+                var r_offset_packed = r * c_in
+                var r_offset_scales = r * c_in_blocks
+                
+                for idx in range(num_active):
+                    var b = active_blocks[idx]
+                    var scale = scales[r_offset_scales + b]
+                    var block_p = r_offset_packed + b * 32
+                    var x_offset = b * 32
+                    
+                    var w0 = W_packed.load[8](block_p).cast[DType.float32]()
+                    var w1 = W_packed.load[8](block_p + 8).cast[DType.float32]()
+                    var w2 = W_packed.load[8](block_p + 16).cast[DType.float32]()
+                    var w3 = W_packed.load[8](block_p + 24).cast[DType.float32]()
+                    
+                    acc = acc + (w0 * x.load[8](x_offset)) * scale
+                    acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                    acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                    acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                    
+                out_ptr[r] = acc.reduce_add()
+                
+        parallelize[sparse_worker](num_tasks)
+    else:
+        var chunk_size = c_out // num_tasks
+        
+        def dense_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
             
-            for b in range(c_in_blocks):
-                var scale = scales[r_offset_scales + b]
-                var block_p = r_offset_packed + b * 32
-                var x_offset = b * 32
+            for r in range(start_r, end_r):
+                var acc = SIMD[DType.float32, 8](0.0)
+                var r_offset_packed = r * c_in
+                var r_offset_scales = r * c_in_blocks
                 
-                var w0 = W_packed.load[8](block_p).cast[DType.float32]()
-                var w1 = W_packed.load[8](block_p + 8).cast[DType.float32]()
-                var w2 = W_packed.load[8](block_p + 16).cast[DType.float32]()
-                var w3 = W_packed.load[8](block_p + 24).cast[DType.float32]()
+                for b in range(c_in_blocks):
+                    var scale = scales[r_offset_scales + b]
+                    var block_p = r_offset_packed + b * 32
+                    var x_offset = b * 32
+                    
+                    var w0 = W_packed.load[8](block_p).cast[DType.float32]()
+                    var w1 = W_packed.load[8](block_p + 8).cast[DType.float32]()
+                    var w2 = W_packed.load[8](block_p + 16).cast[DType.float32]()
+                    var w3 = W_packed.load[8](block_p + 24).cast[DType.float32]()
+                    
+                    acc = acc + (w0 * x.load[8](x_offset)) * scale
+                    acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                    acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                    acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                    
+                out_ptr[r] = acc.reduce_add()
                 
-                acc = acc + (w0 * x.load[8](x_offset)) * scale
-                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
-                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
-                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
-                
-            out_ptr[r] = acc.reduce_add()
-            
-    parallelize[worker](num_tasks)
+        parallelize[dense_worker](num_tasks)
 
 @always_inline
 def fast_tanh(x: Float32) -> Float32:
@@ -709,7 +759,7 @@ def main() raises:
                 q8_matmul_vec(weights.w1_packed, weights.w1_scales, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
+                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -884,7 +934,7 @@ def main() raises:
                 q8_matmul_vec(weights.w1_packed, weights.w1_scales, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
+                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
