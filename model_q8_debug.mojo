@@ -389,9 +389,35 @@ def print_stats(name: String, ptr: UnsafePointer[Float32, _], size: Int):
         var v = ptr[i]
         if v < min_val: min_val = v
         if v > max_val: max_val = v
-        sum_val += v
     var mean_val = sum_val / Float32(size)
     print(name + " -> min: " + String(min_val) + ", max: " + String(max_val) + ", mean: " + String(mean_val))
+
+def print_sparsity(name: String, ptr: UnsafePointer[Float32, _], size: Int):
+    var exact_zeros: Int = 0
+    var below_1e5: Int = 0
+    var below_1e4: Int = 0
+    var below_1e3: Int = 0
+    var below_1e2: Int = 0
+    for i in range(size):
+        var v = abs(ptr[i])
+        if v == 0.0:
+            exact_zeros += 1
+        if v < 1e-5:
+            below_1e5 += 1
+        if v < 1e-4:
+            below_1e4 += 1
+        if v < 1e-3:
+            below_1e3 += 1
+        if v < 1e-2:
+            below_1e2 += 1
+            
+    var exact_pct = Float32(exact_zeros) / Float32(size) * 100.0
+    var e5_pct = Float32(below_1e5) / Float32(size) * 100.0
+    var e4_pct = Float32(below_1e4) / Float32(size) * 100.0
+    var e3_pct = Float32(below_1e3) / Float32(size) * 100.0
+    var e2_pct = Float32(below_1e2) / Float32(size) * 100.0
+    print("  [Sparsity] " + name + " -> Exact Zeros: " + String(exact_zeros) + " (" + String(exact_pct) + "%), <1e-5: " + String(e5_pct) + "%, <1e-4: " + String(e4_pct) + "%, <1e-3: " + String(e3_pct) + "%, <1e-2: " + String(e2_pct) + "%")
+
 
 # -----------------------------------------------------------------------------
 # 4. Standalone Test Executable & Story Generator
@@ -736,6 +762,7 @@ def main() raises:
                     print_stats("L" + String(layer_idx) + "P0 h1", h1, CONFIG.intermediate_dim)
                     print_stats("L" + String(layer_idx) + "P0 h2", h2, CONFIG.intermediate_dim)
                     print_stats("L" + String(layer_idx) + "P0 ffn_out_gate", ffn_out_gate, CONFIG.intermediate_dim)
+                    print_sparsity("L" + String(layer_idx) + "P0 ffn_out_gate", ffn_out_gate, CONFIG.intermediate_dim)
                     print_stats("L" + String(layer_idx) + "P0 ffn_out", ffn_out, CONFIG.embed_dim)
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
