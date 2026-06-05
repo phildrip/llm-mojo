@@ -289,7 +289,7 @@ def wait_for_tag(ring: IoUring, expected_tag: UInt64, out_tag_ptr: UnsafePointer
             if out_tag_ptr[0] == expected_tag:
                 return
         attempts += 1
-        if attempts > 30000000:
+        if attempts > 5000000000:
             raise Error("Weights paging I/O timed out waiting for layer: " + String(expected_tag))
 
 # -----------------------------------------------------------------------------

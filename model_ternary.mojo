@@ -720,12 +720,13 @@ def main() raises:
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
                     
+                    var scale = 1.0 / sqrt(Float32(layer_head_dim))
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
                         for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score
+                        attn_scores[t] = score * scale
                         
                     softmax(attn_scores, pos + 1)
                     
@@ -895,12 +896,13 @@ def main() raises:
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
                     
+                    var scale = 1.0 / sqrt(Float32(layer_head_dim))
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
                         for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score
+                        attn_scores[t] = score * scale
                         
                     softmax(attn_scores, pos + 1)
                     

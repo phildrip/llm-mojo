@@ -127,16 +127,31 @@ def quantize_and_pack_matrix(
             var r_offset_src = r * c_in
             var r_offset_dest = r * c_in_packed
             
-            # Compute absmean of the row
+            # TWN-style thresholding preserves the row's large-weight support
+            # better than rounding every value against the all-weight absmean.
             var sum_abs: Float32 = 0.0
             for c in range(c_in):
                 sum_abs += abs(src_ptr[r_offset_src + c])
-            var scale = sum_abs / Float32(c_in)
+            var mean_abs = sum_abs / Float32(c_in)
+            var threshold = mean_abs * 0.7
+            if threshold < 1e-5:
+                threshold = 1e-5
+            
+            var selected_abs: Float32 = 0.0
+            var selected_count = 0
+            for c in range(c_in):
+                var v_abs = abs(src_ptr[r_offset_src + c])
+                if v_abs > threshold:
+                    selected_abs += v_abs
+                    selected_count += 1
+                    
+            var scale = mean_abs
+            if selected_count > 0:
+                scale = selected_abs / Float32(selected_count)
             if scale < 1e-5:
                 scale = 1e-5
             dest_scales_ptr[r] = scale
             
-            var inv_scale = 1.0 / scale
             for c_packed in range(c_in_packed):
                 var c_orig = c_packed * 4
                 var v0 = src_ptr[r_offset_src + c_orig]
@@ -144,11 +159,10 @@ def quantize_and_pack_matrix(
                 var v2 = src_ptr[r_offset_src + c_orig + 2]
                 var v3 = src_ptr[r_offset_src + c_orig + 3]
                 
-                # Math.round (floor with 0.5 offset)
-                var q0 = Int(max(Float32(-1.0), min(Float32(1.0), Float32(Int(v0 * inv_scale + 0.5 if v0 * inv_scale >= 0.0 else v0 * inv_scale - 0.5))))) + 1
-                var q1 = Int(max(Float32(-1.0), min(Float32(1.0), Float32(Int(v1 * inv_scale + 0.5 if v1 * inv_scale >= 0.0 else v1 * inv_scale - 0.5))))) + 1
-                var q2 = Int(max(Float32(-1.0), min(Float32(1.0), Float32(Int(v2 * inv_scale + 0.5 if v2 * inv_scale >= 0.0 else v2 * inv_scale - 0.5))))) + 1
-                var q3 = Int(max(Float32(-1.0), min(Float32(1.0), Float32(Int(v3 * inv_scale + 0.5 if v3 * inv_scale >= 0.0 else v3 * inv_scale - 0.5))))) + 1
+                var q0 = 2 if v0 > threshold else (0 if v0 < -threshold else 1)
+                var q1 = 2 if v1 > threshold else (0 if v1 < -threshold else 1)
+                var q2 = 2 if v2 > threshold else (0 if v2 < -threshold else 1)
+                var q3 = 2 if v3 > threshold else (0 if v3 < -threshold else 1)
                 
                 dest_packed_ptr[r_offset_dest + c_packed] = UInt8(q0 | (q1 << 2) | (q2 << 4) | (q3 << 6))
                 
@@ -206,8 +220,6 @@ def main() raises:
             q_norm_size + k_norm_size + layer_scalar_size
         )
         
-        # Calculate aligned bytes to read
-        var raw_bytes_size = total_floats * 4
         var aligned_bytes_size = CONFIG.get_layer_aligned_size(i)
         
         print("Layer ", i, "/", CONFIG.num_layers, " (", "global" if is_global else "sliding", ")...", end="")
