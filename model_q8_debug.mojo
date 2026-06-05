@@ -25,6 +25,54 @@ struct TransformerConfig[
         return layer_idx % 6 == 5
 
     @always_inline
+    def get_w2_offset_in_layer(self, layer_idx: Int) -> Int:
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 1 if is_global else 8
+        
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
+        var w1_size = Self.intermediate_dim * Self.embed_dim
+        var w3_size = Self.intermediate_dim * Self.embed_dim
+        
+        var packed_weights_size = wq_size + wk_size + wv_size + wo_size + w1_size + w3_size
+        var scales_count = packed_weights_size // 32
+        var scales_size_bytes = scales_count * 4
+        
+        var input_layernorm_size = Self.embed_dim
+        var post_attention_layernorm_size = Self.embed_dim
+        var pre_feedforward_layernorm_size = Self.embed_dim
+        var post_feedforward_layernorm_size = Self.embed_dim
+        var q_norm_size = layer_head_dim
+        var k_norm_size = layer_head_dim
+        var layer_scalar_size = 1
+        
+        var unchanged_size_bytes = (
+            input_layernorm_size + post_attention_layernorm_size +
+            pre_feedforward_layernorm_size + post_feedforward_layernorm_size +
+            q_norm_size + k_norm_size + layer_scalar_size
+        ) * 4
+        
+        var raw_bytes_size = packed_weights_size + scales_size_bytes + unchanged_size_bytes
+        return ((raw_bytes_size + 4095) // 4096) * 4096
+
+    @always_inline
+    def get_layer_aligned_size(self, layer_idx: Int) -> Int:
+        var base_offset = self.get_w2_offset_in_layer(layer_idx)
+        var w2_blocks = Self.intermediate_dim // 32
+        var w2_size = w2_blocks * 139264
+        return base_offset + w2_size
+
+    def get_layer_offset(self, layer_idx: Int) -> Int:
+        var offset = 0
+        for i in range(layer_idx):
+            offset += self.get_layer_aligned_size(i)
+        return offset
+
+    @always_inline
     def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[Int8, _]) -> Q8LayerWeights:
         var is_global = self.is_global_layer(layer_idx)
         var layer_heads = 16
@@ -36,7 +84,6 @@ struct TransformerConfig[
         var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
         var wo_size = Self.embed_dim * layer_heads * layer_head_dim
         var w1_size = Self.intermediate_dim * Self.embed_dim
-        var w2_size = Self.embed_dim * Self.intermediate_dim
         var w3_size = Self.intermediate_dim * Self.embed_dim
         
         var wq_size_bytes = wq_size
@@ -44,7 +91,6 @@ struct TransformerConfig[
         var wv_size_bytes = wv_size
         var wo_size_bytes = wo_size
         var w1_size_bytes = w1_size
-        var w2_size_bytes = w2_size
         var w3_size_bytes = w3_size
         
         var c_blocks_q = wq_size // 32
@@ -52,7 +98,6 @@ struct TransformerConfig[
         var c_blocks_v = wv_size // 32
         var c_blocks_o = wo_size // 32
         var c_blocks_w1 = w1_size // 32
-        var c_blocks_w2 = w2_size // 32
         var c_blocks_w3 = w3_size // 32
 
         # Pointers to packed weights (Int8)
@@ -65,8 +110,7 @@ struct TransformerConfig[
             wo_packed = wv_packed + wv_size_bytes
             
         var w1_packed = wo_packed + wo_size_bytes
-        var w2_packed = w1_packed + w1_size_bytes
-        var w3_packed = w2_packed + w2_size_bytes
+        var w3_packed = w1_packed + w1_size_bytes
         
         # Scales base address: immediately after the end of w3_packed
         var scales_base = (w3_packed + w3_size_bytes).bitcast[Float32]()
@@ -80,8 +124,7 @@ struct TransformerConfig[
             wo_scales = wv_scales + c_blocks_v
             
         var w1_scales = wo_scales + c_blocks_o
-        var w2_scales = w1_scales + c_blocks_w1
-        var w3_scales = w2_scales + c_blocks_w2
+        var w3_scales = w1_scales + c_blocks_w1
         
         # Unchanged Float32 parameters base address: immediately after the end of w3_scales
         var unchanged_base = w3_scales + c_blocks_w3
@@ -93,6 +136,10 @@ struct TransformerConfig[
         var q_norm = post_feedforward_layernorm + Self.embed_dim
         var k_norm = q_norm + layer_head_dim
         var layer_scalar = k_norm + layer_head_dim
+        
+        # Resolve w2 pointers using new layout at end of layer
+        var w2_packed = base_ptr + self.get_w2_offset_in_layer(layer_idx)
+        var w2_scales = (w2_packed + 122880).bitcast[Float32]()
         
         return Q8LayerWeights(
             UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=wq_packed.__int__()),
@@ -117,52 +164,6 @@ struct TransformerConfig[
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_norm.__int__()),
             UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=layer_scalar.__int__()),
         )
-
-    @always_inline
-    def get_layer_aligned_size(self, layer_idx: Int) -> Int:
-        var is_global = self.is_global_layer(layer_idx)
-        var layer_heads = 16
-        var layer_head_dim = 512 if is_global else 256
-        var layer_kv_heads = 1 if is_global else 8
-        
-        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
-        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
-        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
-        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
-        var w1_size = Self.intermediate_dim * Self.embed_dim
-        var w2_size = Self.embed_dim * Self.intermediate_dim
-        var w3_size = Self.intermediate_dim * Self.embed_dim
-        
-        # Packed Q8 weights: 1 element per byte
-        var packed_weights_size = wq_size + wk_size + wv_size + wo_size + w1_size + w2_size + w3_size
-        
-        # Scale factors (1 per block of 32 elements)
-        var scales_count = (wq_size + wk_size + wv_size + wo_size + w1_size + w2_size + w3_size) // 32
-        var scales_size_bytes = scales_count * 4
-        
-        # Float32 unchanged weights
-        var input_layernorm_size = Self.embed_dim
-        var post_attention_layernorm_size = Self.embed_dim
-        var pre_feedforward_layernorm_size = Self.embed_dim
-        var post_feedforward_layernorm_size = Self.embed_dim
-        var q_norm_size = layer_head_dim
-        var k_norm_size = layer_head_dim
-        var layer_scalar_size = 1
-        
-        var unchanged_size_bytes = (
-            input_layernorm_size + post_attention_layernorm_size +
-            pre_feedforward_layernorm_size + post_feedforward_layernorm_size +
-            q_norm_size + k_norm_size + layer_scalar_size
-        ) * 4
-        
-        var raw_bytes_size = packed_weights_size + scales_size_bytes + unchanged_size_bytes
-        return ((raw_bytes_size + 4095) // 4096) * 4096
-
-    def get_layer_offset(self, layer_idx: Int) -> Int:
-        var offset = 0
-        for i in range(layer_idx):
-            offset += self.get_layer_aligned_size(i)
-        return offset
 
     def __init__(out self):
         pass
@@ -360,6 +361,67 @@ def q8_matmul_vec(
                 out_ptr[r] = acc.reduce_add()
                 
         parallelize[dense_worker](num_tasks)
+
+@always_inline
+def q8_matmul_w2_block_column(
+    W_packed: UnsafePointer[Int8, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    threshold: Float32 = 1e-4,
+):
+    var c_in_blocks = c_in // 32
+    
+    var active_blocks = List[Int]()
+    for b in range(c_in_blocks):
+        var active = False
+        var x_offset = b * 32
+        for i in range(32):
+            if abs(x[x_offset + i]) > threshold:
+                active = True
+                break
+        if active:
+            active_blocks.append(b)
+            
+    var num_active = len(active_blocks)
+    if num_active == 0:
+        for r in range(c_out):
+            out_ptr[r] = 0.0
+        return
+        
+    var chunk_size = c_out // num_tasks
+    
+    def sparse_worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc = SIMD[DType.float32, 8](0.0)
+            
+            for idx in range(num_active):
+                var b = active_blocks[idx]
+                var block_base = W_packed + b * 139264
+                var block_scales = (block_base + 122880).bitcast[Float32]()
+                
+                var scale = block_scales[r]
+                var block_p = block_base + r * 32
+                var x_offset = b * 32
+                
+                var w0 = block_p.load[8]().cast[DType.float32]()
+                var w1 = block_p.load[8](8).cast[DType.float32]()
+                var w2 = block_p.load[8](16).cast[DType.float32]()
+                var w3 = block_p.load[8](24).cast[DType.float32]()
+                
+                acc = acc + (w0 * x.load[8](x_offset)) * scale
+                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                
+            out_ptr[r] = acc.reduce_add()
+            
+    parallelize[sparse_worker](num_tasks)
 
 @always_inline
 def fast_tanh(x: Float32) -> Float32:
@@ -699,9 +761,9 @@ def main() raises:
             for i in range(CONFIG.embed_dim):
                 prompt_x[px_offset + i] = embed_ptr[token_emb_offset + i] * scale
                 
-        # Load Layer 0 weights before the layer loop
+        # Load Layer 0 weights before the layer loop (stable base only)
         var tag_0: UInt64 = UInt64(8000)
-        var ret_val = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
+        var ret_val = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0), 0, tag_0)
         if ret_val < 0:
             print("CRITICAL: submit_read failed with error: ", ret_val)
         wait_for_tag(ring, tag_0, out_tag_ptr)
@@ -710,11 +772,11 @@ def main() raises:
             var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
             var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
             
-            # Prefetch next layer's weights
+            # Prefetch next layer's weights (stable base only!)
             if layer_idx + 1 < CONFIG.num_layers:
                 var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
                 var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
-                var size_next = CONFIG.get_layer_aligned_size(layer_idx + 1)
+                var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
                 _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), size_next, offset_next, tag_next)
                 
             var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
@@ -724,6 +786,8 @@ def main() raises:
             var layer_head_dim = 512 if is_global else 256
             var kv_stride = layer_kv_heads * layer_head_dim
             var ratio = layer_heads // layer_kv_heads
+            
+            var next_layer_completed = False
             
             # Loop over all prompt positions
             for pos in range(num_prompt_tokens):
@@ -807,7 +871,47 @@ def main() raises:
                 q8_matmul_vec(weights.w1_packed, weights.w1_scales, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                
+                # Dynamic W2 disk-skipping block paging via io_uring
+                var num_blocks = CONFIG.intermediate_dim // 32
+                var num_active = 0
+                var layer_offset = CONFIG.get_layer_offset(layer_idx)
+                var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
+                var tag_base_for_w2: UInt64 = 100000 + UInt64(layer_idx) * 1000 + UInt64(pos) * 1000000
+                
+                for b in range(num_blocks):
+                    var block_offset_gate = b * 32
+                    var block_active = False
+                    for c in range(32):
+                        if abs(ffn_out_gate[block_offset_gate + c]) > 1e-4:
+                            block_active = True
+                            break
+                    if block_active:
+                        var block_offset_in_file = layer_offset + w2_offset_in_layer + b * 139264
+                        var dest_mem_addr = weights.w2_packed.__int__() + b * 139264
+                        var tag_block = tag_base_for_w2 + UInt64(b)
+                        _ = ring.submit_read(weights_fd, dest_mem_addr, 139264, block_offset_in_file, tag_block)
+                        num_active += 1
+                        
+                # Wait for all active W2 block reads to complete
+                var completed_active = 0
+                var attempts = 0
+                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
+                
+                while completed_active < num_active:
+                    var res = ring.poll_completion(out_tag_ptr.__int__())
+                    if res >= 0:
+                        var t = out_tag_ptr[0]
+                        if t >= tag_base_for_w2 and t < tag_base_for_w2 + 480:
+                            completed_active += 1
+                        elif t == tag_next:
+                            next_layer_completed = True
+                    attempts += 1
+                    if attempts > 1000000000:
+                        raise Error("Prefill weights paging I/O timed out waiting for sparse W2 blocks")
+                        
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                
                 if (layer_idx == 0 or layer_idx == 12 or layer_idx == 24 or layer_idx == 36 or layer_idx == 47) and pos == 0:
                     print_stats("L" + String(layer_idx) + "P0 h1", h1, CONFIG.intermediate_dim)
                     print_stats("L" + String(layer_idx) + "P0 h2", h2, CONFIG.intermediate_dim)
@@ -827,8 +931,9 @@ def main() raises:
                     print_stats("L" + String(layer_idx) + "P0 local_x_out", local_x, CONFIG.embed_dim)
 
             if layer_idx + 1 < CONFIG.num_layers:
-                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
-                wait_for_tag(ring, tag_next, out_tag_ptr)
+                if not next_layer_completed:
+                    var tag_next_val: UInt64 = UInt64(8000 + layer_idx + 1)
+                    wait_for_tag(ring, tag_next_val, out_tag_ptr)
 
         # Copy the last prompt token's hidden state to x
         var last_px_offset = (num_prompt_tokens - 1) * CONFIG.embed_dim
@@ -895,9 +1000,9 @@ def main() raises:
         var tokens_generated = 1
         var t_gen_start = py.time()
         for pos in range(num_prompt_tokens, max_steps):
-            # Layer 0 weight prefetch
+            # Layer 0 weight prefetch (stable base only!)
             var tag_0: UInt64 = UInt64(2000)
-            _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_layer_aligned_size(0), 0, tag_0)
+            _ = ring.submit_read(weights_fd, w_a_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0), 0, tag_0)
             wait_for_tag(ring, tag_0, out_tag_ptr)
             
             # Setup input activations x with the dense embedding of current_token (scaled)
@@ -910,14 +1015,16 @@ def main() raises:
                 var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
                 var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
                 
+                # Prefetch next layer's weights (stable base only!)
                 if layer_idx + 1 < CONFIG.num_layers:
                     var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
                     var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
-                    var size_next = CONFIG.get_layer_aligned_size(layer_idx + 1)
+                    var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
                     _ = ring.submit_read(weights_fd, next_weights_ptr.__int__(), size_next, offset_next, tag_next)
                     
                 var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
                 var is_global = CONFIG.is_global_layer(layer_idx)
+                var next_layer_completed = False
                 rms_norm(x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
                 var layer_heads = 16
@@ -989,7 +1096,46 @@ def main() raises:
                 q8_matmul_vec(weights.w1_packed, weights.w1_scales, norm_x, h1, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
-                q8_matmul_vec(weights.w2_packed, weights.w2_scales, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                
+                # Dynamic W2 disk-skipping block paging via io_uring
+                var num_blocks = CONFIG.intermediate_dim // 32
+                var num_active = 0
+                var layer_offset = CONFIG.get_layer_offset(layer_idx)
+                var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
+                var tag_base_for_w2: UInt64 = 200000 + UInt64(layer_idx) * 1000
+                
+                for b in range(num_blocks):
+                    var block_offset_gate = b * 32
+                    var block_active = False
+                    for c in range(32):
+                        if abs(ffn_out_gate[block_offset_gate + c]) > 1e-4:
+                            block_active = True
+                            break
+                    if block_active:
+                        var block_offset_in_file = layer_offset + w2_offset_in_layer + b * 139264
+                        var dest_mem_addr = weights.w2_packed.__int__() + b * 139264
+                        var tag_block = tag_base_for_w2 + UInt64(b)
+                        _ = ring.submit_read(weights_fd, dest_mem_addr, 139264, block_offset_in_file, tag_block)
+                        num_active += 1
+                        
+                # Wait for all active W2 block reads to complete
+                var completed_active = 0
+                var attempts = 0
+                var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
+                
+                while completed_active < num_active:
+                    var res = ring.poll_completion(out_tag_ptr.__int__())
+                    if res >= 0:
+                        var t = out_tag_ptr[0]
+                        if t >= tag_base_for_w2 and t < tag_base_for_w2 + 480:
+                            completed_active += 1
+                        elif t == tag_next:
+                            next_layer_completed = True
+                    attempts += 1
+                    if attempts > 1000000000:
+                        raise Error("Decode weights paging I/O timed out waiting for sparse W2 blocks")
+                        
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -1002,8 +1148,9 @@ def main() raises:
                     x[i] *= scalar
                     
                 if layer_idx + 1 < CONFIG.num_layers:
-                    var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
-                    wait_for_tag(ring, tag_next, out_tag_ptr)
+                    if not next_layer_completed:
+                        var tag_next_val: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
+                        wait_for_tag(ring, tag_next_val, out_tag_ptr)
                     
             # Predict the next token
             rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
