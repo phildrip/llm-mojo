@@ -6,3 +6,4 @@ scratch/
 liburing/
 *.gguf
 *.log
+/convert_weights

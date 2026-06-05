@@ -116,6 +116,62 @@ def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_p
             
     parallelize[worker](num_tasks)
 
+@always_inline
+def unpack_2bytes(b0: UInt8, b1: UInt8) -> SIMD[DType.float32, 8]:
+    return SIMD[DType.float32, 8](
+        Float32(Int(b0 & 3) - 1),
+        Float32(Int((b0 >> 2) & 3) - 1),
+        Float32(Int((b0 >> 4) & 3) - 1),
+        Float32(Int((b0 >> 6) & 3) - 1),
+        Float32(Int(b1 & 3) - 1),
+        Float32(Int((b1 >> 2) & 3) - 1),
+        Float32(Int((b1 >> 4) & 3) - 1),
+        Float32(Int((b1 >> 6) & 3) - 1)
+    )
+
+@always_inline
+def ternary_matmul_vec(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    c_in: Int,
+    c_out: Int,
+):
+    var num_tasks = num_physical_cores()
+    var chunk_size = c_out // num_tasks
+    var c_in_packed = c_in // 4
+    
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc0 = SIMD[DType.float32, 8](0.0)
+            var acc1 = SIMD[DType.float32, 8](0.0)
+            var acc2 = SIMD[DType.float32, 8](0.0)
+            var acc3 = SIMD[DType.float32, 8](0.0)
+            
+            var r_offset_packed = r * c_in_packed
+            for c in range(0, c_in_packed, 8):
+                var p = W_packed.load[8](r_offset_packed + c)
+                
+                var w0 = unpack_2bytes(p[0], p[1])
+                var w1 = unpack_2bytes(p[2], p[3])
+                var w2 = unpack_2bytes(p[4], p[5])
+                var w3 = unpack_2bytes(p[6], p[7])
+                
+                var x_offset = c * 4
+                acc0 = acc0 + w0 * x.load[8](x_offset)
+                acc1 = acc1 + w1 * x.load[8](x_offset + 8)
+                acc2 = acc2 + w2 * x.load[8](x_offset + 16)
+                acc3 = acc3 + w3 * x.load[8](x_offset + 24)
+                
+            var row_sum = (acc0 + acc1 + acc2 + acc3).reduce_add()
+            out_ptr[r] = row_sum * scales[r]
+            
+    parallelize[worker](num_tasks)
+
 # -----------------------------------------------------------------------------
 # Unit Test Suite
 # -----------------------------------------------------------------------------
@@ -475,6 +531,73 @@ def test_matmul_vec() raises:
     out_ptr.free()
     print("test_matmul_vec passed!")
 
+def test_ternary_matmul_vec() raises:
+    print("Running test_ternary_matmul_vec...")
+    var np = Python.import_module("numpy")
+    var c_in = 3840
+    var c_out = 128
+    var c_in_packed = c_in // 4
+    
+    # 1. Setup random inputs in Float32
+    var w_np = np.random.randn(c_out, c_in).astype(np.float32) * 0.05
+    var x_np = np.random.randn(c_in).astype(np.float32)
+    
+    # 2. Do row-wise (absmean) quantization and packing in Python (vectorized)
+    var scales_np = np.mean(np.abs(w_np), axis=1).reshape(c_out, 1)
+    scales_np = np.maximum(scales_np, 1e-5)
+    
+    var w_quant_np = np.round(w_np / scales_np)
+    w_quant_np = np.clip(w_quant_np, -1.0, 1.0).astype(np.int32)
+    
+    # Map {-1, 0, 1} to {0, 1, 2}
+    var w_mapped_np = w_quant_np + 1
+    
+    # Pack 4 ternary weights per byte using .take(index, axis=2) and arithmetic to avoid slice parser issues
+    var w_reshaped_np = w_mapped_np.reshape(c_out, c_in_packed, 4)
+    var w0 = w_reshaped_np.take(0, axis=2)
+    var w1 = w_reshaped_np.take(1, axis=2)
+    var w2 = w_reshaped_np.take(2, axis=2)
+    var w3 = w_reshaped_np.take(3, axis=2)
+    var packed_np = (w0 + w1 * 4 + w2 * 16 + w3 * 64).astype(np.uint8)
+    
+    # 3. Reference quantized Float32 matrix (W_quant * scale)
+    var w_ref_np = w_quant_np.astype(np.float32) * scales_np
+    var expected_np = np.dot(w_ref_np, x_np)
+    
+    # 4. Allocate Mojo memory & transfer values
+    var w_packed_ptr = alloc[UInt8](c_out * c_in_packed)
+    var scales_ptr = alloc[Float32](c_out)
+    var x_ptr = alloc[Float32](c_in)
+    var out_ptr = alloc[Float32](c_out)
+    
+    for r in range(c_out):
+        for c in range(c_in_packed):
+            w_packed_ptr[r * c_in_packed + c] = UInt8(Int(py=packed_np[r, c]))
+            
+    for r in range(c_out):
+        scales_ptr[r] = Float32(Float64(py=scales_np[r, 0]))
+        
+    for c in range(c_in):
+        x_ptr[c] = Float32(Float64(py=x_np[c]))
+        
+    # 5. Run Mojo quantized ternary kernel
+    ternary_matmul_vec(w_packed_ptr, scales_ptr, x_ptr, out_ptr, c_in, c_out)
+    
+    # 6. Verify correct matrix-vector multiplication results
+    for r in range(c_out):
+        var expected = Float32(Float64(py=expected_np[r]))
+        var actual = out_ptr[r]
+        var diff = abs(expected - actual)
+        if diff > 1e-4:
+            print("Mismatch at row", r, "Expected:", expected, "Actual:", actual)
+            raise Error("ternary_matmul_vec output mismatch")
+            
+    w_packed_ptr.free()
+    scales_ptr.free()
+    x_ptr.free()
+    out_ptr.free()
+    print("test_ternary_matmul_vec passed!")
+
 def main() raises:
     print("=========================================================")
     print("               GEMMA 4 KERNEL TEST SUITE                 ")
@@ -488,6 +611,7 @@ def main() raises:
     test_logit_softcapping()
     test_block_compression()
     test_matmul_vec()
+    test_ternary_matmul_vec()
     print("=========================================================")
     print("        ALL KERNEL MATH TESTS PASSED SUCCESSFULLY!       ")
     print("=========================================================")
