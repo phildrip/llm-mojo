@@ -7,3 +7,5 @@ liburing/
 *.gguf
 *.log
 /convert_weights
+/model_ternary
+
