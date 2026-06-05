@@ -554,8 +554,8 @@ def main() raises:
     var w_b_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w_b_addr)
 
     # 3. Open converted real weights file on NVMe with O_DIRECT
-    var weights_file = "gemma4_weights_q8.bin"
-    print("Opening converted weights file 'gemma4_weights_q8.bin' with O_DIRECT read-only...")
+    var weights_file = "gemma4_weights_q8_sorted.bin"
+    print("Opening converted weights file 'gemma4_weights_q8_sorted.bin' with O_DIRECT read-only...")
     
     var path_bytes = weights_file.as_bytes()
     var path_ptr = alloc[UInt8](len(path_bytes) + 1)
@@ -566,7 +566,7 @@ def main() raises:
     var weights_fd = c_open(path_ptr.__int__(), 16384, 0)
     
     if weights_fd < 0:
-        print("CRITICAL: Failed to open 'gemma4_weights_q8.bin' weights file with O_DIRECT. Make sure you converted weights first!")
+        print("CRITICAL: Failed to open 'gemma4_weights_q8_sorted.bin' weights file with O_DIRECT. Make sure you converted weights first!")
         return
     else:
         var total_size = CONFIG.get_layer_offset(CONFIG.num_layers)
@@ -824,14 +824,15 @@ def main() raises:
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
-                # Dynamic W2 disk-skipping block paging via io_uring
+                # Contiguous sequential W2 paging via io_uring (prefix reading)
                 var num_blocks = CONFIG.intermediate_dim // 32
-                var num_active = 0
                 var layer_offset = CONFIG.get_layer_offset(layer_idx)
                 var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
                 var tag_base_for_w2: UInt64 = 100000 + UInt64(layer_idx) * 1000 + UInt64(pos) * 1000000
                 
-                for b in range(num_blocks):
+                # Scan from right to left to find highest active block N
+                var max_active_block: Int = -1
+                for b in range(num_blocks - 1, -1, -1):
                     var block_offset_gate = b * 32
                     var block_active = False
                     for c in range(32):
@@ -839,12 +840,17 @@ def main() raises:
                             block_active = True
                             break
                     if block_active:
-                        var block_offset_in_file = layer_offset + w2_offset_in_layer + b * 139264
-                        var dest_mem_addr = weights.w2_packed.__int__() + b * 139264
-                        var tag_block = tag_base_for_w2 + UInt64(b)
-                        _ = ring.submit_read(weights_fd, dest_mem_addr, 139264, block_offset_in_file, tag_block)
-                        num_active += 1
+                        max_active_block = b
+                        break
                         
+                var num_active = 0
+                if max_active_block >= 0:
+                    num_active = 1
+                    var size_to_read = (max_active_block + 1) * 139264
+                    var block_offset_in_file = layer_offset + w2_offset_in_layer
+                    var dest_mem_addr = weights.w2_packed.__int__()
+                    _ = ring.submit_read(weights_fd, dest_mem_addr, size_to_read, block_offset_in_file, tag_base_for_w2)
+                    
                 # Wait for all active W2 block reads to complete
                 var completed_active = 0
                 var attempts = 0
@@ -854,7 +860,7 @@ def main() raises:
                     var res = ring.poll_completion(out_tag_ptr.__int__())
                     if res >= 0:
                         var t = out_tag_ptr[0]
-                        if t >= tag_base_for_w2 and t < tag_base_for_w2 + 480:
+                        if t == tag_base_for_w2:
                             completed_active += 1
                         elif t == tag_next:
                             next_layer_completed = True
@@ -1041,14 +1047,15 @@ def main() raises:
                 q8_matmul_vec(weights.w3_packed, weights.w3_scales, norm_x, h2, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
-                # Dynamic W2 disk-skipping block paging via io_uring
+                # Contiguous sequential W2 paging via io_uring (prefix reading)
                 var num_blocks = CONFIG.intermediate_dim // 32
-                var num_active = 0
                 var layer_offset = CONFIG.get_layer_offset(layer_idx)
                 var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
                 var tag_base_for_w2: UInt64 = 200000 + UInt64(layer_idx) * 1000
                 
-                for b in range(num_blocks):
+                # Scan from right to left to find highest active block N
+                var max_active_block: Int = -1
+                for b in range(num_blocks - 1, -1, -1):
                     var block_offset_gate = b * 32
                     var block_active = False
                     for c in range(32):
@@ -1056,12 +1063,17 @@ def main() raises:
                             block_active = True
                             break
                     if block_active:
-                        var block_offset_in_file = layer_offset + w2_offset_in_layer + b * 139264
-                        var dest_mem_addr = weights.w2_packed.__int__() + b * 139264
-                        var tag_block = tag_base_for_w2 + UInt64(b)
-                        _ = ring.submit_read(weights_fd, dest_mem_addr, 139264, block_offset_in_file, tag_block)
-                        num_active += 1
+                        max_active_block = b
+                        break
                         
+                var num_active = 0
+                if max_active_block >= 0:
+                    num_active = 1
+                    var size_to_read = (max_active_block + 1) * 139264
+                    var block_offset_in_file = layer_offset + w2_offset_in_layer
+                    var dest_mem_addr = weights.w2_packed.__int__()
+                    _ = ring.submit_read(weights_fd, dest_mem_addr, size_to_read, block_offset_in_file, tag_base_for_w2)
+                    
                 # Wait for all active W2 block reads to complete
                 var completed_active = 0
                 var attempts = 0
@@ -1071,7 +1083,7 @@ def main() raises:
                     var res = ring.poll_completion(out_tag_ptr.__int__())
                     if res >= 0:
                         var t = out_tag_ptr[0]
-                        if t >= tag_base_for_w2 and t < tag_base_for_w2 + 480:
+                        if t == tag_base_for_w2:
                             completed_active += 1
                         elif t == tag_next:
                             next_layer_completed = True

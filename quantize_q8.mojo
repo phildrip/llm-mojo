@@ -221,14 +221,24 @@ def main() raises:
     print("=========================================================")
     print("Target Cores: ", num_tasks)
     print("Input File:   gemma4_weights.bin")
-    print("Output File:  gemma4_weights_q8.bin")
+    print("Output File:  gemma4_weights_q8_sorted.bin")
     print("---------------------------------------------------------")
     
     var builtins = Python.import_module("builtins")
     var np = Python.import_module("numpy")
     
+    # Load activation profiles
+    print("Loading activation profiles from scratch/ffn_activation_profiles.bin...")
+    var profiles_raw = builtins.open("scratch/ffn_activation_profiles.bin", "rb").read()
+    var profiles_np = np.frombuffer(profiles_raw, dtype=np.float32)
+    print("Activation profiles loaded successfully. Size:", len(profiles_np))
+    print("---------------------------------------------------------")
+    var reshape_and_copy = Python.evaluate("lambda arr, start, size, rows, cols: arr[start : start + size].reshape(rows, cols).copy()")
+    var permute_rows = Python.evaluate("lambda w, perm: w[perm].copy()")
+    var permute_cols = Python.evaluate("lambda w, perm: w[:, perm].copy()")
+    
     var f_in = builtins.open("gemma4_weights.bin", "rb")
-    var f_out = builtins.open("gemma4_weights_q8.bin", "wb")
+    var f_out = builtins.open("gemma4_weights_q8_sorted.bin", "wb")
     
     for i in range(CONFIG.num_layers):
         var is_global = CONFIG.is_global_layer(i)
@@ -263,19 +273,22 @@ def main() raises:
         
         var aligned_bytes_size = CONFIG.get_layer_aligned_size(i)
         
-        print("Layer ", i, "/", CONFIG.num_layers, " (", "global" if is_global else "sliding", ")...", end="")
+        print("Layer ", i, "/", CONFIG.num_layers, " (", "global" if is_global else "sliding", ")...")
         
         # Read the entire aligned layer block as Python bytes
         var raw_bytes = f_in.read(aligned_bytes_size)
+        print("  - Read bytes successfully. Size:", len(raw_bytes))
         
         # Convert first total_floats of it to NumPy float32 array
         var layer_np = np.frombuffer(raw_bytes, dtype=np.float32, count=total_floats)
+        print("  - NumPy buffer converted. Size:", len(layer_np))
         
         # Get actual memory address of this Float32 array
         var addr = Int(py=layer_np.__array_interface__["data"][0])
+        print("  - Memory address:", addr)
         var base_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=addr)
         
-        # Get sub-pointers for dense matrices
+        # Get sub-pointers for original dense matrices
         var wq_ptr = base_ptr
         var wk_ptr = wq_ptr + wq_size
         var wv_ptr = wk_ptr
@@ -284,9 +297,38 @@ def main() raises:
             wv_ptr = wk_ptr + wk_size
             wo_ptr = wv_ptr + wv_size
             
-        var w1_ptr = wo_ptr + wo_size
-        var w2_ptr = w1_ptr + w1_size
-        var w3_ptr = w2_ptr + w2_size
+        # Slice the original layer_np to extract FFN weights, then permute them
+        var w1_offset_floats = wq_size + wk_size + wv_size + wo_size
+        var w2_offset_floats = w1_offset_floats + w1_size
+        var w3_offset_floats = w2_offset_floats + w2_size
+        print("  - Offsets calculated: w1=", w1_offset_floats, ", w2=", w2_offset_floats, ", w3=", w3_offset_floats)
+        
+        # Load the activation profile permutation for this layer
+        var layer_profile = profiles_np[i * CONFIG.intermediate_dim : (i + 1) * CONFIG.intermediate_dim]
+        print("  - layer_profile sliced. Size:", len(layer_profile))
+        # argsort in descending order
+        var perm_indices = np.argsort(layer_profile)[::-1]
+        print("  - perm_indices argsort done. Size:", len(perm_indices))
+        
+        var w1_np = reshape_and_copy(layer_np, w1_offset_floats, w1_size, CONFIG.intermediate_dim, CONFIG.embed_dim)
+        print("  - w1_np reshaped and copied.")
+        var w2_np = reshape_and_copy(layer_np, w2_offset_floats, w2_size, CONFIG.embed_dim, CONFIG.intermediate_dim)
+        print("  - w2_np reshaped and copied.")
+        var w3_np = reshape_and_copy(layer_np, w3_offset_floats, w3_size, CONFIG.intermediate_dim, CONFIG.embed_dim)
+        print("  - w3_np reshaped and copied.")
+        
+        # Apply the permutation index to rows of w1/w3 and columns of w2
+        var w1_perm_np = permute_rows(w1_np, perm_indices)
+        print("  - w1 permuted successfully.")
+        var w2_perm_np = permute_cols(w2_np, perm_indices)
+        print("  - w2 permuted successfully.")
+        var w3_perm_np = permute_rows(w3_np, perm_indices)
+        print("  - w3 permuted successfully.")
+        
+        # Obtain unsafe pointers to the permuted float matrices
+        var w1_perm_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(py=w1_perm_np.__array_interface__["data"][0]))
+        var w2_perm_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(py=w2_perm_np.__array_interface__["data"][0]))
+        var w3_perm_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(py=w3_perm_np.__array_interface__["data"][0]))
         
         # Get sub-pointer to full-precision weights (unchanged)
         var unchanged_floats = (
@@ -341,10 +383,10 @@ def main() raises:
         if not is_global:
             quantize_and_pack_matrix(wv_ptr, wv_packed_ptr, wv_scales_ptr, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
         quantize_and_pack_matrix(wo_ptr, wo_packed_ptr, wo_scales_ptr, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
-        quantize_and_pack_matrix(w1_ptr, w1_packed_ptr, w1_scales_ptr, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
-        quantize_and_pack_matrix(w3_ptr, w3_packed_ptr, w3_scales_ptr, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
+        quantize_and_pack_matrix(w1_perm_ptr, w1_packed_ptr, w1_scales_ptr, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
+        quantize_and_pack_matrix(w3_perm_ptr, w3_packed_ptr, w3_scales_ptr, CONFIG.embed_dim, CONFIG.intermediate_dim, num_tasks)
         
-        quantize_and_pack_w2_block_column(w2_ptr, w2_padded_ptr, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
+        quantize_and_pack_w2_block_column(w2_perm_ptr, w2_padded_ptr, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
         
         # 3. Create unchanged float32 numpy slice to write out directly
         var unchanged_np = np.frombuffer(raw_bytes, dtype=np.float32, count=unchanged_floats, offset=(total_floats - unchanged_floats) * 4)
@@ -368,9 +410,24 @@ def main() raises:
         var aligned_out_size = CONFIG.get_quantized_layer_aligned_size(i)
         print(" Done. (Aligned Size: ", aligned_out_size, " bytes)")
         
+        # Keep Python references alive during parallel C/Mojo quantization kernels
+        _ = w1_perm_np
+        _ = w2_perm_np
+        _ = w3_perm_np
+        _ = w1_np
+        _ = w2_np
+        _ = w3_np
+        _ = layer_np
+        _ = raw_bytes
+        _ = packed_stable_np
+        _ = scales_stable_np
+        _ = w2_padded_np
+        _ = unchanged_np
+
+        
     f_in.close()
     f_out.close()
     print("=========================================================")
     print(" QUANTIZATION COMPLETED SUCCESSFULLY!")
-    print(" Quantized weights written to: gemma4_weights_q8.bin")
+    print(" Quantized weights written to: gemma4_weights_q8_sorted.bin")
     print("=========================================================")
