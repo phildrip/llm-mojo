@@ -722,18 +722,25 @@ def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], o
 
 @always_inline
 def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
-    if is_global:
-        return
+    var half_dim = head_dim // 2
+    var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
+    var rope_dim = 512 if is_global else 256
+    
     for h in range(num_heads):
         var h_offset = h * head_dim
-        for i in range(0, head_dim // 2):
-            var theta = Float32(pos) / (10000.0 ** (Float32(2 * i) / Float32(head_dim)))
-            var cos_val = cos(theta)
-            var sin_val = sin(theta)
-            var v0 = vec[h_offset + i]
-            var v1 = vec[h_offset + head_dim // 2 + i]
-            vec[h_offset + i] = v0 * cos_val - v1 * sin_val
-            vec[h_offset + head_dim // 2 + i] = v0 * sin_val + v1 * cos_val
+        for i in range(half_dim):
+            var theta: Float32 = 0.0
+            if (not is_global) or (i < 64):
+                theta = Float32(pos) / (base ** (Float32(2 * i) / Float32(rope_dim)))
+                
+            var cos_theta = cos(theta)
+            var sin_theta = sin(theta)
+            
+            var val1 = vec[h_offset + i]
+            var val2 = vec[h_offset + half_dim + i]
+            
+            vec[h_offset + i] = val1 * cos_theta - val2 * sin_theta
+            vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
 
 @always_inline
 def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
@@ -985,7 +992,7 @@ def main() raises:
     var draft_ffn_out = alloc[Float32](DRAFT_CONFIG.embed_dim)
 
     # Common target activations (can validation-batch up to K+1 tokens sequentially inside layer loops)
-    comptime K_MAX = 4
+    comptime K_MAX = 5
     var target_x_seq = alloc[Float32]((K_MAX + 1) * TARGET_CONFIG.embed_dim)
     var target_norm_x = alloc[Float32](TARGET_CONFIG.embed_dim)
     var target_q = alloc[Float32](8192)
@@ -1105,7 +1112,6 @@ def main() raises:
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
-                    
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
@@ -1356,8 +1362,12 @@ def main() raises:
         var tokens_generated = 1
         var t_gen_start = py.time()
         
+        var current_K = 4
+        var total_accepted = 0
+        var total_speculative_steps = 0
+        
         while pos < max_steps:
-            var K_actual = K_MAX
+            var K_actual = current_K
             if pos + K_actual >= max_steps:
                 K_actual = max_steps - pos - 1
             if K_actual <= 0:
@@ -1417,7 +1427,6 @@ def main() raises:
                         var h_offset = h * layer_head_dim
                         var g = h // ratio
                         var g_offset = g * layer_head_dim
-                        
                         for t in range(pos + j + 1):
                             var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                             var score: Float32 = 0.0
@@ -1678,6 +1687,7 @@ def main() raises:
             # D. Speculative Verification Decision
             var num_accepted = 0
             for s in range(K_actual):
+                print("[Debug Spec] s =", s, " Target:", target_predictions[s], " Draft Proposed:", draft_tokens[s + 1])
                 if target_predictions[s] == draft_tokens[s + 1]:
                     num_accepted += 1
                 else:
@@ -1698,6 +1708,16 @@ def main() raises:
             var decoded = tokenizer.decode(next_token_list)
             py_builtins.print(decoded, end="", flush=True)
             
+            # Record metrics
+            total_accepted += num_accepted
+            total_speculative_steps += 1
+
+            # Dynamic Speculation Depth (K-Tuning)
+            if num_accepted == K_actual:
+                current_K = min(current_K + 1, K_MAX)
+            elif num_accepted <= 1:
+                current_K = max(current_K - 1, 1)
+
             # Commit steps & rollback position pointer
             pos = pos + num_accepted + 1
             tokens_generated += num_accepted + 1
@@ -1706,3 +1726,5 @@ def main() raises:
         var t_gen_end = py.time()
         var gen_time = Float64(py=(t_gen_end - t_gen_start))
         print("\n[Mojo Bench] Speculative generation completed in", gen_time, "sec (" + String(Float64(tokens_generated) / gen_time) + " t/s)")
+        if total_speculative_steps > 0:
+            print("[Mojo Bench] Speculative acceptance rate: ", Float64(total_accepted) / Float64(total_speculative_steps * K_MAX) * 100.0, "% (Avg accepted: ", Float64(total_accepted) / Float64(total_speculative_steps), " tokens per step)")

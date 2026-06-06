@@ -3,7 +3,7 @@ from std.memory import alloc
 from std.testing import assert_equal
 from std.python import Python
 from std.algorithm import parallelize
-from std.math import min, max
+from std.math import min, max, sqrt
 
 # -----------------------------------------------------------------------------
 # Transformer Config & Sizing Math
@@ -130,24 +130,25 @@ def quantize_and_pack_matrix(
             # TWN-style thresholding preserves the row's large-weight support
             # better than rounding every value against the all-weight absmean.
             var sum_abs: Float32 = 0.0
+            var sum_sq: Float32 = 0.0
             for c in range(c_in):
-                sum_abs += abs(src_ptr[r_offset_src + c])
+                var val = src_ptr[r_offset_src + c]
+                sum_abs += abs(val)
+                sum_sq += val * val
             var mean_abs = sum_abs / Float32(c_in)
             var threshold = mean_abs * 0.7
             if threshold < 1e-5:
                 threshold = 1e-5
             
-            var selected_abs: Float32 = 0.0
             var selected_count = 0
             for c in range(c_in):
                 var v_abs = abs(src_ptr[r_offset_src + c])
                 if v_abs > threshold:
-                    selected_abs += v_abs
                     selected_count += 1
                     
             var scale = mean_abs
             if selected_count > 0:
-                scale = selected_abs / Float32(selected_count)
+                scale = sqrt(sum_sq / Float32(selected_count))
             if scale < 1e-5:
                 scale = 1e-5
             dest_scales_ptr[r] = scale
