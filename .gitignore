@@ -22,3 +22,4 @@ liburing/
 /quantize_q4
 /quantize_q8
 comparison_results.txt
+/model_speculative

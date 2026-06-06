@@ -298,16 +298,11 @@ def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_p
 
 @always_inline
 def unpack_2bytes(b0: UInt8, b1: UInt8) -> SIMD[DType.float32, 8]:
-    return SIMD[DType.float32, 8](
-        Float32(Int(b0 & 3) - 1),
-        Float32(Int((b0 >> 2) & 3) - 1),
-        Float32(Int((b0 >> 4) & 3) - 1),
-        Float32(Int((b0 >> 6) & 3) - 1),
-        Float32(Int(b1 & 3) - 1),
-        Float32(Int((b1 >> 2) & 3) - 1),
-        Float32(Int((b1 >> 4) & 3) - 1),
-        Float32(Int((b1 >> 6) & 3) - 1)
-    )
+    var b = SIMD[DType.uint8, 8](b0, b0, b0, b0, b1, b1, b1, b1)
+    var shifts = SIMD[DType.uint8, 8](0, 2, 4, 6, 0, 2, 4, 6)
+    var shifted = b >> shifts
+    var masked = shifted & 3
+    return masked.cast[DType.float32]() - 1.0
 
 @always_inline
 def ternary_matmul_vec(

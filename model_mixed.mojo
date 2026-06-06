@@ -448,22 +448,11 @@ def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_p
 
 @always_inline
 def unpack_2bytes(b0: UInt8, b1: UInt8) -> SIMD[DType.float32, 8]:
-    # Unpack 2 bytes (representing 8 ternary elements) into a Float32 SIMD vector
-    # Map {0, 1, 2} back to {-1.0, 0.0, 1.0}
-    var map_q0 = Float32(Int(b0 & 0x03) - 1)
-    var map_q1 = Float32(Int((b0 >> 2) & 0x03) - 1)
-    var map_q2 = Float32(Int((b0 >> 4) & 0x03) - 1)
-    var map_q3 = Float32(Int((b0 >> 6) & 0x03) - 1)
-    
-    var map_q4 = Float32(Int(b1 & 0x03) - 1)
-    var map_q5 = Float32(Int((b1 >> 2) & 0x03) - 1)
-    var map_q6 = Float32(Int((b1 >> 4) & 0x03) - 1)
-    var map_q7 = Float32(Int((b1 >> 6) & 0x03) - 1)
-    
-    return SIMD[DType.float32, 8](
-        map_q0, map_q1, map_q2, map_q3,
-        map_q4, map_q5, map_q6, map_q7
-    )
+    var b = SIMD[DType.uint8, 8](b0, b0, b0, b0, b1, b1, b1, b1)
+    var shifts = SIMD[DType.uint8, 8](0, 2, 4, 6, 0, 2, 4, 6)
+    var shifted = b >> shifts
+    var masked = shifted & 3
+    return masked.cast[DType.float32]() - 1.0
 
 @always_inline
 def ternary_matmul_vec(
