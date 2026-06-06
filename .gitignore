@@ -23,3 +23,5 @@ liburing/
 /quantize_q8
 comparison_results.txt
 /model_speculative
+/model_q8_ram
+
