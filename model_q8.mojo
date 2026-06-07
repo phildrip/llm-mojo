@@ -526,7 +526,7 @@ def main() raises:
     var free_c = libc.get_function[def(Int) -> NoneType]("free")
     var py = Python.import_module("time")
     var sys = Python.import_module("sys")
-    sys.path.append("/home/phil/git/llm-mojo/.venv/lib/python3.12/site-packages")
+    # sys.path.append("/home/phil/git/llm-mojo/.venv/lib/python3.12/site-packages")
     var transformers = Python.import_module("transformers")
     print("Loading Gemma 4 tokenizer...")
     var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
