@@ -1322,7 +1322,7 @@ def main() raises:
     var k_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_vec_buf.cpu_addr)
     var v_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=v_vec_buf.cpu_addr)
     
-    var attn_scores = alloc[Float32](CONFIG.max_seq_len)
+    var attn_scores = alloc[Float32](CONFIG.num_heads * CONFIG.max_seq_len)
     var attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=attn_out_buf.cpu_addr)
     var proj_attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=proj_attn_out_buf.cpu_addr)
     var h1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=h1_buf.cpu_addr)
@@ -1452,26 +1452,34 @@ def main() raises:
                     k_cache[step_cache_offset + i] = k_vec[i]
                     v_cache[step_cache_offset + i] = v_vec[i]
                     
-                for h in range(layer_heads):
+                @parameter
+                fn prefill_head_worker(h: Int) capturing -> None:
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
+                    var head_scores = attn_scores + h * CONFIG.max_seq_len
                     
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                        var score: Float32 = 0.0
-                        for d in range(layer_head_dim):
-                            score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score
+                        var score_vec = SIMD[DType.float32, 16](0.0)
+                        for d in range(0, layer_head_dim, 16):
+                            score_vec += q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
+                        head_scores[t] = score_vec.reduce_add()
                         
-                    softmax(attn_scores, pos + 1)
+                    softmax(head_scores, pos + 1)
                     
-                    for d in range(layer_head_dim):
-                        var val_sum: Float32 = 0.0
-                        for t in range(pos + 1):
-                            var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                            val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
-                        attn_out[h_offset + d] = val_sum
+                    for d in range(0, layer_head_dim, 16):
+                        attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
+                        
+                    for t in range(pos + 1):
+                        var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                        var s_vec = SIMD[DType.float32, 16](head_scores[t])
+                        for d in range(0, layer_head_dim, 16):
+                            var v = v_cache.load[16](t_cache_offset + d)
+                            var acc = attn_out.load[16](h_offset + d)
+                            attn_out.store[16](h_offset + d, acc + s_vec * v)
+                        
+                parallelize[prefill_head_worker](layer_heads)
                         
                 # Compute wo on GPU!
                 gpu_ctx.launch_matmul(weights.wo_packed.__int__(), weights.wo_scales.__int__(), attn_out.__int__(), proj_attn_out.__int__(), layer_heads * layer_head_dim, CONFIG.embed_dim)
@@ -1612,26 +1620,35 @@ def main() raises:
                     v_cache[step_cache_offset + i] = v_vec[i]
                     
                 var ratio = layer_heads // layer_kv_heads
-                for h in range(layer_heads):
+                @parameter
+                fn gen_head_worker(h: Int) capturing -> None:
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
+                    var head_scores = attn_scores + h * CONFIG.max_seq_len
                     
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                        var score: Float32 = 0.0
-                        for d in range(layer_head_dim):
-                            score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score
+                        var score_vec = SIMD[DType.float32, 16](0.0)
+                        for d in range(0, layer_head_dim, 16):
+                            score_vec += q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
+                        head_scores[t] = score_vec.reduce_add()
                         
-                    softmax(attn_scores, pos + 1)
+                    softmax(head_scores, pos + 1)
                     
-                    for d in range(layer_head_dim):
-                        var val_sum: Float32 = 0.0
-                        for t in range(pos + 1):
-                            var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                            val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
-                        attn_out[h_offset + d] = val_sum
+                    for d in range(0, layer_head_dim, 16):
+                        attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
+                        
+                    for t in range(pos + 1):
+                        var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                        var s_vec = SIMD[DType.float32, 16](head_scores[t])
+                        for d in range(0, layer_head_dim, 16):
+                            var v = v_cache.load[16](t_cache_offset + d)
+                            var acc = attn_out.load[16](h_offset + d)
+                            attn_out.store[16](h_offset + d, acc + s_vec * v)
+                        
+                for h in range(layer_heads):
+                    gen_head_worker(h)
                         
                 # Compute wo on GPU!
                 gpu_ctx.launch_matmul(weights.wo_packed.__int__(), weights.wo_scales.__int__(), attn_out.__int__(), proj_attn_out.__int__(), layer_heads * layer_head_dim, CONFIG.embed_dim)
