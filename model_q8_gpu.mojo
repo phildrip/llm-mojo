@@ -1050,7 +1050,7 @@ def main() raises:
     print("Embedding Size:      3840")
     print("Attention Heads:     16 Query Heads / 8 KV Heads (GQA/MQA)")
     print("Model Parameters:    12B Scale Causal Layout")
-    print("Kernel Paging I/O:   Linux io_uring (Direct NVMe double-buf)")
+    print("Kernel Paging I/O:   Fully Synchronous DRAM-to-GTT Cache")
     print("Hardware Accelerator: AMD Cezanne Vega iGPU (Direct Userspace)")
     print("---------------------------------------------------------")
 
@@ -1186,26 +1186,48 @@ def main() raises:
     var w_a_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w_a_buf.cpu_addr)
     var w_b_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w_b_buf.cpu_addr)
 
-    print(" -> Allocating double-buffered page-aligned Host RAM weight buffers...")
-    var memptr_w_a = alloc[Int](1)
-    var memptr_w_b = alloc[Int](1)
-    _ = posix_memalign(memptr_w_a.__int__(), 4096, max_layer_bytes)
-    _ = posix_memalign(memptr_w_b.__int__(), 4096, max_layer_bytes)
-    var w_a_host_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=memptr_w_a[0])
-    var w_b_host_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=memptr_w_b[0])
+    # Allocate and load the ENTIRE quantized Q8 weights into contiguous system RAM (12.29 GB)
+    var total_weights_size = CONFIG.get_layer_offset(CONFIG.num_layers)
+    print("Allocating memory for 12.29 GB Q8 weights in contiguous RAM...")
+    var memptr_weights = alloc[Int](1)
+    var alloc_res = posix_memalign(memptr_weights.__int__(), 4096, total_weights_size)
+    if alloc_res != 0:
+        print("CRITICAL: Failed to allocate aligned memory for weights!")
+        return
+        
+    var weights_addr = memptr_weights[0]
+    var weights_ram_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=weights_addr)
 
-    # Open converted weights file with O_DIRECT
     var weights_file = "gemma4_weights_q8_sorted.bin"
-    print("Opening converted weights file 'gemma4_weights_q8_sorted.bin' with O_DIRECT read-only...")
+    print("Opening weights file 'gemma4_weights_q8_sorted.bin'...")
     var path_bytes = weights_file.as_bytes()
     var path_ptr = alloc[UInt8](len(path_bytes) + 1)
     for i in range(len(path_bytes)):
         path_ptr[i] = path_bytes[i]
     path_ptr[len(path_bytes)] = 0
-    var weights_fd = c_open(path_ptr.__int__(), 16384, 0)
+    var weights_fd = c_open(path_ptr.__int__(), 0, 0) # 0 is O_RDONLY
     if weights_fd < 0:
         print("CRITICAL: Failed to open weights file. Verify conversion path!")
         return
+
+    var total_read_weights = 0
+    print("Loading weights into system RAM...")
+    var t_load_start = py.time()
+    while total_read_weights < total_weights_size:
+        var bytes_to_read = total_weights_size - total_read_weights
+        if bytes_to_read > 1024 * 1024 * 1024:
+            bytes_to_read = 1024 * 1024 * 1024 # 1GB chunk
+        var read_res = c_read(weights_fd, weights_addr + total_read_weights, bytes_to_read)
+        if read_res <= 0:
+            print("CRITICAL: Failed to read from weights file!")
+            return
+        total_read_weights += read_res
+        print(" -> Loaded ", total_read_weights // (1024*1024), " MB / ", total_weights_size // (1024*1024), " MB")
+        
+    var t_load_end = py.time()
+    print("Weights loaded into RAM successfully in " + String(Float64(py=(t_load_end - t_load_start))) + " sec!")
+    _ = c_close(weights_fd)
+    path_ptr.free()
 
     # Embeddings
     var embed_file = "gemma4_embed.bin"
@@ -1372,29 +1394,21 @@ def main() raises:
             for i in range(CONFIG.embed_dim):
                 prompt_x[px_offset + i] = embed_ptr[token_emb_offset + i] * scale
                 
-        # Load Layer 0 weights before the layer loop
-        var tag_0: UInt64 = UInt64(8000)
-        var ret_val = ring.submit_read(weights_fd, w_a_host_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0), 0, tag_0)
-        if ret_val < 0:
-            print("CRITICAL: submit_read failed!")
-        wait_for_tag(ring, tag_0, out_tag_ptr)
-        print(" [DEBUG] Initial memcpy of Layer 0 weights from host to GTT...")
-        _ = c_memcpy(w_a_ptr.__int__(), w_a_host_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
+        # Load Layer 0 weights before the layer loop from RAM cache
+        print(" [DEBUG] Initial memcpy of Layer 0 weights from RAM cache to GTT...")
+        _ = c_memcpy(w_a_ptr.__int__(), weights_ram_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
         print(" [DEBUG] Initial memcpy of Layer 0 weights complete.")
 
         for layer_idx in range(CONFIG.num_layers):
             print(" [DEBUG] Entering layer", layer_idx)
             var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
             var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
-            var active_host_ptr = w_a_host_ptr if layer_idx % 2 == 0 else w_b_host_ptr
-            var next_host_ptr = w_b_host_ptr if layer_idx % 2 == 0 else w_a_host_ptr
             
-            # Prefetch next layer's weights
+            # Copy next layer's weights synchronously from RAM cache to GTT double buffer
             if layer_idx + 1 < CONFIG.num_layers:
-                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
                 var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
                 var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                _ = ring.submit_read(weights_fd, next_host_ptr.__int__(), size_next, offset_next, tag_next)
+                _ = c_memcpy(next_weights_ptr.__int__(), weights_ram_ptr.__int__() + offset_next, size_next)
                 
             var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
             var is_global = CONFIG.is_global_layer(layer_idx)
@@ -1404,7 +1418,6 @@ def main() raises:
             var kv_stride = layer_kv_heads * layer_head_dim
             var ratio = layer_heads // layer_kv_heads
             
-            var next_layer_completed = False
             
             # Loop over all prompt positions
             for pos in range(num_prompt_tokens):
@@ -1490,7 +1503,6 @@ def main() raises:
                 var num_blocks = CONFIG.intermediate_dim // 32
                 var layer_offset = CONFIG.get_layer_offset(layer_idx)
                 var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
-                var tag_base_for_w2: UInt64 = 100000 + UInt64(layer_idx) * 1000 + UInt64(pos) * 1000000
                 
                 # Scan from right to left to find highest active block N
                 var max_active_block: Int = -1
@@ -1505,38 +1517,10 @@ def main() raises:
                         max_active_block = b
                         break
                         
-                var num_active = 0
-                var host_mem_addr = active_host_ptr.__int__() + w2_offset_in_layer
                 if max_active_block >= 0:
-                    num_active = 1
                     var size_to_read = (max_active_block + 1) * 139264
                     var block_offset_in_file = layer_offset + w2_offset_in_layer
-                    _ = ring.submit_read(weights_fd, host_mem_addr, size_to_read, block_offset_in_file, tag_base_for_w2)
-                    
-                # Wait for all active W2 block reads to complete
-                var completed_active = 0
-                var attempts = 0
-                var tag_next: UInt64 = UInt64(8000 + layer_idx + 1)
-                var c_usleep = gpu_ctx.usleep_fn
-                
-                while completed_active < num_active:
-                    var res = ring.poll_completion(out_tag_ptr.__int__())
-                    if res >= 0:
-                        var t = out_tag_ptr[0]
-                        if t == tag_base_for_w2:
-                            completed_active += 1
-                        elif t == tag_next:
-                            next_layer_completed = True
-                    attempts += 1
-                    if attempts > 1000:
-                        _ = c_usleep(10) # 10 us sleep to avoid CPU starvation
-                    if attempts > 20000000: # adjusted limit for usleep
-                        raise Error("Prefill weights paging I/O timed out waiting for sparse W2 blocks")
-                        
-                if num_active > 0:
-                    var size_to_read = (max_active_block + 1) * 139264
-                    var dest_mem_addr = weights.w2_packed.__int__()
-                    _ = c_memcpy(dest_mem_addr, host_mem_addr, size_to_read)
+                    _ = c_memcpy(weights.w2_packed.__int__(), weights_ram_ptr.__int__() + block_offset_in_file, size_to_read)
 
                 q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
                 
@@ -1549,14 +1533,6 @@ def main() raises:
                 var scalar = weights.layer_scalar[0]
                 for i in range(CONFIG.embed_dim):
                     local_x[i] *= scalar
-
-            if layer_idx + 1 < CONFIG.num_layers:
-                if not next_layer_completed:
-                    var tag_next_val: UInt64 = UInt64(8000 + layer_idx + 1)
-                    wait_for_tag(ring, tag_next_val, out_tag_ptr)
-                
-                var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                _ = c_memcpy(next_weights_ptr.__int__(), next_host_ptr.__int__(), size_next)
 
         # Copy the last prompt token's hidden state to x
         var last_px_offset = (num_prompt_tokens - 1) * CONFIG.embed_dim
@@ -1619,11 +1595,8 @@ def main() raises:
         var tokens_generated = 1
         var t_gen_start = py.time()
         for pos in range(num_prompt_tokens, max_steps):
-            # Layer 0 weight prefetch
-            var tag_0: UInt64 = UInt64(2000)
-            _ = ring.submit_read(weights_fd, w_a_host_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0), 0, tag_0)
-            wait_for_tag(ring, tag_0, out_tag_ptr)
-            _ = c_memcpy(w_a_ptr.__int__(), w_a_host_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
+            # Layer 0 weight load from RAM cache
+            _ = c_memcpy(w_a_ptr.__int__(), weights_ram_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
             
             # Setup input activations x with scaled current_token embedding
             var token_emb_offset = current_token * CONFIG.embed_dim
@@ -1634,19 +1607,15 @@ def main() raises:
             for layer_idx in range(CONFIG.num_layers):
                 var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
                 var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
-                var active_host_ptr = w_a_host_ptr if layer_idx % 2 == 0 else w_b_host_ptr
-                var next_host_ptr = w_b_host_ptr if layer_idx % 2 == 0 else w_a_host_ptr
                 
-                # Prefetch next layer's weights
+                # Copy next layer's weights synchronously from RAM cache to GTT double buffer
                 if layer_idx + 1 < CONFIG.num_layers:
-                    var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
                     var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
                     var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                    _ = ring.submit_read(weights_fd, next_host_ptr.__int__(), size_next, offset_next, tag_next)
+                    _ = c_memcpy(next_weights_ptr.__int__(), weights_ram_ptr.__int__() + offset_next, size_next)
                     
                 var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
                 var is_global = CONFIG.is_global_layer(layer_idx)
-                var next_layer_completed = False
                 rms_norm(x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
                 var layer_heads = 16
@@ -1729,7 +1698,6 @@ def main() raises:
                 var num_blocks = CONFIG.intermediate_dim // 32
                 var layer_offset = CONFIG.get_layer_offset(layer_idx)
                 var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
-                var tag_base_for_w2: UInt64 = 200000 + UInt64(layer_idx) * 1000
                 
                 # Scan from right to left to find highest active block N
                 var max_active_block: Int = -1
@@ -1744,38 +1712,10 @@ def main() raises:
                         max_active_block = b
                         break
                         
-                var num_active = 0
-                var host_mem_addr = active_host_ptr.__int__() + w2_offset_in_layer
                 if max_active_block >= 0:
-                    num_active = 1
                     var size_to_read = (max_active_block + 1) * 139264
                     var block_offset_in_file = layer_offset + w2_offset_in_layer
-                    _ = ring.submit_read(weights_fd, host_mem_addr, size_to_read, block_offset_in_file, tag_base_for_w2)
-                    
-                # Wait for all active W2 block reads to complete
-                var completed_active = 0
-                var attempts = 0
-                var tag_next: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
-                var c_usleep = gpu_ctx.usleep_fn
-                
-                while completed_active < num_active:
-                    var res = ring.poll_completion(out_tag_ptr.__int__())
-                    if res >= 0:
-                        var t = out_tag_ptr[0]
-                        if t == tag_base_for_w2:
-                            completed_active += 1
-                        elif t == tag_next:
-                            next_layer_completed = True
-                    attempts += 1
-                    if attempts > 1000:
-                        _ = c_usleep(10) # 10 us sleep to avoid CPU starvation
-                    if attempts > 20000000: # adjusted limit for usleep
-                        raise Error("Decode weights paging I/O timed out waiting for sparse W2 blocks")
-                        
-                if num_active > 0:
-                    var size_to_read = (max_active_block + 1) * 139264
-                    var dest_mem_addr = weights.w2_packed.__int__()
-                    _ = c_memcpy(dest_mem_addr, host_mem_addr, size_to_read)
+                    _ = c_memcpy(weights.w2_packed.__int__(), weights_ram_ptr.__int__() + block_offset_in_file, size_to_read)
                     
                 q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
                 
@@ -1788,14 +1728,6 @@ def main() raises:
                 var scalar = weights.layer_scalar[0]
                 for i in range(CONFIG.embed_dim):
                     x[i] *= scalar
-                    
-                if layer_idx + 1 < CONFIG.num_layers:
-                    if not next_layer_completed:
-                        var tag_next_val: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
-                        wait_for_tag(ring, tag_next_val, out_tag_ptr)
-                    
-                    var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                    _ = c_memcpy(next_weights_ptr.__int__(), next_host_ptr.__int__(), size_next)
                     
             # Predict next token
             rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
@@ -1856,13 +1788,9 @@ def main() raises:
 
     free_c(embed_addr)
     memptr_embed.free()
-    free_c(memptr_w_a[0])
-    free_c(memptr_w_b[0])
-    memptr_w_a.free()
-    memptr_w_b.free()
+    free_c(weights_addr)
+    memptr_weights.free()
     out_tag_ptr.free()
-    path_ptr.free()
-    _ = c_close(weights_fd)
 
     final_norm_weight.free()
     attn_scores.free()
