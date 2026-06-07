@@ -523,7 +523,7 @@ struct GPUContext:
         print("WARNING: get_gpu_va did not match address", cpu_addr, "falling back to raw va_addr!")
         return UInt64(cpu_addr)
 
-    fn launch_matmul(
+    fn enqueue_matmul(
         mut self,
         W_packed_addr: Int,
         scales_addr: Int,
@@ -531,7 +531,7 @@ struct GPUContext:
         out_ptr_addr: Int,
         c_in: Int,
         c_out: Int,
-    ) raises:
+    ) raises -> Int:
         var cpu_sfence = self.cpu_sfence_fn
         var cpu_clflush = self.cpu_clflush_fn
 
@@ -622,7 +622,20 @@ struct GPUContext:
         doorbell_ptr[0] = self.packet_idx - 1
         _ = cpu_sfence(0) # Flush doorbell write through PCIe WC buffers
 
-        # 5. Wait for GPU completion flag with adaptive back-off
+        return slot
+
+    fn wait_matmul(
+        self,
+        slot: Int,
+        out_ptr_addr: Int,
+        c_out: Int,
+    ) raises:
+        var cpu_sfence = self.cpu_sfence_fn
+        var cpu_clflush = self.cpu_clflush_fn
+        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
+        var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_slot_cpu_addr)
+
+        # Wait for GPU completion flag with adaptive back-off
         var completed = False
         var attempts = 0
         var c_usleep = self.usleep_fn
@@ -646,7 +659,7 @@ struct GPUContext:
                 print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
                 print("  Completion flag in memory:", completion_ptr[0])
                 print("  Atomic counter in memory:", completion_ptr[1])
-                raise Error("GPU execution timed out in launch_matmul!")
+                raise Error("GPU execution timed out in wait_matmul!")
 
         # Flush/invalidate CPU cache lines for output vector out to ensure CPU reads the GPU's results
         var output_size_bytes = c_out * 4
@@ -656,6 +669,18 @@ struct GPUContext:
             _ = cpu_clflush(base_out)
             base_out += 64
         _ = cpu_sfence(0)
+
+    fn launch_matmul(
+        mut self,
+        W_packed_addr: Int,
+        scales_addr: Int,
+        x_addr: Int,
+        out_ptr_addr: Int,
+        c_in: Int,
+        c_out: Int,
+    ) raises:
+        var slot = self.enqueue_matmul(W_packed_addr, scales_addr, x_addr, out_ptr_addr, c_in, c_out)
+        self.wait_matmul(slot, out_ptr_addr, c_out)
 
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
@@ -1420,18 +1445,24 @@ def main() raises:
                 print(" [DEBUG] Running rms_norm for pos", pos)
                 rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
-                # Compute q, k on GPU!
-                print(" [DEBUG] Launching wq_packed matmul...")
-                gpu_ctx.launch_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
-                print(" [DEBUG] Launching wk_packed matmul...")
-                gpu_ctx.launch_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                # Compute q, k on GPU asynchronously!
+                print(" [DEBUG] Launching wq_packed and wk_packed matmuls asynchronously...")
+                var slot_q = gpu_ctx.enqueue_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
+                var slot_k = gpu_ctx.enqueue_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                var slot_v: Int = -1
+                
+                if not is_global:
+                    slot_v = gpu_ctx.enqueue_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                
+                # Wait for the GPU to finish Q and K
+                gpu_ctx.wait_matmul(slot_q, q.__int__(), layer_heads * layer_head_dim)
+                gpu_ctx.wait_matmul(slot_k, k_vec.__int__(), layer_kv_heads * layer_head_dim)
                 
                 if is_global:
                     for i in range(kv_stride):
                         v_vec[i] = k_vec[i]
                 else:
-                    # Compute v on GPU!
-                    gpu_ctx.launch_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                    gpu_ctx.wait_matmul(slot_v, v_vec.__int__(), layer_kv_heads * layer_head_dim)
                     
                 # Apply head-wise RMS normalization
                 for h in range(layer_heads):
@@ -1493,9 +1524,12 @@ def main() raises:
                 # Pre-feedforward normalization
                 rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
-                # Compute w1, w3 on GPU!
-                gpu_ctx.launch_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
-                gpu_ctx.launch_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                # Compute w1, w3 on GPU asynchronously!
+                var slot_w1 = gpu_ctx.enqueue_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                var slot_w3 = gpu_ctx.enqueue_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                
+                gpu_ctx.wait_matmul(slot_w1, h1.__int__(), CONFIG.intermediate_dim)
+                gpu_ctx.wait_matmul(slot_w3, h2.__int__(), CONFIG.intermediate_dim)
                 
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
@@ -1589,16 +1623,23 @@ def main() raises:
                 var layer_head_dim = 512 if is_global else 256
                 var kv_stride = layer_kv_heads * layer_head_dim
                 
-                # Compute q, k on GPU!
-                gpu_ctx.launch_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
-                gpu_ctx.launch_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                # Compute q, k on GPU asynchronously!
+                var slot_q = gpu_ctx.enqueue_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
+                var slot_k = gpu_ctx.enqueue_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                var slot_v: Int = -1
+                
+                if not is_global:
+                    slot_v = gpu_ctx.enqueue_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                
+                # Now wait for them to complete
+                gpu_ctx.wait_matmul(slot_q, q.__int__(), layer_heads * layer_head_dim)
+                gpu_ctx.wait_matmul(slot_k, k_vec.__int__(), layer_kv_heads * layer_head_dim)
                 
                 if is_global:
                     for i in range(kv_stride):
                         v_vec[i] = k_vec[i]
                 else:
-                    # Compute v on GPU!
-                    gpu_ctx.launch_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                    gpu_ctx.wait_matmul(slot_v, v_vec.__int__(), layer_kv_heads * layer_head_dim)
                     
                 # Apply head-wise RMS normalization
                 for h in range(layer_heads):
@@ -1662,9 +1703,12 @@ def main() raises:
                 # Pre-feedforward normalization
                 rms_norm(x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
                 
-                # Compute w1, w3 on GPU!
-                gpu_ctx.launch_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
-                gpu_ctx.launch_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                # Compute w1, w3 on GPU asynchronously!
+                var slot_w1 = gpu_ctx.enqueue_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                var slot_w3 = gpu_ctx.enqueue_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                
+                gpu_ctx.wait_matmul(slot_w1, h1.__int__(), CONFIG.intermediate_dim)
+                gpu_ctx.wait_matmul(slot_w3, h2.__int__(), CONFIG.intermediate_dim)
                 
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
