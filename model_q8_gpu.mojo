@@ -231,8 +231,7 @@ struct GPUContext:
     var kernarg_buf: GPUMemoryBuffer
     var completion_buf: GPUMemoryBuffer
     var packet_idx: UInt64
-    var w_a_buf: GPUMemoryBuffer
-    var w_b_buf: GPUMemoryBuffer
+    var weights_gpu_buf: GPUMemoryBuffer
     var x_buf: GPUMemoryBuffer
     var norm_x_buf: GPUMemoryBuffer
     var final_norm_x_buf: GPUMemoryBuffer
@@ -270,8 +269,7 @@ struct GPUContext:
         self.kernarg_buf = GPUMemoryBuffer()
         self.hsaco_buf = GPUMemoryBuffer()
         self.doorbell_reg_addr = 0
-        self.w_a_buf = GPUMemoryBuffer()
-        self.w_b_buf = GPUMemoryBuffer()
+        self.weights_gpu_buf = GPUMemoryBuffer()
         self.x_buf = GPUMemoryBuffer()
         self.norm_x_buf = GPUMemoryBuffer()
         self.final_norm_x_buf = GPUMemoryBuffer()
@@ -416,21 +414,21 @@ struct GPUContext:
         _ = c_close(hsaco_fd)
 
         # Map ELF segments to virtual memory layout (do not copy flat):
-        # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xa40
+        # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xa80 (covering KD descriptor)
         var segment1_src = temp_file_buf
         var segment1_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
-        for i in range(0xa40):
+        for i in range(0xa80):
             segment1_dst[i] = segment1_src[i]
 
-        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x188
+        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x414 (full instructions payload)
         var segment2_src = temp_file_buf + 0xb00
         var segment2_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
-        for i in range(0x188):
+        for i in range(0x414):
             segment2_dst[i] = segment2_src[i]
 
-        # Segment 3 (RW): offset 0xc88, virt_addr 0x2c88, size 0x70
-        var segment3_src = temp_file_buf + 0xc88
-        var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2c88)
+        # Segment 3 (RW): offset 0xf18, virt_addr 0x2f18, size 0x70
+        var segment3_src = temp_file_buf + 0xf18
+        var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f18)
         for i in range(0x70):
             segment3_dst[i] = segment3_src[i]
 
@@ -500,10 +498,8 @@ struct GPUContext:
     fn get_gpu_va(self, cpu_addr: Int) -> UInt64:
         if cpu_addr == 0:
             return 0
-        if self.w_a_buf.size > 0 and cpu_addr >= self.w_a_buf.cpu_addr and cpu_addr < self.w_a_buf.cpu_addr + self.w_a_buf.size:
-            return UInt64(self.w_a_buf.va_addr + (cpu_addr - self.w_a_buf.cpu_addr))
-        if self.w_b_buf.size > 0 and cpu_addr >= self.w_b_buf.cpu_addr and cpu_addr < self.w_b_buf.cpu_addr + self.w_b_buf.size:
-            return UInt64(self.w_b_buf.va_addr + (cpu_addr - self.w_b_buf.cpu_addr))
+        if self.weights_gpu_buf.size > 0 and cpu_addr >= self.weights_gpu_buf.cpu_addr and cpu_addr < self.weights_gpu_buf.cpu_addr + self.weights_gpu_buf.size:
+            return UInt64(self.weights_gpu_buf.va_addr + (cpu_addr - self.weights_gpu_buf.cpu_addr))
         if self.x_buf.size > 0 and cpu_addr >= self.x_buf.cpu_addr and cpu_addr < self.x_buf.cpu_addr + self.x_buf.size:
             return UInt64(self.x_buf.va_addr + (cpu_addr - self.x_buf.cpu_addr))
         if self.norm_x_buf.size > 0 and cpu_addr >= self.norm_x_buf.cpu_addr and cpu_addr < self.norm_x_buf.cpu_addr + self.norm_x_buf.size:
@@ -539,13 +535,23 @@ struct GPUContext:
         var cpu_sfence = self.cpu_sfence_fn
         var cpu_clflush = self.cpu_clflush_fn
 
+        # Flush CPU cache lines for input vector x to ensure GPU reads current activations
+        var input_size_bytes = c_in * 4
+        var base_in = (x_addr // 64) * 64
+        var end_in = x_addr + input_size_bytes
+        while base_in < end_in:
+            _ = cpu_clflush(base_in)
+            base_in += 64
+        _ = cpu_sfence(0)
+
         var slot = Int(self.packet_idx % 1024)
 
-        # 1. Reset completion flag to 0 for this slot
+        # 1. Reset completion flag to 0 and atomic counter to 0 for this slot
         var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
         var completion_slot_va_addr = self.completion_buf.va_addr + slot * 64
         var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_slot_cpu_addr)
         completion_ptr[0] = 0
+        completion_ptr[1] = 0 # reset atomic counter to 0!
         _ = cpu_sfence(0)
         _ = cpu_clflush(completion_slot_cpu_addr)
 
@@ -566,9 +572,15 @@ struct GPUContext:
         kernarg_p[3] = gpu_out_ptr_va
         kernarg_p[4] = UInt64(completion_slot_va_addr)
 
+        var num_workgroups = 32
+        var workgroup_size = 256
+        var grid_stride = num_workgroups * workgroup_size
+
         var kernarg_u32_p = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=kernarg_slot_cpu_addr + 40)
         kernarg_u32_p[0] = UInt32(c_in)
         kernarg_u32_p[1] = UInt32(c_out)
+        kernarg_u32_p[2] = UInt32(grid_stride)
+        kernarg_u32_p[3] = UInt32(num_workgroups)
         
         _ = cpu_sfence(0)
         _ = cpu_clflush(kernarg_slot_cpu_addr)
@@ -580,12 +592,12 @@ struct GPUContext:
             workgroup_size_x=256,    # 256 threads in workgroup
             workgroup_size_y=1,
             workgroup_size_z=1,
-            grid_size_x=256,         # Total grid size (1 workgroup = 256 threads)
+            grid_size_x=UInt32(grid_stride), # Grid size = num_workgroups * 256
             grid_size_y=1,
             grid_size_z=1,
             private_segment_size=0,
             group_segment_size=0,
-            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa00), # KD address!
+            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa40), # KD address!
             kernarg_address=UInt64(kernarg_slot_va_addr),
             completion_signal=0
         )
@@ -619,21 +631,31 @@ struct GPUContext:
                 completed = True
                 break
             attempts += 1
-            if attempts > 10000:
+            if attempts > 500000: # Wait longer (approx 2-3ms) before sleeping to avoid OS scheduling latency
                 _ = cpu_clflush(completion_slot_cpu_addr)
                 _ = cpu_sfence(0)
                 _ = c_usleep(5) # 5 microseconds sleep to prevent memory controller / bus starvation
-            elif attempts % 1000 == 0:
+            elif attempts % 5000 == 0:
                 _ = cpu_clflush(completion_slot_cpu_addr)
                 _ = cpu_sfence(0)
-            if attempts > 150000: # 150k with usleep (approx 10-12s with scheduling latency) is plenty and fails fast
+            if attempts > 10000000: # Failsafe timeout
                 var current_wptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)[0]
                 var current_rptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 128)[0]
                 print("GPU Execution Timeout details:")
                 print("  Attempts reached:", attempts)
                 print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
                 print("  Completion flag in memory:", completion_ptr[0])
+                print("  Atomic counter in memory:", completion_ptr[1])
                 raise Error("GPU execution timed out in launch_matmul!")
+
+        # Flush/invalidate CPU cache lines for output vector out to ensure CPU reads the GPU's results
+        var output_size_bytes = c_out * 4
+        var base_out = (out_ptr_addr // 64) * 64
+        var end_out = out_ptr_addr + output_size_bytes
+        while base_out < end_out:
+            _ = cpu_clflush(base_out)
+            base_out += 64
+        _ = cpu_sfence(0)
 
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
@@ -906,6 +928,8 @@ def q8_matmul_w2_block_column(
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
+    c_memcpy: fn(Int, Int, Int) -> Int,
+    w2_scratch: UnsafePointer[Int8, MutExternalOrigin],
     threshold: Float32 = 1e-4,
 ):
     var c_in_blocks = c_in // 32
@@ -929,6 +953,11 @@ def q8_matmul_w2_block_column(
         
     var chunk_size = c_out // num_tasks
     
+    # Copy active blocks from uncached GTT memory to CPU cached memory
+    for idx in range(num_active):
+        var b = active_blocks[idx]
+        _ = c_memcpy((w2_scratch + idx * 139264).__int__(), (W_packed + b * 139264).__int__(), 139264)
+    
     def sparse_worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
@@ -937,12 +966,13 @@ def q8_matmul_w2_block_column(
             var acc = SIMD[DType.float32, 8](0.0)
             
             for idx in range(num_active):
-                var b = active_blocks[idx]
-                var block_base = W_packed + b * 139264
+                var block_base = w2_scratch + idx * 139264
                 var block_scales = (block_base + 122880).bitcast[Float32]()
                 
                 var scale = block_scales[r]
                 var block_p = block_base + r * 32
+                
+                var b = active_blocks[idx]
                 var x_offset = b * 32
                 
                 var w0 = block_p.load[8]().cast[DType.float32]()
@@ -950,10 +980,8 @@ def q8_matmul_w2_block_column(
                 var w2 = block_p.load[8](16).cast[DType.float32]()
                 var w3 = block_p.load[8](24).cast[DType.float32]()
                 
-                acc = acc + (w0 * x.load[8](x_offset)) * scale
-                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
-                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
-                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                var dot = w0 * x.load[8](x_offset) + w1 * x.load[8](x_offset + 8) + w2 * x.load[8](x_offset + 16) + w3 * x.load[8](x_offset + 24)
+                acc = acc + dot * scale
                 
             out_ptr[r] = acc.reduce_add()
             
@@ -1167,36 +1195,12 @@ def main() raises:
     var out_tag_ptr = alloc[UInt64](1)
     out_tag_ptr[0] = 0
 
-    # Find max layer size and Setup Page-Aligned Layer Weight Buffers (Double-buffering in GPU Unified GTT)
-    var max_layer_bytes = 0
-    for i in range(CONFIG.num_layers):
-        var sz = CONFIG.get_layer_aligned_size(i)
-        if sz > max_layer_bytes:
-            max_layer_bytes = sz
-
-    # Align size to page
-    max_layer_bytes = ((max_layer_bytes + 4095) // 4096) * 4096
-
-    var gtt_uncached_flags: UInt32 = 0xF6000002 # KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | UNCACHED | PUBLIC | GTT | WRITABLE | EXECUTABLE | NO_SUBSTITUTE
-    print(" -> Allocating double-buffered GTT weight buffers...")
-    var w_a_buf = gpu_ctx.alloc_gpu_buffer(max_layer_bytes, gtt_uncached_flags, cpu_access=True)
-    var w_b_buf = gpu_ctx.alloc_gpu_buffer(max_layer_bytes, gtt_uncached_flags, cpu_access=True)
-    gpu_ctx.w_a_buf = w_a_buf.copy()
-    gpu_ctx.w_b_buf = w_b_buf.copy()
-    var w_a_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w_a_buf.cpu_addr)
-    var w_b_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w_b_buf.cpu_addr)
-
-    # Allocate and load the ENTIRE quantized Q8 weights into contiguous system RAM (12.29 GB)
+    var gtt_cached_flags: UInt32 = 0xF6000002 # KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | UNCACHED | PUBLIC | GTT | WRITABLE | EXECUTABLE | NO_SUBSTITUTE (UNCACHED!)
     var total_weights_size = CONFIG.get_layer_offset(CONFIG.num_layers)
-    print("Allocating memory for 12.29 GB Q8 weights in contiguous RAM...")
-    var memptr_weights = alloc[Int](1)
-    var alloc_res = posix_memalign(memptr_weights.__int__(), 4096, total_weights_size)
-    if alloc_res != 0:
-        print("CRITICAL: Failed to allocate aligned memory for weights!")
-        return
-        
-    var weights_addr = memptr_weights[0]
-    var weights_ram_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=weights_addr)
+    print(" -> Allocating GTT weight buffer for the entire 12.29 GB of weights...")
+    var weights_gpu_buf = gpu_ctx.alloc_gpu_buffer(total_weights_size, gtt_cached_flags, cpu_access=True)
+    gpu_ctx.weights_gpu_buf = weights_gpu_buf.copy()
+    var weights_gpu_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=weights_gpu_buf.cpu_addr)
 
     var weights_file = "gemma4_weights_q8_sorted.bin"
     print("Opening weights file 'gemma4_weights_q8_sorted.bin'...")
@@ -1211,13 +1215,13 @@ def main() raises:
         return
 
     var total_read_weights = 0
-    print("Loading weights into system RAM...")
+    print("Loading weights into GTT memory...")
     var t_load_start = py.time()
     while total_read_weights < total_weights_size:
         var bytes_to_read = total_weights_size - total_read_weights
         if bytes_to_read > 1024 * 1024 * 1024:
             bytes_to_read = 1024 * 1024 * 1024 # 1GB chunk
-        var read_res = c_read(weights_fd, weights_addr + total_read_weights, bytes_to_read)
+        var read_res = c_read(weights_fd, weights_gpu_buf.cpu_addr + total_read_weights, bytes_to_read)
         if read_res <= 0:
             print("CRITICAL: Failed to read from weights file!")
             return
@@ -1225,7 +1229,7 @@ def main() raises:
         print(" -> Loaded ", total_read_weights // (1024*1024), " MB / ", total_weights_size // (1024*1024), " MB")
         
     var t_load_end = py.time()
-    print("Weights loaded into RAM successfully in " + String(Float64(py=(t_load_end - t_load_start))) + " sec!")
+    print("Weights loaded into GTT memory successfully in " + String(Float64(py=(t_load_end - t_load_start))) + " sec!")
     _ = c_close(weights_fd)
     path_ptr.free()
 
@@ -1287,18 +1291,18 @@ def main() raises:
 
     # Allocate GPU-mapped activations and caches
     print(" -> Allocating GTT activation vectors...")
-    var x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var final_norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
+    var x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var final_norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     
-    var q_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var k_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var v_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
+    var q_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var k_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var v_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     
-    var attn_out_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var proj_attn_out_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var h1_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
-    var h2_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_uncached_flags, cpu_access=True)
+    var attn_out_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var proj_attn_out_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var h1_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var h2_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
 
     gpu_ctx.x_buf = x_buf.copy()
     gpu_ctx.norm_x_buf = norm_x_buf.copy()
@@ -1326,6 +1330,7 @@ def main() raises:
     
     var ffn_out_gate = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out = alloc[Float32](CONFIG.embed_dim)
+    var w2_scratch = alloc[Int8](480 * 139264)
 
     # KV-cache setup
     var layer_cache_offsets = List[Int]()
@@ -1394,22 +1399,9 @@ def main() raises:
             for i in range(CONFIG.embed_dim):
                 prompt_x[px_offset + i] = embed_ptr[token_emb_offset + i] * scale
                 
-        # Load Layer 0 weights before the layer loop from RAM cache
-        print(" [DEBUG] Initial memcpy of Layer 0 weights from RAM cache to GTT...")
-        _ = c_memcpy(w_a_ptr.__int__(), weights_ram_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
-        print(" [DEBUG] Initial memcpy of Layer 0 weights complete.")
-
         for layer_idx in range(CONFIG.num_layers):
             print(" [DEBUG] Entering layer", layer_idx)
-            var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
-            var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
-            
-            # Copy next layer's weights synchronously from RAM cache to GTT double buffer
-            if layer_idx + 1 < CONFIG.num_layers:
-                var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
-                var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                _ = c_memcpy(next_weights_ptr.__int__(), weights_ram_ptr.__int__() + offset_next, size_next)
-                
+            var active_weights_ptr = weights_gpu_ptr + CONFIG.get_layer_offset(layer_idx)
             var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
             var is_global = CONFIG.is_global_layer(layer_idx)
             var layer_heads = 16
@@ -1465,13 +1457,12 @@ def main() raises:
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
                     
-                    var scale_score = 1.0 / sqrt(Float32(layer_head_dim))
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
                         for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score * scale_score
+                        attn_scores[t] = score
                         
                     softmax(attn_scores, pos + 1)
                     
@@ -1499,30 +1490,7 @@ def main() raises:
                 
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
-                # Contiguous sequential W2 paging via io_uring
-                var num_blocks = CONFIG.intermediate_dim // 32
-                var layer_offset = CONFIG.get_layer_offset(layer_idx)
-                var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
-                
-                # Scan from right to left to find highest active block N
-                var max_active_block: Int = -1
-                for b in range(num_blocks - 1, -1, -1):
-                    var block_offset_gate = b * 32
-                    var block_active = False
-                    for c in range(32):
-                        if abs(ffn_out_gate[block_offset_gate + c]) > 1e-4:
-                            block_active = True
-                            break
-                    if block_active:
-                        max_active_block = b
-                        break
-                        
-                if max_active_block >= 0:
-                    var size_to_read = (max_active_block + 1) * 139264
-                    var block_offset_in_file = layer_offset + w2_offset_in_layer
-                    _ = c_memcpy(weights.w2_packed.__int__(), weights_ram_ptr.__int__() + block_offset_in_file, size_to_read)
-
-                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, c_memcpy, w2_scratch, Float32(1e-4))
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -1595,25 +1563,14 @@ def main() raises:
         var tokens_generated = 1
         var t_gen_start = py.time()
         for pos in range(num_prompt_tokens, max_steps):
-            # Layer 0 weight load from RAM cache
-            _ = c_memcpy(w_a_ptr.__int__(), weights_ram_ptr.__int__(), CONFIG.get_w2_offset_in_layer(0))
-            
             # Setup input activations x with scaled current_token embedding
             var token_emb_offset = current_token * CONFIG.embed_dim
             for i in range(CONFIG.embed_dim):
                 x[i] = embed_ptr[token_emb_offset + i] * scale
                 
-            # Run the 48 layers of Transformer forward pass
+            # Run the Transformer forward pass
             for layer_idx in range(CONFIG.num_layers):
-                var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
-                var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
-                
-                # Copy next layer's weights synchronously from RAM cache to GTT double buffer
-                if layer_idx + 1 < CONFIG.num_layers:
-                    var offset_next = CONFIG.get_layer_offset(layer_idx + 1)
-                    var size_next = CONFIG.get_w2_offset_in_layer(layer_idx + 1)
-                    _ = c_memcpy(next_weights_ptr.__int__(), weights_ram_ptr.__int__() + offset_next, size_next)
-                    
+                var active_weights_ptr = weights_gpu_ptr + CONFIG.get_layer_offset(layer_idx)
                 var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
                 var is_global = CONFIG.is_global_layer(layer_idx)
                 rms_norm(x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
@@ -1660,13 +1617,12 @@ def main() raises:
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
                     
-                    var scale_score = 1.0 / sqrt(Float32(layer_head_dim))
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score: Float32 = 0.0
                         for d in range(layer_head_dim):
                             score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score * scale_score
+                        attn_scores[t] = score
                         
                     softmax(attn_scores, pos + 1)
                     
@@ -1694,30 +1650,8 @@ def main() raises:
                 
                 gelu_and_mul(h1, h2, ffn_out_gate, CONFIG.intermediate_dim)
                 
-                # Contiguous sequential W2 paging via io_uring
-                var num_blocks = CONFIG.intermediate_dim // 32
-                var layer_offset = CONFIG.get_layer_offset(layer_idx)
-                var w2_offset_in_layer = CONFIG.get_w2_offset_in_layer(layer_idx)
-                
-                # Scan from right to left to find highest active block N
-                var max_active_block: Int = -1
-                for b in range(num_blocks - 1, -1, -1):
-                    var block_offset_gate = b * 32
-                    var block_active = False
-                    for c in range(32):
-                        if abs(ffn_out_gate[block_offset_gate + c]) > 1e-4:
-                            block_active = True
-                            break
-                    if block_active:
-                        max_active_block = b
-                        break
-                        
-                if max_active_block >= 0:
-                    var size_to_read = (max_active_block + 1) * 139264
-                    var block_offset_in_file = layer_offset + w2_offset_in_layer
-                    _ = c_memcpy(weights.w2_packed.__int__(), weights_ram_ptr.__int__() + block_offset_in_file, size_to_read)
-                    
-                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                # Evaluate the W2 matmul directly on the resident weights
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, c_memcpy, w2_scratch, Float32(1e-4))
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -1765,8 +1699,7 @@ def main() raises:
     print("Inference generation loop complete!")
 
     # Cleanup resources
-    gpu_ctx.free_gpu_buffer(w_a_buf)
-    gpu_ctx.free_gpu_buffer(w_b_buf)
+    gpu_ctx.free_gpu_buffer(weights_gpu_buf)
     gpu_ctx.free_gpu_buffer(x_buf)
     gpu_ctx.free_gpu_buffer(norm_x_buf)
     gpu_ctx.free_gpu_buffer(final_norm_x_buf)
@@ -1788,8 +1721,6 @@ def main() raises:
 
     free_c(embed_addr)
     memptr_embed.free()
-    free_c(weights_addr)
-    memptr_weights.free()
     out_tag_ptr.free()
 
     final_norm_weight.free()
@@ -1798,6 +1729,7 @@ def main() raises:
     ffn_out.free()
     k_cache.free()
     v_cache.free()
+    w2_scratch.free()
 
     _ = c_close(kfd_fd)
     _ = c_close(drm_fd)

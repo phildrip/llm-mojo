@@ -2,6 +2,7 @@ from std.memory import alloc
 from compress import Float32BlockCompressor
 from std.math import sqrt, exp, cos, sin
 from std.testing import assert_equal, assert_true, assert_false
+from std.ffi import OwnedDLHandle
 from std.python import Python
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
@@ -171,6 +172,73 @@ def ternary_matmul_vec(
             out_ptr[r] = row_sum * scales[r]
             
     parallelize[worker](num_tasks)
+
+@always_inline
+def q8_matmul_w2_block_column(
+    W_packed: UnsafePointer[Int8, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    c_memcpy: fn(Int, Int, Int) -> Int,
+    w2_scratch: UnsafePointer[Int8, MutExternalOrigin],
+    threshold: Float32 = 1e-4,
+):
+    var c_in_blocks = c_in // 32
+    
+    var active_blocks = List[Int]()
+    for b in range(c_in_blocks):
+        var active = False
+        var x_offset = b * 32
+        for i in range(32):
+            if abs(x[x_offset + i]) > threshold:
+                active = True
+                break
+        if active:
+            active_blocks.append(b)
+            
+    var num_active = len(active_blocks)
+    if num_active == 0:
+        for r in range(c_out):
+            out_ptr[r] = 0.0
+        return
+        
+    var chunk_size = c_out // num_tasks
+    
+    # Copy active blocks from uncached GTT memory to CPU cached memory
+    for idx in range(num_active):
+        var b = active_blocks[idx]
+        _ = c_memcpy((w2_scratch + idx * 139264).__int__(), (W_packed + b * 139264).__int__(), 139264)
+    
+    def sparse_worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc = SIMD[DType.float32, 8](0.0)
+            
+            for idx in range(num_active):
+                var block_base = w2_scratch + idx * 139264
+                var block_scales = (block_base + 122880).bitcast[Float32]()
+                
+                var scale = block_scales[r]
+                var block_p = block_base + r * 32
+                
+                var b = active_blocks[idx]
+                var x_offset = b * 32
+                
+                var w0 = block_p.load[8]().cast[DType.float32]()
+                var w1 = block_p.load[8](8).cast[DType.float32]()
+                var w2 = block_p.load[8](16).cast[DType.float32]()
+                var w3 = block_p.load[8](24).cast[DType.float32]()
+                
+                var dot = w0 * x.load[8](x_offset) + w1 * x.load[8](x_offset + 8) + w2 * x.load[8](x_offset + 16) + w3 * x.load[8](x_offset + 24)
+                acc = acc + dot * scale
+                
+            out_ptr[r] = acc.reduce_add()
+            
+    parallelize[sparse_worker](num_tasks)
 
 # -----------------------------------------------------------------------------
 # Unit Test Suite
@@ -598,6 +666,144 @@ def test_ternary_matmul_vec() raises:
     out_ptr.free()
     print("test_ternary_matmul_vec passed!")
 
+def test_attention_no_scaling() raises:
+    print("Running test_attention_no_scaling...")
+    var np = Python.import_module("numpy")
+    var head_dim = 256
+    var pos = 7
+    
+    # 1. Setup random inputs
+    var q_np = np.random.randn(head_dim).astype(np.float32)
+    var k_np = np.random.randn(pos + 1, head_dim).astype(np.float32)
+    
+    var q_ptr = alloc[Float32](head_dim)
+    var k_ptr = alloc[Float32]((pos + 1) * head_dim)
+    var scores_ptr = alloc[Float32](pos + 1)
+    
+    for d in range(head_dim):
+        q_ptr[d] = Float32(Float64(py=q_np[d]))
+        
+    for t in range(pos + 1):
+        for d in range(head_dim):
+            k_ptr[t * head_dim + d] = Float32(Float64(py=k_np[t, d]))
+            
+    # 2. Run the exact Gemma 4 attention dot-product loop (NO scaling)
+    for t in range(pos + 1):
+        var score: Float32 = 0.0
+        for d in range(head_dim):
+            score += q_ptr[d] * k_ptr[t * head_dim + d]
+        scores_ptr[t] = score
+        
+    # 3. Compute reference unscaled scores in NumPy
+    var expected_np = np.dot(k_np, q_np)
+    
+    # 4. Compute reference SCALED scores in NumPy (what other models do, e.g. Llama)
+    var scale = 1.0 / sqrt(Float64(head_dim))
+    var expected_scaled_np = expected_np * scale
+    
+    # 5. Assert that Mojo matches unscaled scores and does NOT match scaled scores
+    for t in range(pos + 1):
+        var expected_unscaled = Float32(Float64(py=expected_np[t]))
+        var expected_scaled = Float32(Float64(py=expected_scaled_np[t]))
+        var actual = scores_ptr[t]
+        
+        # Verify it matches the unscaled computation
+        var diff_unscaled = abs(expected_unscaled - actual)
+        if diff_unscaled > 1e-4:
+            print("Mismatch at t", t, "Expected unscaled:", expected_unscaled, "Actual:", actual)
+            raise Error("Attention unscaled score mismatch")
+            
+        # Verify it is significantly different from the scaled computation
+        var diff_scaled = abs(expected_scaled - actual)
+        if diff_scaled < 1e-2:
+            print("Warning: actual score is too close to scaled score at t", t, "Actual:", actual, "Scaled:", expected_scaled)
+            raise Error("Attention score was scaled! Regression detected.")
+            
+    q_ptr.free()
+    k_ptr.free()
+    scores_ptr.free()
+    print("test_attention_no_scaling passed!")
+
+def test_q8_matmul_w2_block_column() raises:
+    print("Running test_q8_matmul_w2_block_column...")
+    var np = Python.import_module("numpy")
+    var libc = OwnedDLHandle("libc.so.6")
+    var c_memcpy = libc.get_function[fn(Int, Int, Int) -> Int]("memcpy")
+    
+    var c_in = 3840
+    var c_out = 3840
+    var c_in_blocks = c_in // 32
+    var block_size = 139264
+    
+    # 1. Setup random inputs in Float32
+    var x_np = np.zeros(c_in, dtype=np.float32)
+    # Make only 3 blocks active
+    var active_indices: List[Int] = [5, 42, 100]
+    for idx in range(len(active_indices)):
+        var b = active_indices[idx]
+        var block_vals = np.random.randn(32).astype(np.float32)
+        # Avoid zero by adding 1.0 or similar to guarantee active status
+        block_vals = block_vals + np.sign(block_vals) * 0.1
+        for i in range(32):
+            x_np[b * 32 + i] = block_vals[i]
+            
+    # Setup random weights and scales for W_packed
+    var w_blocks_np = np.random.randint(-128, 127, size=c_in_blocks * c_out * 32).reshape(c_in_blocks, c_out, 32).astype(np.int8)
+    var scale_blocks_np = np.random.randn(c_in_blocks, c_out).astype(np.float32) * 0.05
+    
+    # 2. Compute reference outputs using active blocks in Python
+    var expected_np = np.zeros(c_out, dtype=np.float32)
+    for idx in range(len(active_indices)):
+        var b = active_indices[idx]
+        var w_b = w_blocks_np[b].astype(np.float32) # (c_out, 32)
+        var s_b = scale_blocks_np[b] # (c_out,)
+        var x_b = x_np[b * 32 : (b + 1) * 32] # (32,)
+        
+        var block_dot = np.dot(w_b, x_b) # (c_out,)
+        expected_np = expected_np + block_dot * s_b
+        
+    # 3. Allocate Mojo memory
+    var w_packed_ptr = alloc[Int8](c_in_blocks * block_size)
+    var x_ptr = alloc[Float32](c_in)
+    var out_ptr = alloc[Float32](c_out)
+    var w2_scratch = alloc[Int8](c_in_blocks * block_size)
+    
+    # 4. Transfer values to Mojo memory
+    for c in range(c_in):
+        x_ptr[c] = Float32(Float64(py=x_np[c]))
+        
+    for b in range(c_in_blocks):
+        var block_base = w_packed_ptr + b * block_size
+        # Copy weights
+        var w_flat = w_blocks_np[b].flatten()
+        for r_c in range(c_out * 32):
+            block_base[r_c] = Int8(Int(py=w_flat[r_c]))
+            
+        # Copy scales
+        var scales_base = (block_base + 122880).bitcast[Float32]()
+        var s_flat = scale_blocks_np[b]
+        for r in range(c_out):
+            scales_base[r] = Float32(Float64(py=s_flat[r]))
+            
+    # 5. Run Mojo sparse matmul kernel
+    var num_tasks = num_physical_cores()
+    q8_matmul_w2_block_column(w_packed_ptr, x_ptr, out_ptr, c_in, c_out, num_tasks, c_memcpy, w2_scratch, Float32(1e-4))
+    
+    # 6. Verify correct matrix-vector multiplication results
+    for r in range(c_out):
+        var expected = Float32(Float64(py=expected_np[r]))
+        var actual = out_ptr[r]
+        var diff = abs(expected - actual)
+        if diff > 1e-3:
+            print("Mismatch at row", r, "Expected:", expected, "Actual:", actual)
+            raise Error("q8_matmul_w2_block_column output mismatch")
+            
+    w_packed_ptr.free()
+    x_ptr.free()
+    out_ptr.free()
+    w2_scratch.free()
+    print("test_q8_matmul_w2_block_column passed!")
+
 def main() raises:
     print("=========================================================")
     print("               GEMMA 4 KERNEL TEST SUITE                 ")
@@ -612,6 +818,8 @@ def main() raises:
     test_block_compression()
     test_matmul_vec()
     test_ternary_matmul_vec()
+    test_attention_no_scaling()
+    test_q8_matmul_w2_block_column()
     print("=========================================================")
     print("        ALL KERNEL MATH TESTS PASSED SUCCESSFULLY!       ")
     print("=========================================================")
