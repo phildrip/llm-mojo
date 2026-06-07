@@ -935,6 +935,7 @@ def q8_matmul_w2_block_column(
     var c_in_blocks = c_in // 32
     
     var active_blocks = List[Int]()
+    var max_active_block = -1
     for b in range(c_in_blocks):
         var active = False
         var x_offset = b * 32
@@ -944,6 +945,7 @@ def q8_matmul_w2_block_column(
                 break
         if active:
             active_blocks.append(b)
+            max_active_block = b
             
     var num_active = len(active_blocks)
     if num_active == 0:
@@ -953,10 +955,9 @@ def q8_matmul_w2_block_column(
         
     var chunk_size = c_out // num_tasks
     
-    # Copy active blocks from uncached GTT memory to CPU cached memory
-    for idx in range(num_active):
-        var b = active_blocks[idx]
-        _ = c_memcpy((w2_scratch + idx * 139264).__int__(), (W_packed + b * 139264).__int__(), 139264)
+    # Copy all blocks up to max_active_block contiguously from GTT to cached memory
+    var copy_size = (max_active_block + 1) * 139264
+    _ = c_memcpy(w2_scratch.__int__(), W_packed.__int__(), copy_size)
     
     def sparse_worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
@@ -966,13 +967,13 @@ def q8_matmul_w2_block_column(
             var acc = SIMD[DType.float32, 8](0.0)
             
             for idx in range(num_active):
-                var block_base = w2_scratch + idx * 139264
+                var b = active_blocks[idx]
+                var block_base = w2_scratch + b * 139264
                 var block_scales = (block_base + 122880).bitcast[Float32]()
                 
                 var scale = block_scales[r]
                 var block_p = block_base + r * 32
                 
-                var b = active_blocks[idx]
                 var x_offset = b * 32
                 
                 var w0 = block_p.load[8]().cast[DType.float32]()
