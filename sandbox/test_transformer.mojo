@@ -18,6 +18,7 @@ def main() raises:
         num_layers=2,
         vocab_size=50257,
         max_seq_len=64,
+        reuse_attn=True,
     ]()
     
     print("Allocating Activations...")
