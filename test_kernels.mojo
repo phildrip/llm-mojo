@@ -174,6 +174,65 @@ def ternary_matmul_vec(
     parallelize[worker](num_tasks)
 
 @always_inline
+def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
+    return SIMD[DType.float32, 8](
+        Float32(Int(b0 & 15) - 8),
+        Float32(Int((b0 >> 4) & 15) - 8),
+        Float32(Int(b1 & 15) - 8),
+        Float32(Int((b1 >> 4) & 15) - 8),
+        Float32(Int(b2 & 15) - 8),
+        Float32(Int((b2 >> 4) & 15) - 8),
+        Float32(Int(b3 & 15) - 8),
+        Float32(Int((b3 >> 4) & 15) - 8)
+    )
+
+@always_inline
+def q4_matmul_vec(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+):
+    var chunk_size = c_out // num_tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc = SIMD[DType.float32, 8](0.0)
+            
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+            
+            for b in range(c_in_blocks):
+                var scale = scales[r_offset_scales + b]
+                var block_p = r_offset_packed + b * 16
+                var x_offset = b * 32
+                
+                # Load 16 bytes of packed weights at once
+                var bytes = W_packed.load[16](block_p)
+                
+                var w0 = unpack_4bytes(bytes[0], bytes[1], bytes[2], bytes[3])
+                var w1 = unpack_4bytes(bytes[4], bytes[5], bytes[6], bytes[7])
+                var w2 = unpack_4bytes(bytes[8], bytes[9], bytes[10], bytes[11])
+                var w3 = unpack_4bytes(bytes[12], bytes[13], bytes[14], bytes[15])
+                
+                acc = acc + (w0 * x.load[8](x_offset)) * scale
+                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                
+            out_ptr[r] = acc.reduce_add()
+            
+    parallelize[worker](num_tasks)
+
+@always_inline
 def q8_matmul_w2_block_column(
     W_packed: UnsafePointer[Int8, _],
     x: UnsafePointer[Float32, _],
@@ -667,6 +726,101 @@ def test_ternary_matmul_vec() raises:
     out_ptr.free()
     print("test_ternary_matmul_vec passed!")
 
+def test_q4_matmul_vec() raises:
+    print("Running test_q4_matmul_vec...")
+    var np = Python.import_module("numpy")
+    var c_in = 3840
+    var c_out = 128
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    # 1. Setup random inputs in Float32
+    var w_np = np.random.randn(c_out, c_in).astype(np.float32) * 0.05
+    var x_np = np.random.randn(c_in).astype(np.float32)
+    
+    var w_packed_ptr = alloc[UInt8](c_out * c_in_packed)
+    var scales_ptr = alloc[Float32](c_out * c_in_blocks)
+    var x_ptr = alloc[Float32](c_in)
+    var out_ptr = alloc[Float32](c_out)
+    
+    # Populate x_ptr
+    for c in range(c_in):
+        x_ptr[c] = Float32(Float64(py=x_np[c]))
+        
+    # Python-based Q4 quantization and packing
+    for r in range(c_out):
+        for b in range(c_in_blocks):
+            var block_start = b * 32
+            
+            var max_abs: Float64 = 0.0
+            for i in range(32):
+                var val = abs(Float64(py=w_np[r, block_start + i]))
+                if val > max_abs:
+                    max_abs = val
+                    
+            var scale = max_abs / 7.0
+            if scale < 1e-5:
+                scale = 1e-5
+                
+            scales_ptr[r * c_in_blocks + b] = Float32(scale)
+            
+            # Quantize 32 elements to 4-bit (-8 to 7)
+            for i in range(16):
+                var idx0 = block_start + i * 2
+                var idx1 = block_start + i * 2 + 1
+                
+                var v0 = Float64(py=w_np[r, idx0])
+                var v1 = Float64(py=w_np[r, idx1])
+                
+                var q0 = Int(py=np.clip(np.round(v0 / scale), -8.0, 7.0))
+                var q1 = Int(py=np.clip(np.round(v1 / scale), -8.0, 7.0))
+                
+                var u0 = UInt8(q0 + 8)
+                var u1 = UInt8(q1 + 8)
+                var packed_val = u0 | (u1 << 4)
+                
+                w_packed_ptr[r * c_in_packed + b * 16 + i] = packed_val
+                
+    # 2. Run our Mojo q4_matmul_vec kernel
+    q4_matmul_vec(w_packed_ptr, scales_ptr, x_ptr, out_ptr, c_in, c_out, num_physical_cores())
+    
+    # 3. Calculate expected values in Python to verify
+    var w_dequant_np = np.zeros(c_out * c_in, dtype=np.float32).reshape(c_out, c_in)
+    for r in range(c_out):
+        for b in range(c_in_blocks):
+            var block_start = b * 32
+            var scale = Float64(scales_ptr[r * c_in_blocks + b])
+            for i in range(16):
+                var idx0 = block_start + i * 2
+                var idx1 = block_start + i * 2 + 1
+                
+                var packed_val = w_packed_ptr[r * c_in_packed + b * 16 + i]
+                var u0 = packed_val & 15
+                var u1 = packed_val >> 4
+                
+                var q0 = Int(u0) - 8
+                var q1 = Int(u1) - 8
+                
+                w_dequant_np[r, idx0] = Float32(q0 * scale)
+                w_dequant_np[r, idx1] = Float32(q1 * scale)
+                
+    var expected_np = np.dot(w_dequant_np, x_np)
+    
+    # 4. Compare outputs
+    for r in range(c_out):
+        var expected = Float32(Float64(py=expected_np[r]))
+        var actual = out_ptr[r]
+        var diff = abs(expected - actual)
+        if diff > 1e-4:
+            print("Mismatch at row", r, "Expected:", expected, "Actual:", actual)
+            raise Error("q4_matmul_vec output mismatch")
+            
+    w_packed_ptr.free()
+    scales_ptr.free()
+    x_ptr.free()
+    out_ptr.free()
+    print("test_q4_matmul_vec passed!")
+
 def test_attention_no_scaling() raises:
     print("Running test_attention_no_scaling...")
     var np = Python.import_module("numpy")
@@ -995,6 +1149,175 @@ struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
         self.kernarg_address = kernarg_address
         self.reserved2 = 0
         self.completion_signal = completion_signal
+
+def test_early_exit() raises:
+    print("Running test_early_exit...")
+    
+    # Cosine Similarity test (Scale-invariant Hidden State Directional Convergence)
+    print("  Testing Cosine Similarity metrics...")
+    comptime embed_dim = 128 # small size for testing
+    var x = alloc[Float32](embed_dim)
+    var x_old = alloc[Float32](embed_dim)
+    
+    # 1. Exact match (perfect convergence)
+    for i in range(embed_dim):
+        x[i] = Float32(i + 1)
+        x_old[i] = Float32(i + 1)
+        
+    var dot_prod: Float32 = 0.0
+    var sum_sq_x: Float32 = 0.0
+    var sum_sq_x_old: Float32 = 0.0
+    for i in range(embed_dim):
+        dot_prod += x[i] * x_old[i]
+        sum_sq_x += x[i] * x[i]
+        sum_sq_x_old += x_old[i] * x_old[i]
+    var cosine_sim_1 = dot_prod / (sqrt(sum_sq_x) * sqrt(sum_sq_x_old) + 1e-9)
+    assert_true(abs(cosine_sim_1 - 1.0) < 1e-5)
+    
+    # 2. Global scaling change (direction is identical, magnitude differs)
+    for i in range(embed_dim):
+        x[i] = Float32(i + 1) * 1.5 # Scale by 1.5
+        
+    dot_prod = 0.0
+    sum_sq_x = 0.0
+    sum_sq_x_old = 0.0
+    for i in range(embed_dim):
+        dot_prod += x[i] * x_old[i]
+        sum_sq_x += x[i] * x[i]
+        sum_sq_x_old += x_old[i] * x_old[i]
+    var cosine_sim_2 = dot_prod / (sqrt(sum_sq_x) * sqrt(sum_sq_x_old) + 1e-9)
+    # Cosine similarity must remain exactly 1.0 because the direction is unchanged!
+    assert_true(abs(cosine_sim_2 - 1.0) < 1e-5)
+    
+    # 3. Small directional shift (modify one element slightly)
+    x[0] = x_old[0] + 5.0
+    dot_prod = 0.0
+    sum_sq_x = 0.0
+    sum_sq_x_old = 0.0
+    for i in range(embed_dim):
+        dot_prod += x[i] * x_old[i]
+        sum_sq_x += x[i] * x[i]
+        sum_sq_x_old += x_old[i] * x_old[i]
+    var cosine_sim_3 = dot_prod / (sqrt(sum_sq_x) * sqrt(sum_sq_x_old) + 1e-9)
+    # Direction is slightly modified, so cosine similarity is slightly less than 1.0
+    assert_true(cosine_sim_3 < 1.0)
+    assert_true(cosine_sim_3 > 0.95)
+    
+    x.free()
+    x_old.free()
+    
+    # Heuristic B test (Sub-Sampled Projection probability math)
+    comptime test_vocab_size = 8
+    comptime test_embed_dim = 16
+    var norm_x = alloc[Float32](test_embed_dim)
+    var embed_ptr = alloc[Float32](test_vocab_size * test_embed_dim)
+    
+    # Initialize mock norm_x
+    for i in range(test_embed_dim):
+        norm_x[i] = 1.0 # simple constant vector
+        
+    # Initialize mock embed_ptr: token 3 is highly aligned, others are not
+    for r in range(test_vocab_size):
+        var r_offset = r * test_embed_dim
+        for c in range(test_embed_dim):
+            if r == 3:
+                embed_ptr[r_offset + c] = 2.0 # high alignment
+            else:
+                embed_ptr[r_offset + c] = -1.0 # low alignment
+                
+    var common_tokens = [0, 1, 2, 3, 4, 5, 6, 7]
+    
+    # Compute sub-sampled logits and probabilities
+    var max_sub_logit: Float32 = -999999.0
+    var max_sub_tok = 0
+    var sub_logits = List[Float32]()
+    for i in range(len(common_tokens)):
+        var r_offset = common_tokens[i] * test_embed_dim
+        var acc: Float32 = 0.0
+        for c in range(test_embed_dim):
+            acc += norm_x[c] * embed_ptr[r_offset + c]
+        
+        var logit = Float32(30.0) * fast_tanh(acc / Float32(30.0))
+        sub_logits.append(logit)
+        if logit > max_sub_logit:
+            max_sub_logit = logit
+            max_sub_tok = common_tokens[i]
+            
+    assert_equal(max_sub_tok, 3)
+    
+    var sum_exp_sub: Float32 = 0.0
+    for i in range(len(sub_logits)):
+        sum_exp_sub += exp(sub_logits[i] - max_sub_logit)
+        
+    var top_prob = 1.0 / sum_exp_sub
+    assert_true(top_prob > 0.999)
+    
+    norm_x.free()
+    embed_ptr.free()
+    
+    # Heuristic C: KV Cache Propagation / Recovery test for skipped layers
+    print("  Testing KV Cache propagation for skipped layers...")
+    comptime num_layers = 4
+    comptime max_seq_len = 10
+    comptime kv_stride = 16
+    
+    var k_cache = alloc[Float32](num_layers * max_seq_len * kv_stride)
+    var v_cache = alloc[Float32](num_layers * max_seq_len * kv_stride)
+    
+    # Initialize all caches to some marker value (e.g. -999.0)
+    for i in range(num_layers * max_seq_len * kv_stride):
+        k_cache[i] = -999.0
+        v_cache[i] = -999.0
+        
+    # Setup some dummy cache offsets
+    var layer_cache_offsets = List[Int]()
+    for l in range(num_layers):
+        layer_cache_offsets.append(l * max_seq_len * kv_stride)
+        
+    # Set up some known values for position pos_prev (e.g. pos_prev = 2)
+    var pos_prev = 2
+    var pos_curr = 3
+    
+    # Fill position pos_prev with recognizable values for all layers
+    for l in range(num_layers):
+        var offset = layer_cache_offsets[l] + pos_prev * kv_stride
+        for i in range(kv_stride):
+            k_cache[offset + i] = Float32(l * 100 + i)
+            v_cache[offset + i] = Float32(l * 200 + i)
+            
+    # Simulate early exit at layer_idx = 2
+    var early_exit_layer = 2
+    
+    # Copy KV cache from pos_prev to pos_curr for skipped layers (from early_exit_layer to num_layers - 1)
+    for skipped_layer in range(early_exit_layer, num_layers):
+        var l_cache_offset = layer_cache_offsets[skipped_layer]
+        var s_cache_offset = l_cache_offset + pos_curr * kv_stride
+        var p_cache_offset = l_cache_offset + pos_prev * kv_stride
+        for i in range(kv_stride):
+            k_cache[s_cache_offset + i] = k_cache[p_cache_offset + i]
+            v_cache[s_cache_offset + i] = v_cache[p_cache_offset + i]
+            
+    # Verification
+    # 1. Skipped layers (2 and 3) should have copied values at pos_curr
+    for skipped_layer in range(early_exit_layer, num_layers):
+        var l_cache_offset = layer_cache_offsets[skipped_layer]
+        var curr_offset = l_cache_offset + pos_curr * kv_stride
+        for i in range(kv_stride):
+            assert_equal(k_cache[curr_offset + i], Float32(skipped_layer * 100 + i))
+            assert_equal(v_cache[curr_offset + i], Float32(skipped_layer * 200 + i))
+            
+    # 2. Non-skipped layers (0 and 1) should remain untouched (still contain marker value -999.0)
+    for l in range(early_exit_layer):
+        var l_cache_offset = layer_cache_offsets[l]
+        var curr_offset = l_cache_offset + pos_curr * kv_stride
+        for i in range(kv_stride):
+            assert_equal(k_cache[curr_offset + i], Float32(-999.0))
+            assert_equal(v_cache[curr_offset + i], Float32(-999.0))
+            
+    k_cache.free()
+    v_cache.free()
+    
+    print("test_early_exit passed!")
 
 def test_gpu_integration() raises:
     print("Running test_gpu_integration (AMD KFD Direct GPU execution)...")
@@ -1492,8 +1815,10 @@ def main() raises:
     test_block_compression()
     test_matmul_vec()
     test_ternary_matmul_vec()
+    test_q4_matmul_vec()
     test_attention_no_scaling()
     test_q8_matmul_w2_block_column()
+    test_early_exit()
     test_gpu_integration()
     print("=========================================================")
     print("        ALL KERNEL MATH TESTS PASSED SUCCESSFULLY!       ")

@@ -167,7 +167,7 @@ struct TargetConfig[
         pass
 
 
-# Draft Model Configuration (1.58-bit ternary, fully RAM-resident)
+# Draft Model Configuration (4-bit Q4_0, fully RAM-resident)
 struct DraftConfig[
     embed_dim: Int,
     head_dim: Int,
@@ -183,7 +183,7 @@ struct DraftConfig[
         return layer_idx % 6 == 5
 
     @always_inline
-    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[UInt8, _]) -> TernaryLayerWeights:
+    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[UInt8, _]) -> Q4LayerWeights:
         var is_global = self.is_global_layer(layer_idx)
         var layer_heads = 16
         var layer_head_dim = 512 if is_global else 256
@@ -197,41 +197,52 @@ struct DraftConfig[
         var w2_size = Self.embed_dim * Self.intermediate_dim
         var w3_size = Self.intermediate_dim * Self.embed_dim
         
-        var c_out_q = layer_heads * layer_head_dim
-        var c_out_k = layer_kv_heads * layer_head_dim
-        var c_out_v = 0 if is_global else (layer_kv_heads * layer_head_dim)
-        var c_out_o = Self.embed_dim
-        var c_out_w1 = Self.intermediate_dim
-        var c_out_w2 = Self.embed_dim
-        var c_out_w3 = Self.intermediate_dim
-
-        var wq_packed = base_ptr
-        var wk_packed = wq_packed + (wq_size // 4)
-        var wv_packed = wk_packed + (wk_size // 4)
-        var wo_packed = wk_packed + (wk_size // 4)
-        if not is_global:
-            wv_packed = wk_packed + (wk_size // 4)
-            wo_packed = wv_packed + (wv_size // 4)
-            
-        var w1_packed = wo_packed + (wo_size // 4)
-        var w2_packed = w1_packed + (w1_size // 4)
-        var w3_packed = w2_packed + (w2_size // 4)
+        var wq_size_bytes = wq_size // 2
+        var wk_size_bytes = wk_size // 2
+        var wv_size_bytes = wv_size // 2
+        var wo_size_bytes = wo_size // 2
+        var w1_size_bytes = w1_size // 2
+        var w2_size_bytes = w2_size // 2
+        var w3_size_bytes = w3_size // 2
         
-        var scales_base = (w3_packed + (w3_size // 4)).bitcast[Float32]()
+        var c_blocks_q = wq_size // 32
+        var c_blocks_k = wk_size // 32
+        var c_blocks_v = wv_size // 32
+        var c_blocks_o = wo_size // 32
+        var c_blocks_w1 = w1_size // 32
+        var c_blocks_w2 = w2_size // 32
+        var c_blocks_w3 = w3_size // 32
+
+        # Pointers to packed weights (UInt8)
+        var wq_packed = base_ptr
+        var wk_packed = wq_packed + wq_size_bytes
+        var wv_packed = wk_packed + wk_size_bytes # fallback/initialized
+        var wo_packed = wk_packed + wk_size_bytes
+        if not is_global:
+            wv_packed = wk_packed + wk_size_bytes
+            wo_packed = wv_packed + wv_size_bytes
+            
+        var w1_packed = wo_packed + wo_size_bytes
+        var w2_packed = w1_packed + w1_size_bytes
+        var w3_packed = w2_packed + w2_size_bytes
+        
+        # Scales base address: immediately after the end of w3_packed
+        var scales_base = (w3_packed + w3_size_bytes).bitcast[Float32]()
         
         var wq_scales = scales_base
-        var wk_scales = wq_scales + c_out_q
-        var wv_scales = wk_scales + c_out_k
-        var wo_scales = wk_scales + c_out_k
+        var wk_scales = wq_scales + c_blocks_q
+        var wv_scales = wk_scales + c_blocks_k # fallback/initialized
+        var wo_scales = wk_scales + c_blocks_k
         if not is_global:
-            wv_scales = wk_scales + c_out_k
-            wo_scales = wv_scales + c_out_v
+            wv_scales = wk_scales + c_blocks_k
+            wo_scales = wv_scales + c_blocks_v
             
-        var w1_scales = wo_scales + c_out_o
-        var w2_scales = w1_scales + c_out_w1
-        var w3_scales = w2_scales + c_out_w2
+        var w1_scales = wo_scales + c_blocks_o
+        var w2_scales = w1_scales + c_blocks_w1
+        var w3_scales = w2_scales + c_blocks_w2
         
-        var unchanged_base = w3_scales + c_out_w3
+        # Unchanged Float32 parameters base address: immediately after the end of w3_scales
+        var unchanged_base = w3_scales + c_blocks_w3
         
         var input_layernorm = unchanged_base
         var post_attention_layernorm = input_layernorm + Self.embed_dim
@@ -241,7 +252,7 @@ struct DraftConfig[
         var k_norm = q_norm + layer_head_dim
         var layer_scalar = k_norm + layer_head_dim
         
-        return TernaryLayerWeights(
+        return Q4LayerWeights(
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wq_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wk_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wv_packed.__int__()),
@@ -280,19 +291,14 @@ struct DraftConfig[
         var w2_size = Self.embed_dim * Self.intermediate_dim
         var w3_size = Self.intermediate_dim * Self.embed_dim
         
-        var packed_weights_size = (wq_size + wk_size + wv_size + wo_size + w1_size + w2_size + w3_size) // 4
+        # Packed Q4 weights: 2 elements per byte
+        var packed_weights_size = (wq_size + wk_size + wv_size + wo_size + w1_size + w2_size + w3_size) // 2
         
-        var c_out_q = layer_heads * layer_head_dim
-        var c_out_k = layer_kv_heads * layer_head_dim
-        var c_out_v = 0 if is_global else (layer_kv_heads * layer_head_dim)
-        var c_out_o = Self.embed_dim
-        var c_out_w1 = Self.intermediate_dim
-        var c_out_w2 = Self.embed_dim
-        var c_out_w3 = Self.intermediate_dim
-        
-        var scales_count = c_out_q + c_out_k + c_out_v + c_out_o + c_out_w1 + c_out_w2 + c_out_w3
+        # Scale factors (1 per block of 32 elements)
+        var scales_count = (wq_size + wk_size + wv_size + wo_size + w1_size + w2_size + w3_size) // 32
         var scales_size_bytes = scales_count * 4
         
+        # Float32 unchanged weights
         var input_layernorm_size = Self.embed_dim
         var post_attention_layernorm_size = Self.embed_dim
         var pre_feedforward_layernorm_size = Self.embed_dim
@@ -395,7 +401,7 @@ struct Q8LayerWeights:
         self.layer_scalar = layer_scalar
 
 
-struct TernaryLayerWeights:
+struct Q4LayerWeights:
     var wq_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var wk_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var wv_packed: UnsafePointer[UInt8, MutExternalOrigin]
@@ -649,17 +655,22 @@ def q8_matmul_w2_block_column(
     parallelize[sparse_worker](num_tasks)
 
 
-# --- 2-bit Ternary Unpacking & Matmul ---
+# --- 4-bit Q4_0 Unpacking & Matmul ---
 @always_inline
-def unpack_2bytes(b0: UInt8, b1: UInt8) -> SIMD[DType.float32, 8]:
-    var b = SIMD[DType.uint8, 8](b0, b0, b0, b0, b1, b1, b1, b1)
-    var shifts = SIMD[DType.uint8, 8](0, 2, 4, 6, 0, 2, 4, 6)
-    var shifted = b >> shifts
-    var masked = shifted & 3
-    return masked.cast[DType.float32]() - 1.0
+def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
+    return SIMD[DType.float32, 8](
+        Float32(Int(b0 & 15) - 8),
+        Float32(Int((b0 >> 4) & 15) - 8),
+        Float32(Int(b1 & 15) - 8),
+        Float32(Int((b1 >> 4) & 15) - 8),
+        Float32(Int(b2 & 15) - 8),
+        Float32(Int((b2 >> 4) & 15) - 8),
+        Float32(Int(b3 & 15) - 8),
+        Float32(Int((b3 >> 4) & 15) - 8)
+    )
 
 @always_inline
-def ternary_matmul_vec(
+def q4_matmul_vec(
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
     x: UnsafePointer[Float32, _],
@@ -667,38 +678,40 @@ def ternary_matmul_vec(
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
-    boost: Float32 = 1.0,
 ):
     var chunk_size = c_out // num_tasks
-    var c_in_packed = c_in // 4
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
     
     def worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
         
         for r in range(start_r, end_r):
-            var acc0 = SIMD[DType.float32, 8](0.0)
-            var acc1 = SIMD[DType.float32, 8](0.0)
-            var acc2 = SIMD[DType.float32, 8](0.0)
-            var acc3 = SIMD[DType.float32, 8](0.0)
+            var acc = SIMD[DType.float32, 8](0.0)
             
             var r_offset_packed = r * c_in_packed
-            for c in range(0, c_in_packed, 8):
-                var p = W_packed.load[8](r_offset_packed + c)
+            var r_offset_scales = r * c_in_blocks
+            
+            for b in range(c_in_blocks):
+                var scale = scales[r_offset_scales + b]
+                var block_p = r_offset_packed + b * 16
+                var x_offset = b * 32
                 
-                var w0 = unpack_2bytes(p[0], p[1])
-                var w1 = unpack_2bytes(p[2], p[3])
-                var w2 = unpack_2bytes(p[4], p[5])
-                var w3 = unpack_2bytes(p[6], p[7])
+                # Load 16 bytes of packed weights at once
+                var bytes = W_packed.load[16](block_p)
                 
-                var x_offset = c * 4
-                acc0 = acc0 + w0 * x.load[8](x_offset)
-                acc1 = acc1 + w1 * x.load[8](x_offset + 8)
-                acc2 = acc2 + w2 * x.load[8](x_offset + 16)
-                acc3 = acc3 + w3 * x.load[8](x_offset + 24)
+                var w0 = unpack_4bytes(bytes[0], bytes[1], bytes[2], bytes[3])
+                var w1 = unpack_4bytes(bytes[4], bytes[5], bytes[6], bytes[7])
+                var w2 = unpack_4bytes(bytes[8], bytes[9], bytes[10], bytes[11])
+                var w3 = unpack_4bytes(bytes[12], bytes[13], bytes[14], bytes[15])
                 
-            var row_sum = (acc0 + acc1 + acc2 + acc3).reduce_add()
-            out_ptr[r] = row_sum * scales[r] * boost
+                acc = acc + (w0 * x.load[8](x_offset)) * scale
+                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                
+            out_ptr[r] = acc.reduce_add()
             
     parallelize[worker](num_tasks)
 
@@ -781,7 +794,7 @@ def main() raises:
     print("Attention Heads:     16 Query Heads / 8 KV Heads (GQA/MQA)")
     print("Model Parameters:    12B Scale Causal Speculative Layout")
     print("Kernel Paging I/O:   Linux io_uring (Direct NVMe double-buf)")
-    print("Draft Model State:   Fully RAM-resident Ternary (1.58-bit)")
+    print("Draft Model State:   Fully RAM-resident Q4_0 (4-bit)")
     print("Target Model State:  Direct NVMe-paged Q8_0 (Block column)")
     print("---------------------------------------------------------")
 
@@ -817,7 +830,7 @@ def main() raises:
     
     var py = Python.import_module("time")
     var sys = Python.import_module("sys")
-    sys.path.append("/home/phil/git/llm-mojo/.venv/lib/python3.12/site-packages")
+    # sys.path.append("/home/phil/git/llm-mojo/.venv/lib/python3.12/site-packages")
     var transformers = Python.import_module("transformers")
     print("Loading Gemma 4 tokenizer...")
     var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
@@ -918,9 +931,9 @@ def main() raises:
     _ = c_close(final_norm_fd)
     final_norm_path_ptr.free()
 
-    # 4. Load Ternary Draft Weights FULLY into memory (RAM-resident)
-    var draft_file = "gemma4_weights_ternary.bin"
-    print("Opening ternary draft weights file '" + draft_file + "'...")
+    # 4. Load Q4 Draft Weights FULLY into memory (RAM-resident)
+    var draft_file = "gemma4_weights_q4.bin"
+    print("Opening Q4_0 draft weights file '" + draft_file + "'...")
     var draft_path_bytes = draft_file.as_bytes()
     var draft_path_ptr = alloc[UInt8](len(draft_path_bytes) + 1)
     for i in range(len(draft_path_bytes)):
@@ -928,7 +941,7 @@ def main() raises:
     draft_path_ptr[len(draft_path_bytes)] = 0
     var draft_fd = c_open(draft_path_ptr.__int__(), 0, 0)
     if draft_fd < 0:
-        print("CRITICAL: Failed to open 'gemma4_weights_ternary.bin'!")
+        print("CRITICAL: Failed to open 'gemma4_weights_q4.bin'!")
         return
 
     var draft_file_size = DRAFT_CONFIG.get_layer_offset(DRAFT_CONFIG.num_layers)
@@ -937,16 +950,16 @@ def main() raises:
     var draft_base_addr = memptr_draft[0]
     var draft_base_ptr = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=draft_base_addr)
 
-    print("Loading entire ternary weights file into memory (2.73 GB)...")
+    print("Loading entire Q4_0 weights file into memory (6.82 GB)...")
     total_read = 0
     while total_read < draft_file_size:
         var bytes_to_read = draft_file_size - total_read
         var read_res = c_read(draft_fd, draft_base_addr + total_read, bytes_to_read)
         if read_res <= 0:
-            print("CRITICAL: Failed to read from gemma4_weights_ternary.bin!")
+            print("CRITICAL: Failed to read from gemma4_weights_q4.bin!")
             return
         total_read += read_res
-    print("Loaded ternary draft weights fully into RAM: ", total_read, " bytes")
+    print("Loaded Q4 draft weights fully into RAM: ", total_read, " bytes")
     print("---------------------------------------------------------")
     _ = c_close(draft_fd)
     draft_path_ptr.free()
@@ -1080,14 +1093,14 @@ def main() raises:
                 
                 rms_norm(local_x, weights.input_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
                 
-                ternary_matmul_vec(weights.wq_packed, weights.wq_scales, draft_norm_x, draft_q, DRAFT_CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks, Float32(1.1))
-                ternary_matmul_vec(weights.wk_packed, weights.wk_scales, draft_norm_x, draft_k_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks, Float32(1.6))
+                q4_matmul_vec(weights.wq_packed, weights.wq_scales, draft_norm_x, draft_q, DRAFT_CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                q4_matmul_vec(weights.wk_packed, weights.wk_scales, draft_norm_x, draft_k_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                 
                 if is_global:
                     for i in range(kv_stride):
                         draft_v_vec[i] = draft_k_vec[i]
                 else:
-                    ternary_matmul_vec(weights.wv_packed, weights.wv_scales, draft_norm_x, draft_v_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks, Float32(1.35))
+                    q4_matmul_vec(weights.wv_packed, weights.wv_scales, draft_norm_x, draft_v_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                     
                 for h in range(layer_heads):
                     var head_ptr = draft_q + h * layer_head_dim
@@ -1128,18 +1141,18 @@ def main() raises:
                             val_sum += draft_attn_scores[t] * draft_v_cache[t_cache_offset + d]
                         draft_attn_out[h_offset + d] = val_sum
                         
-                ternary_matmul_vec(weights.wo_packed, weights.wo_scales, draft_attn_out, draft_proj_attn_out, layer_heads * layer_head_dim, DRAFT_CONFIG.embed_dim, num_tasks, Float32(1.25))
+                q4_matmul_vec(weights.wo_packed, weights.wo_scales, draft_attn_out, draft_proj_attn_out, layer_heads * layer_head_dim, DRAFT_CONFIG.embed_dim, num_tasks)
                 
                 rms_norm(draft_proj_attn_out, weights.post_attention_layernorm_weight, draft_proj_attn_out, DRAFT_CONFIG.embed_dim)
                 for i in range(DRAFT_CONFIG.embed_dim):
                     local_x[i] += draft_proj_attn_out[i]
                     
                 rms_norm(local_x, weights.pre_feedforward_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
-                ternary_matmul_vec(weights.w1_packed, weights.w1_scales, draft_norm_x, draft_h1, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks, Float32(1.1))
-                ternary_matmul_vec(weights.w3_packed, weights.w3_scales, draft_norm_x, draft_h2, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks, Float32(1.4))
+                q4_matmul_vec(weights.w1_packed, weights.w1_scales, draft_norm_x, draft_h1, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
+                q4_matmul_vec(weights.w3_packed, weights.w3_scales, draft_norm_x, draft_h2, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
                 gelu_and_mul(draft_h1, draft_h2, draft_ffn_out_gate, DRAFT_CONFIG.intermediate_dim)
                 
-                ternary_matmul_vec(weights.w2_packed, weights.w2_scales, draft_ffn_out_gate, draft_ffn_out, DRAFT_CONFIG.intermediate_dim, DRAFT_CONFIG.embed_dim, num_tasks, Float32(2.8))
+                q4_matmul_vec(weights.w2_packed, weights.w2_scales, draft_ffn_out_gate, draft_ffn_out, DRAFT_CONFIG.intermediate_dim, DRAFT_CONFIG.embed_dim, num_tasks)
                 
                 rms_norm(draft_ffn_out, weights.post_feedforward_layernorm_weight, draft_ffn_out, DRAFT_CONFIG.embed_dim)
                 for i in range(DRAFT_CONFIG.embed_dim):
@@ -1395,14 +1408,14 @@ def main() raises:
                     
                     rms_norm(draft_x, weights.input_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
                     
-                    ternary_matmul_vec(weights.wq_packed, weights.wq_scales, draft_norm_x, draft_q, DRAFT_CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks, Float32(1.1))
-                    ternary_matmul_vec(weights.wk_packed, weights.wk_scales, draft_norm_x, draft_k_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks, Float32(1.6))
+                    q4_matmul_vec(weights.wq_packed, weights.wq_scales, draft_norm_x, draft_q, DRAFT_CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                    q4_matmul_vec(weights.wk_packed, weights.wk_scales, draft_norm_x, draft_k_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                     
                     if is_global:
                         for i in range(kv_stride):
                             draft_v_vec[i] = draft_k_vec[i]
                     else:
-                        ternary_matmul_vec(weights.wv_packed, weights.wv_scales, draft_norm_x, draft_v_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks, Float32(1.35))
+                        q4_matmul_vec(weights.wv_packed, weights.wv_scales, draft_norm_x, draft_v_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                         
                     for h in range(layer_heads):
                         var head_ptr = draft_q + h * layer_head_dim
@@ -1443,18 +1456,18 @@ def main() raises:
                                 val_sum += draft_attn_scores[t] * draft_v_cache[t_cache_offset + d]
                             draft_attn_out[h_offset + d] = val_sum
                             
-                    ternary_matmul_vec(weights.wo_packed, weights.wo_scales, draft_attn_out, draft_proj_attn_out, layer_heads * layer_head_dim, DRAFT_CONFIG.embed_dim, num_tasks, Float32(1.25))
+                    q4_matmul_vec(weights.wo_packed, weights.wo_scales, draft_attn_out, draft_proj_attn_out, layer_heads * layer_head_dim, DRAFT_CONFIG.embed_dim, num_tasks)
                     
                     rms_norm(draft_proj_attn_out, weights.post_attention_layernorm_weight, draft_proj_attn_out, DRAFT_CONFIG.embed_dim)
                     for i in range(DRAFT_CONFIG.embed_dim):
                         draft_x[i] += draft_proj_attn_out[i]
                         
                     rms_norm(draft_x, weights.pre_feedforward_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
-                    ternary_matmul_vec(weights.w1_packed, weights.w1_scales, draft_norm_x, draft_h1, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks, Float32(1.1))
-                    ternary_matmul_vec(weights.w3_packed, weights.w3_scales, draft_norm_x, draft_h2, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks, Float32(1.4))
+                    q4_matmul_vec(weights.w1_packed, weights.w1_scales, draft_norm_x, draft_h1, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
+                    q4_matmul_vec(weights.w3_packed, weights.w3_scales, draft_norm_x, draft_h2, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
                     gelu_and_mul(draft_h1, draft_h2, draft_ffn_out_gate, DRAFT_CONFIG.intermediate_dim)
                     
-                    ternary_matmul_vec(weights.w2_packed, weights.w2_scales, draft_ffn_out_gate, draft_ffn_out, DRAFT_CONFIG.intermediate_dim, DRAFT_CONFIG.embed_dim, num_tasks, Float32(2.8))
+                    q4_matmul_vec(weights.w2_packed, weights.w2_scales, draft_ffn_out_gate, draft_ffn_out, DRAFT_CONFIG.intermediate_dim, DRAFT_CONFIG.embed_dim, num_tasks)
                     
                     rms_norm(draft_ffn_out, weights.post_feedforward_layernorm_weight, draft_ffn_out, DRAFT_CONFIG.embed_dim)
                     for i in range(DRAFT_CONFIG.embed_dim):
