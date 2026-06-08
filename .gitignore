@@ -25,3 +25,5 @@ comparison_results.txt
 /model_speculative
 /model_q8_ram
 /model_q8_gpu
+/train
+
