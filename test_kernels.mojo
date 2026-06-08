@@ -805,6 +805,679 @@ def test_q8_matmul_w2_block_column() raises:
     w2_scratch.free()
     print("test_q8_matmul_w2_block_column passed!")
 
+# ==============================================================================
+# GPU Integration Tests (direct AMD KFD/DRM Userspace Queue & Shader Execution)
+# ==============================================================================
+
+struct kfd_ioctl_acquire_vm_args:
+    var drm_fd: UInt32
+    var gpu_id: UInt32
+
+    fn __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
+        self.drm_fd = drm_fd
+        self.gpu_id = gpu_id
+
+struct kfd_ioctl_runtime_enable_args:
+    var r_debug: UInt64
+    var mode_mask: UInt32
+    var capabilities_mask: UInt32
+
+    fn __init__(out self):
+        self.r_debug = 0
+        self.mode_mask = 0
+        self.capabilities_mask = 0
+
+struct kfd_ioctl_alloc_memory_of_gpu_args:
+    var va_addr: UInt64
+    var size: UInt64
+    var handle: UInt64
+    var mmap_offset: UInt64
+    var gpu_id: UInt32
+    var flags: UInt32
+
+    fn __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
+        self.va_addr = va_addr
+        self.size = size
+        self.handle = 0
+        self.mmap_offset = 0
+        self.gpu_id = gpu_id
+        self.flags = flags
+
+struct kfd_ioctl_map_memory_to_gpu_args:
+    var handle: UInt64
+    var device_ids_array_ptr: UInt64
+    var n_devices: UInt32
+    var pad: UInt32
+
+    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+        self.handle = handle
+        self.device_ids_array_ptr = device_ids_array_ptr
+        self.n_devices = n_devices
+        self.pad = 0
+
+struct kfd_ioctl_unmap_memory_from_gpu_args:
+    var handle: UInt64
+    var device_ids_array_ptr: UInt64
+    var n_devices: UInt32
+    var pad: UInt32
+
+    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+        self.handle = handle
+        self.device_ids_array_ptr = device_ids_array_ptr
+        self.n_devices = n_devices
+        self.pad = 0
+
+struct kfd_ioctl_free_memory_of_gpu_args:
+    var handle: UInt64
+
+    fn __init__(out self, handle: UInt64):
+        self.handle = handle
+
+struct kfd_ioctl_create_queue_args:
+    var ring_base_address: UInt64
+    var write_pointer_address: UInt64
+    var read_pointer_address: UInt64
+    var doorbell_offset: UInt64
+    var ring_size: UInt32
+    var gpu_id: UInt32
+    var queue_type: UInt32
+    var queue_percentage: UInt32
+    var queue_priority: UInt32
+    var queue_id: UInt32
+    var eop_buffer_address: UInt64
+    var eop_buffer_size: UInt64
+    var ctx_save_restore_address: UInt64
+    var ctx_save_restore_size: UInt32
+    var ctl_stack_size: UInt32
+    var sdma_engine_id: UInt32
+    var pad: UInt32
+
+    fn __init__(
+        out self,
+        ring_base_address: UInt64,
+        write_pointer_address: UInt64,
+        read_pointer_address: UInt64,
+        ring_size: UInt32,
+        gpu_id: UInt32,
+        queue_type: UInt32,
+        queue_percentage: UInt32,
+        queue_priority: UInt32,
+        eop_buffer_address: UInt64 = 0,
+        eop_buffer_size: UInt64 = 0,
+        ctx_save_restore_address: UInt64 = 0,
+        ctx_save_restore_size: UInt32 = 0,
+        ctl_stack_size: UInt32 = 0,
+        sdma_engine_id: UInt32 = 0
+    ):
+        self.ring_base_address = ring_base_address
+        self.write_pointer_address = write_pointer_address
+        self.read_pointer_address = read_pointer_address
+        self.doorbell_offset = 0
+        self.ring_size = ring_size
+        self.gpu_id = gpu_id
+        self.queue_type = queue_type
+        self.queue_percentage = queue_percentage
+        self.queue_priority = queue_priority
+        self.queue_id = 0
+        self.eop_buffer_address = eop_buffer_address
+        self.eop_buffer_size = eop_buffer_size
+        self.ctx_save_restore_address = ctx_save_restore_address
+        self.ctx_save_restore_size = ctx_save_restore_size
+        self.ctl_stack_size = ctl_stack_size
+        self.sdma_engine_id = sdma_engine_id
+        self.pad = 0
+
+struct kfd_ioctl_destroy_queue_args:
+    var queue_id: UInt32
+    var pad: UInt32
+
+    fn __init__(out self, queue_id: UInt32):
+        self.queue_id = queue_id
+        self.pad = 0
+
+struct GPUMemoryBuffer:
+    var va_addr: Int
+    var size: Int
+    var handle: UInt64
+    var cpu_addr: Int
+
+    fn __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
+        self.va_addr = va_addr
+        self.size = size
+        self.handle = handle
+        self.cpu_addr = cpu_addr
+
+struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
+    var header: UInt16
+    var setup: UInt16
+    var workgroup_size_x: UInt16
+    var workgroup_size_y: UInt16
+    var workgroup_size_z: UInt16
+    var reserved0: UInt16
+    var grid_size_x: UInt32
+    var grid_size_y: UInt32
+    var grid_size_z: UInt32
+    var private_segment_size: UInt32
+    var group_segment_size: UInt32
+    var kernel_object: UInt64
+    var kernarg_address: UInt64
+    var reserved2: UInt64
+    var completion_signal: UInt64
+
+    fn __init__(
+        out self,
+        header: UInt16,
+        setup: UInt16,
+        workgroup_size_x: UInt16,
+        workgroup_size_y: UInt16,
+        workgroup_size_z: UInt16,
+        grid_size_x: UInt32,
+        grid_size_y: UInt32,
+        grid_size_z: UInt32,
+        private_segment_size: UInt32,
+        group_segment_size: UInt32,
+        kernel_object: UInt64,
+        kernarg_address: UInt64,
+        completion_signal: UInt64
+    ):
+        self.header = header
+        self.setup = setup
+        self.workgroup_size_x = workgroup_size_x
+        self.workgroup_size_y = workgroup_size_y
+        self.workgroup_size_z = workgroup_size_z
+        self.reserved0 = 0
+        self.grid_size_x = grid_size_x
+        self.grid_size_y = grid_size_y
+        self.grid_size_z = grid_size_z
+        self.private_segment_size = private_segment_size
+        self.group_segment_size = group_segment_size
+        self.kernel_object = kernel_object
+        self.kernarg_address = kernarg_address
+        self.reserved2 = 0
+        self.completion_signal = completion_signal
+
+def test_gpu_integration() raises:
+    print("Running test_gpu_integration (AMD KFD Direct GPU execution)...")
+    
+    # Check if AMD KFD device nodes are present and accessible
+    var libc = OwnedDLHandle("libc.so.6")
+    var c_open = libc.get_function[fn(Int, Int32) -> Int32]("open")
+    
+    var kfd_path = "/dev/kfd"
+    var kfd_path_bytes = kfd_path.as_bytes()
+    var kfd_path_ptr = alloc[UInt8](len(kfd_path_bytes) + 1)
+    for i in range(len(kfd_path_bytes)):
+        kfd_path_ptr[i] = kfd_path_bytes[i]
+    kfd_path_ptr[len(kfd_path_bytes)] = 0
+    var kfd_fd = c_open(kfd_path_ptr.__int__(), 2) # O_RDWR
+    kfd_path_ptr.free()
+    
+    if kfd_fd < 0:
+        print(" -> SKIP: /dev/kfd not accessible or AMD GPU not present.")
+        _ = libc
+        return
+        
+    var drm_path = "/dev/dri/renderD128"
+    var drm_path_bytes = drm_path.as_bytes()
+    var drm_path_ptr = alloc[UInt8](len(drm_path_bytes) + 1)
+    for i in range(len(drm_path_bytes)):
+        drm_path_ptr[i] = drm_path_bytes[i]
+    drm_path_ptr[len(drm_path_bytes)] = 0
+    var drm_fd = c_open(drm_path_ptr.__int__(), 2) # O_RDWR
+    drm_path_ptr.free()
+    
+    if drm_fd < 0:
+        print(" -> SKIP: /dev/dri/renderD128 not accessible.")
+        var c_close = libc.get_function[fn(Int32) -> Int32]("close")
+        _ = c_close(kfd_fd)
+        _ = libc
+        return
+
+    var c_ioctl = libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
+    var c_close = libc.get_function[fn(Int32) -> Int32]("close")
+    var c_mmap = libc.get_function[fn(Int, Int, Int32, Int32, Int32, Int) -> Int]("mmap")
+    var c_munmap = libc.get_function[fn(Int, Int) -> Int32]("munmap")
+    var c_read = libc.get_function[fn(Int32, Int, Int) -> Int]("read")
+    var c_errno_loc = libc.get_function[fn() -> Int]("__errno_location")
+
+    # Load CPU fence helper library
+    var cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
+    var cpu_sfence = cpu_fence_lib.get_function[fn(Int32) -> Int32]("cpu_sfence")
+    var cpu_clflush = cpu_fence_lib.get_function[fn(Int) -> Int32]("cpu_clflush")
+
+    # Define KFD constants
+    comptime AMDKFD_IOC_ACQUIRE_VM = 0x40084B15
+    comptime AMDKFD_IOC_RUNTIME_ENABLE = 0xC0104B25
+    comptime AMDKFD_IOC_ALLOC_MEMORY_OF_GPU = 0xC0284B16
+    comptime AMDKFD_IOC_FREE_MEMORY_OF_GPU = 0x40084B17
+    comptime AMDKFD_IOC_MAP_MEMORY_TO_GPU = 0xC0184B18
+    comptime AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU = 0xC0184B19
+    comptime AMDKFD_IOC_CREATE_QUEUE = 0xC0604B02
+    comptime AMDKFD_IOC_DESTROY_QUEUE = 0xC0084B03
+
+    comptime PROT_NONE = 0
+    comptime PROT_READ = 1
+    comptime PROT_WRITE = 2
+    comptime MAP_SHARED = 0x01
+    comptime MAP_PRIVATE = 0x02
+    comptime MAP_FIXED = 0x10
+    comptime MAP_ANONYMOUS = 0x20
+
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_VRAM = 1 << 0
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_GTT = 1 << 1
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE = 1 << 31
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE = 1 << 30
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC = 1 << 29
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE = 1 << 28
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_COHERENT = 1 << 26
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED = 1 << 25
+
+    var base_flags = (KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+                      KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+                      KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE)
+
+    var gtt_uncached_flags = (base_flags |
+                              KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+                              KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+                              KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED |
+                              KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC)
+
+    var vram_private_flags = (base_flags |
+                              KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+
+    var gpu_id: UInt32 = 0
+    for node_idx in range(1, 16):
+        var path = "/sys/class/kfd/kfd/topology/nodes/" + String(node_idx) + "/gpu_id"
+        var path_bytes = path.as_bytes()
+        var path_ptr = alloc[UInt8](len(path_bytes) + 1)
+        for i in range(len(path_bytes)):
+            path_ptr[i] = path_bytes[i]
+        path_ptr[len(path_bytes)] = 0
+        var fd = c_open(path_ptr.__int__(), 0)
+        path_ptr.free()
+        
+        if fd >= 0:
+            var buf = alloc[UInt8](64)
+            var bytes_read = c_read(fd, buf.__int__(), 63)
+            _ = c_close(fd)
+            if bytes_read > 0:
+                buf[bytes_read] = 0
+                var val: Int = 0
+                for i in range(bytes_read):
+                    var char_code = buf[i]
+                    if char_code >= 48 and char_code <= 57:
+                        val = val * 10 + (Int(char_code) - 48)
+                buf.free()
+                if val > 0:
+                    gpu_id = UInt32(val)
+                    break
+            else:
+                buf.free()
+
+    if gpu_id == 0:
+        gpu_id = 21148
+
+    # VM Acquisition
+    var acq_args_ptr = alloc[kfd_ioctl_acquire_vm_args](1)
+    acq_args_ptr[0] = kfd_ioctl_acquire_vm_args(drm_fd=UInt32(drm_fd), gpu_id=gpu_id)
+    var r = c_ioctl(kfd_fd, AMDKFD_IOC_ACQUIRE_VM, acq_args_ptr.__int__())
+    acq_args_ptr.free()
+    if r < 0:
+        _ = c_close(kfd_fd)
+        _ = c_close(drm_fd)
+        raise Error("GPU VM Acquisition failed!")
+
+    # Enable Runtime
+    var runtime_enable_ptr = alloc[kfd_ioctl_runtime_enable_args](1)
+    runtime_enable_ptr[0] = kfd_ioctl_runtime_enable_args()
+    r = c_ioctl(kfd_fd, AMDKFD_IOC_RUNTIME_ENABLE, runtime_enable_ptr.__int__())
+    runtime_enable_ptr.free()
+    if r < 0:
+        _ = c_close(kfd_fd)
+        _ = c_close(drm_fd)
+        raise Error("GPU Runtime enable failed!")
+
+    def alloc_gpu_buffer(size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
+        var va_addr = c_mmap(0, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        if va_addr == -1 or va_addr == 0:
+            raise Error("mmap failed")
+        
+        var alloc_args_ptr = alloc[kfd_ioctl_alloc_memory_of_gpu_args](1)
+        alloc_args_ptr[0] = kfd_ioctl_alloc_memory_of_gpu_args(va_addr=UInt64(va_addr), size=UInt64(size), gpu_id=gpu_id, flags=flags)
+        var io_res = c_ioctl(kfd_fd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, alloc_args_ptr.__int__())
+        if io_res < 0:
+            alloc_args_ptr.free()
+            _ = c_munmap(va_addr, size)
+            raise Error("ALLOC_MEMORY failed")
+        var handle = alloc_args_ptr[0].handle
+        var mmap_offset = alloc_args_ptr[0].mmap_offset
+        alloc_args_ptr.free()
+
+        var cpu_addr = 0
+        if cpu_access:
+            cpu_addr = c_mmap(va_addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, drm_fd, Int(mmap_offset))
+            if cpu_addr == -1 or cpu_addr != va_addr:
+                raise Error("CPU mmap failed")
+
+        var device_ids_ptr = alloc[UInt32](1)
+        device_ids_ptr[0] = gpu_id
+        var map_args_ptr = alloc[kfd_ioctl_map_memory_to_gpu_args](1)
+        map_args_ptr[0] = kfd_ioctl_map_memory_to_gpu_args(handle=handle, device_ids_array_ptr=UInt64(device_ids_ptr.__int__()), n_devices=1)
+        io_res = c_ioctl(kfd_fd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, map_args_ptr.__int__())
+        device_ids_ptr.free()
+        map_args_ptr.free()
+        if io_res < 0:
+            raise Error("MAP failed")
+
+        return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
+
+    def free_gpu_buffer(buf: GPUMemoryBuffer) raises:
+        var unmap_device_ids_ptr = alloc[UInt32](1)
+        unmap_device_ids_ptr[0] = gpu_id
+        var unmap_args_ptr = alloc[kfd_ioctl_unmap_memory_from_gpu_args](1)
+        unmap_args_ptr[0] = kfd_ioctl_unmap_memory_from_gpu_args(handle=buf.handle, device_ids_array_ptr=UInt64(unmap_device_ids_ptr.__int__()), n_devices=1)
+        _ = c_ioctl(kfd_fd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, unmap_args_ptr.__int__())
+        unmap_device_ids_ptr.free()
+        unmap_args_ptr.free()
+        
+        if buf.cpu_addr != 0:
+            _ = c_munmap(buf.cpu_addr, buf.size)
+        else:
+            _ = c_munmap(buf.va_addr, buf.size)
+
+        var free_args_ptr = alloc[kfd_ioctl_free_memory_of_gpu_args](1)
+        free_args_ptr[0] = kfd_ioctl_free_memory_of_gpu_args(handle=buf.handle)
+        _ = c_ioctl(kfd_fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, free_args_ptr.__int__())
+        free_args_ptr.free()
+
+    # Create userspace AQL Queue
+    var ring_size = 64 * 1024
+    var ring_buf = alloc_gpu_buffer(ring_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var gart_buf = alloc_gpu_buffer(4096, UInt32(gtt_uncached_flags), cpu_access=True)
+    var cwsr_buf = alloc_gpu_buffer(2801664, UInt32(vram_private_flags), cpu_access=False)
+    var eop_buf = alloc_gpu_buffer(4096, UInt32(vram_private_flags), cpu_access=False)
+
+    var ring_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=ring_buf.cpu_addr)
+    for i in range(ring_size // 4):
+        ring_ptr[i] = 0
+
+    var gart_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr)
+    for i in range(4096 // 4):
+        gart_u32_ptr[i] = 0
+
+    var sig_cpu_addr = gart_buf.cpu_addr + 512
+    var sig_va_addr = gart_buf.va_addr + 512
+
+    var sig_u64_ptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr)
+    for i in range(8):
+        sig_u64_ptr[i] = 0
+
+    UnsafePointer[Int64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(gart_buf.va_addr)
+
+    _ = cpu_clflush(sig_cpu_addr)
+    _ = cpu_sfence(0)
+
+    var q_base = gart_buf.cpu_addr
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 0)[0] = 2       # queue_type = AQL
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 4)[0] = 1       # features
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=q_base + 8)[0] = UInt64(ring_buf.va_addr)
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=q_base + 16)[0] = UInt64(sig_va_addr)
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 24)[0] = 1024   # size
+
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 72)[0] = 7
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 76)[0] = 39
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 136)[0] = 128
+    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 180)[0] = 10
+
+    _ = cpu_clflush(q_base)
+    _ = cpu_clflush(q_base + 64)
+    _ = cpu_clflush(q_base + 128)
+    _ = cpu_clflush(q_base + 180)
+    _ = cpu_sfence(0)
+
+    var create_args_ptr = alloc[kfd_ioctl_create_queue_args](1)
+    create_args_ptr[0] = kfd_ioctl_create_queue_args(
+        ring_base_address=UInt64(ring_buf.va_addr),
+        write_pointer_address=UInt64(gart_buf.va_addr + 56),
+        read_pointer_address=UInt64(gart_buf.va_addr + 128),
+        ring_size=UInt32(ring_size),
+        gpu_id=gpu_id,
+        queue_type=2,
+        queue_percentage=100,
+        queue_priority=7,
+        eop_buffer_address=UInt64(eop_buf.va_addr),
+        eop_buffer_size=4096,
+        ctx_save_restore_address=UInt64(cwsr_buf.va_addr),
+        ctx_save_restore_size=2789376,
+        ctl_stack_size=4096,
+        sdma_engine_id=0
+    )
+    r = c_ioctl(kfd_fd, AMDKFD_IOC_CREATE_QUEUE, create_args_ptr.__int__())
+    if r < 0:
+        var err = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=c_errno_loc())[0]
+        free_gpu_buffer(eop_buf)
+        free_gpu_buffer(cwsr_buf)
+        free_gpu_buffer(gart_buf)
+        free_gpu_buffer(ring_buf)
+        _ = c_close(kfd_fd)
+        _ = c_close(drm_fd)
+        raise Error("KFD Queue creation failed with errno: " + String(err))
+
+    var queue_id = create_args_ptr[0].queue_id
+    var doorbell_offset = create_args_ptr[0].doorbell_offset
+    create_args_ptr.free()
+
+    var doorbells_base = doorbell_offset & (~0x1fff)
+    var doorbell_page_size = 0x2000
+    var doorbell_mmap_addr = c_mmap(0, doorbell_page_size, PROT_READ | PROT_WRITE, MAP_SHARED, kfd_fd, Int(doorbells_base))
+    if doorbell_mmap_addr == -1:
+        raise Error("Doorbell page mmap failed")
+    var doorbell_reg_addr = doorbell_mmap_addr + (Int(doorbell_offset) - Int(doorbells_base))
+
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(doorbell_reg_addr)
+    _ = cpu_clflush(sig_cpu_addr)
+    _ = cpu_sfence(0)
+
+    # Load GCN compiled ELF shader
+    var hsaco_buf = alloc_gpu_buffer(16384, UInt32(gtt_uncached_flags), cpu_access=True)
+    var hsaco_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr)
+    for i in range(16384 // 4):
+        hsaco_u32_ptr[i] = 0
+
+    var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul.hsaco"
+    var hsaco_file_bytes = hsaco_file.as_bytes()
+    var hsaco_file_ptr = alloc[UInt8](len(hsaco_file_bytes) + 1)
+    for i in range(len(hsaco_file_bytes)):
+        hsaco_file_ptr[i] = hsaco_file_bytes[i]
+    hsaco_file_ptr[len(hsaco_file_bytes)] = 0
+    var hsaco_fd = c_open(hsaco_file_ptr.__int__(), 0)
+    hsaco_file_ptr.free()
+    if hsaco_fd < 0:
+        raise Error("Failed to open q8_matmul.hsaco")
+
+    var temp_file_buf = alloc[UInt8](8192)
+    var bytes_read = c_read(hsaco_fd, temp_file_buf.__int__(), 8192)
+    _ = c_close(hsaco_fd)
+    assert_true(bytes_read > 0, "Failed to read any bytes from q8_matmul.hsaco")
+
+    var segment1_src = temp_file_buf
+    var segment1_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0)
+    for i in range(0xa80):
+        segment1_dst[i] = segment1_src[i]
+
+    var segment2_src = temp_file_buf + 0xb00
+    var segment2_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x1b00)
+    for i in range(0x414):
+        segment2_dst[i] = segment2_src[i]
+
+    var segment3_src = temp_file_buf + 0xf18
+    var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f18)
+    for i in range(0x70):
+        segment3_dst[i] = segment3_src[i]
+
+    temp_file_buf.free()
+
+    # Populate Predictable Matmul activations
+    comptime test_c_in = 3072
+    comptime test_c_out = 256
+    comptime test_c_in_blocks = test_c_in // 32
+
+    var W_size = test_c_out * test_c_in * 1
+    var scales_size = test_c_out * test_c_in_blocks * 4
+    var x_size = test_c_in * 4
+    var out_size = test_c_out * 4
+
+    W_size = ((W_size + 4095) // 4096) * 4096
+    scales_size = ((scales_size + 4095) // 4096) * 4096
+    x_size = ((x_size + 4095) // 4096) * 4096
+    out_size = ((out_size + 4095) // 4096) * 4096
+
+    var W_buf = alloc_gpu_buffer(W_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var scales_buf = alloc_gpu_buffer(scales_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var x_buf = alloc_gpu_buffer(x_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var out_buf = alloc_gpu_buffer(out_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var completion_buf = alloc_gpu_buffer(4096, UInt32(gtt_uncached_flags), cpu_access=True)
+    var kernarg_buf = alloc_gpu_buffer(4096, UInt32(gtt_uncached_flags), cpu_access=True)
+
+    var W_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=W_buf.cpu_addr)
+    var scales_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=scales_buf.cpu_addr)
+    var x_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=x_buf.cpu_addr)
+    var out_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=out_buf.cpu_addr)
+    var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_buf.cpu_addr)
+
+    for i in range(test_c_out * test_c_in):
+        W_ptr[i] = Int8((i % 7) - 3)
+
+    for i in range(test_c_out * test_c_in_blocks):
+        scales_ptr[i] = Float32(0.02)
+
+    for i in range(test_c_in):
+        x_ptr[i] = Float32(i % 10) * 0.1
+
+    for i in range(test_c_out):
+        out_ptr[i] = 0.0
+
+    completion_ptr[0] = 0
+
+    # CPU reference values
+    var expected_out = alloc[Float32](test_c_out)
+    for r_idx in range(test_c_out):
+        var sum_ref: Float32 = 0.0
+        var r_offset_packed = r_idx * test_c_in
+        var r_offset_scales = r_idx * test_c_in_blocks
+        for b_idx in range(test_c_in_blocks):
+            var sc = scales_ptr[r_offset_scales + b_idx]
+            var block_acc: Float32 = 0.0
+            var block_p = r_offset_packed + b_idx * 32
+            var x_offset = b_idx * 32
+            for i in range(32):
+                var w_val = Float32(W_ptr[block_p + i])
+                var x_val = x_ptr[x_offset + i]
+                block_acc += w_val * x_val
+            sum_ref += block_acc * sc
+        expected_out[r_idx] = sum_ref
+
+    # Dispatch Kernarg packing
+    var kernarg_p = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=kernarg_buf.cpu_addr)
+    kernarg_p[0] = UInt64(W_buf.va_addr)
+    kernarg_p[1] = UInt64(scales_buf.va_addr)
+    kernarg_p[2] = UInt64(x_buf.va_addr)
+    kernarg_p[3] = UInt64(out_buf.va_addr)
+    kernarg_p[4] = UInt64(completion_buf.va_addr)
+
+    var kernarg_u32_p = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=kernarg_buf.cpu_addr + 40)
+    kernarg_u32_p[0] = UInt32(test_c_in)
+    kernarg_u32_p[1] = UInt32(test_c_out)
+    kernarg_u32_p[2] = UInt32(256)
+    kernarg_u32_p[3] = UInt32(1)
+
+    _ = cpu_sfence(0)
+    _ = cpu_clflush(kernarg_buf.cpu_addr)
+
+    # Format dispatch packet
+    var packet = hsa_kernel_dispatch_packet_t(
+        header=5378,
+        setup=1,
+        workgroup_size_x=256,
+        workgroup_size_y=1,
+        workgroup_size_z=1,
+        grid_size_x=256,
+        grid_size_y=1,
+        grid_size_z=1,
+        private_segment_size=0,
+        group_segment_size=0,
+        kernel_object=UInt64(hsaco_buf.va_addr + 0xa40),
+        kernarg_address=UInt64(kernarg_buf.va_addr),
+        completion_signal=0
+    )
+
+    var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutExternalOrigin](unsafe_from_address=ring_buf.cpu_addr)
+    ring_packet_ptr[0] = packet^
+
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0] = 1
+
+    _ = cpu_sfence(0)
+    _ = cpu_clflush(gart_buf.cpu_addr + 56)
+    _ = cpu_clflush(ring_buf.cpu_addr)
+    _ = cpu_sfence(0)
+
+    # Direct doorbell write
+    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=doorbell_reg_addr)[0] = 0
+    _ = cpu_sfence(0)
+
+    # Wait for completion
+    var polled = 0
+    var gpu_success = False
+    while polled < 50000000:
+        if completion_ptr[0] == 1:
+            gpu_success = True
+            break
+        polled += 1
+        if polled % 10000000 == 0:
+            var wptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0]
+            var rptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 128)[0]
+            print("    -> Polling status... (iter", polled, "| flag =", completion_ptr[0], "| wptr =", wptr, "| rptr =", rptr, ")")
+
+    assert_true(gpu_success, "GPU execution timed out")
+
+    # Math parity verification
+    for r_idx in range(test_c_out):
+        var cpu_val = expected_out[r_idx]
+        var gpu_val = out_ptr[r_idx]
+        var diff = abs(cpu_val - gpu_val)
+        assert_true(diff <= 1e-4, "Mathematical mismatch between GPU and CPU at row " + String(r_idx))
+
+    # Teardown
+    var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
+    destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=queue_id)
+    _ = c_ioctl(kfd_fd, AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
+    destroy_args_ptr.free()
+
+    _ = c_munmap(doorbell_mmap_addr, doorbell_page_size)
+
+    free_gpu_buffer(kernarg_buf)
+    free_gpu_buffer(completion_buf)
+    free_gpu_buffer(out_buf)
+    free_gpu_buffer(x_buf)
+    free_gpu_buffer(scales_buf)
+    free_gpu_buffer(W_buf)
+    free_gpu_buffer(hsaco_buf)
+
+    free_gpu_buffer(eop_buf)
+    free_gpu_buffer(cwsr_buf)
+    free_gpu_buffer(gart_buf)
+    free_gpu_buffer(ring_buf)
+
+    _ = c_close(kfd_fd)
+    _ = c_close(drm_fd)
+    expected_out.free()
+    
+    _ = libc
+    _ = cpu_fence_lib
+    print("test_gpu_integration passed successfully!")
+
 def main() raises:
     print("=========================================================")
     print("               GEMMA 4 KERNEL TEST SUITE                 ")
@@ -821,6 +1494,7 @@ def main() raises:
     test_ternary_matmul_vec()
     test_attention_no_scaling()
     test_q8_matmul_w2_block_column()
+    test_gpu_integration()
     print("=========================================================")
     print("        ALL KERNEL MATH TESTS PASSED SUCCESSFULLY!       ")
     print("=========================================================")
