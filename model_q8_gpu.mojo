@@ -966,20 +966,6 @@ def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float3
         out_ptr.store[8](i, v * inv_rms)
 
 @always_inline
-def sort_floats(mut arr: List[Float32]):
-    var n = len(arr)
-    var gap = n // 2
-    while gap > 0:
-        for i in range(gap, n):
-            var temp = arr[i]
-            var j = i
-            while j >= gap and arr[j - gap] > temp:
-                arr[j] = arr[j - gap]
-                j -= gap
-            arr[j] = temp
-        gap = gap // 2
-
-@always_inline
 def q8_matmul_w2_block_column(
     W_packed: UnsafePointer[Int8, _],
     x: UnsafePointer[Float32, _],
@@ -989,36 +975,22 @@ def q8_matmul_w2_block_column(
     num_tasks: Int,
     c_memcpy: fn(Int, Int, Int) -> Int,
     w2_scratch: UnsafePointer[Int8, MutExternalOrigin],
-    top_k_pct: Float32 = 0.30,
+    threshold: Float32 = 1e-4,
 ):
     var c_in_blocks = c_in // 32
     
-    # 1. Compute block importance/energy (sum of absolute values of activations)
-    var importance = List[Float32](capacity=c_in_blocks)
+    var active_blocks = List[Int]()
+    var max_active_block = -1
     for b in range(c_in_blocks):
-        var imp: Float32 = 0.0
+        var active = False
         var x_offset = b * 32
         for i in range(32):
-            imp += abs(x[x_offset + i])
-        importance.append(imp)
-        
-    # 2. Sort the importances to find the threshold for Top-K blocks
-    var sorted_importance = importance.copy()
-    sort_floats(sorted_importance)
-    
-    var top_k_blocks = Int(top_k_pct * Float32(c_in_blocks))
-    if top_k_blocks < 1:
-        top_k_blocks = 1
-    elif top_k_blocks > c_in_blocks:
-        top_k_blocks = c_in_blocks
-        
-    var threshold_val = sorted_importance[c_in_blocks - top_k_blocks]
-    
-    # 3. Collect active blocks
-    var active_blocks = List[Int]()
-    for b in range(c_in_blocks):
-        if importance[b] >= threshold_val and importance[b] > 0.0:
+            if abs(x[x_offset + i]) > threshold:
+                active = True
+                break
+        if active:
             active_blocks.append(b)
+            max_active_block = b
             
     var num_active = len(active_blocks)
     if num_active == 0:
@@ -1028,13 +1000,10 @@ def q8_matmul_w2_block_column(
         
     var chunk_size = c_out // num_tasks
     
-    # 4. Copy ONLY the active blocks from GTT to fast CPU cache/scratch
-    for idx in range(num_active):
-        var b = active_blocks[idx]
-        var offset = b * 139264
-        _ = c_memcpy((w2_scratch + offset).__int__(), (W_packed + offset).__int__(), 139264)
-        
-    # 5. Parallelized CPU multiplication
+    # Copy all blocks up to max_active_block contiguously from GTT to cached memory
+    var copy_size = (max_active_block + 1) * 139264
+    _ = c_memcpy(w2_scratch.__int__(), W_packed.__int__(), copy_size)
+    
     def sparse_worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
@@ -1961,9 +1930,9 @@ def main() raises:
         print("  Total Tokens Generated:        ", tokens_generated)
         print("  Early Exits at Layer 12 (32%):  ", early_exits_l12, " (", String(Float64(early_exits_l12) * 100.0 / Float64(tokens_generated)), "%)")
         print("  Early Exits at Layer 24 (62%):  ", early_exits_l24, " (", String(Float64(early_exits_l24) * 100.0 / Float64(tokens_generated)), "%)")
-        var avg_layers = (Float64(early_exits_l12) * 13.0 + Float64(early_exits_l24) * 25.0 + Float64(tokens_generated - early_exits_l12 - early_exits_l24) * 40.0) / Float64(tokens_generated)
-        print("  Average Layers Executed:       ", avg_layers, " / 40 (", String(avg_layers * 100.0 / 40.0), "%)")
-        var bandwidth_saved = (1.0 - (avg_layers / 40.0)) * 100.0
+        var avg_layers = (Float64(early_exits_l12) * 13.0 + Float64(early_exits_l24) * 25.0 + Float64(tokens_generated - early_exits_l12 - early_exits_l24) * Float64(CONFIG.num_layers)) / Float64(tokens_generated)
+        print("  Average Layers Executed:       ", avg_layers, " / ", CONFIG.num_layers, " (", String(avg_layers * 100.0 / Float64(CONFIG.num_layers)), "%)")
+        var bandwidth_saved = (1.0 - (avg_layers / Float64(CONFIG.num_layers))) * 100.0
         print("  Estimated DDR Bandwidth Saved:  ", bandwidth_saved, "%")
         print("  --------------------------------------------------------------------------------------------------------")
         var avg_cos_l12 = sum_cos_l12 / Float32(count_l12) if count_l12 > 0 else Float32(0.0)

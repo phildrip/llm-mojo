@@ -959,6 +959,89 @@ def test_q8_matmul_w2_block_column() raises:
     w2_scratch.free()
     print("test_q8_matmul_w2_block_column passed!")
 
+def test_block_sparsity_regression() raises:
+    print("Running test_block_sparsity_regression (Verify all active blocks above threshold are computed)...")
+    var np = Python.import_module("numpy")
+    var libc = OwnedDLHandle("libc.so.6")
+    var c_memcpy = libc.get_function[fn(Int, Int, Int) -> Int]("memcpy")
+    
+    var c_in = 320
+    var c_out = 320
+    var c_in_blocks = c_in // 32
+    var block_size = 139264
+    
+    # 1. Setup inputs:
+    # 2 blocks have large values (importance ~32.0)
+    # 4 blocks have small values (importance ~0.064) which is still above threshold (1e-4)
+    # 4 blocks are completely zero
+    var x_np = np.zeros(c_in, dtype=np.float32)
+    
+    # Large blocks: indices 1, 5
+    for i in range(32):
+        x_np[1 * 32 + i] = 1.0
+        x_np[5 * 32 + i] = 1.0
+    
+    # Small but active blocks (above threshold 1e-4): indices 2, 4, 7, 8
+    for i in range(32):
+        x_np[2 * 32 + i] = 0.002
+        x_np[4 * 32 + i] = 0.002
+        x_np[7 * 32 + i] = 0.002
+        x_np[8 * 32 + i] = 0.002
+    
+    # Setup random weights and scales
+    var w_blocks_np = np.random.randint(-128, 127, size=c_in_blocks * c_out * 32).reshape(c_in_blocks, c_out, 32).astype(np.int8)
+    var scale_blocks_np = np.random.randn(c_in_blocks, c_out).astype(np.float32) * 0.05
+    
+    # 2. Compute reference outputs including ALL active blocks (large + small)
+    var expected_np = np.zeros(c_out, dtype=np.float32)
+    var active_indices: List[Int] = [1, 2, 4, 5, 7, 8]
+    for idx in range(len(active_indices)):
+        var b = active_indices[idx]
+        var w_b = w_blocks_np[b].astype(np.float32)
+        var s_b = scale_blocks_np[b]
+        var x_b = x_np[b * 32 : (b + 1) * 32]
+        expected_np = expected_np + np.dot(w_b, x_b) * s_b
+        
+    # Allocate Mojo memory
+    var w_packed_ptr = alloc[Int8](c_in_blocks * block_size)
+    var x_ptr = alloc[Float32](c_in)
+    var out_ptr = alloc[Float32](c_out)
+    var w2_scratch = alloc[Int8](c_in_blocks * block_size)
+    
+    # Transfer values
+    for c in range(c_in):
+        x_ptr[c] = Float32(Float64(py=x_np[c]))
+        
+    for b in range(c_in_blocks):
+        var block_base = w_packed_ptr + b * block_size
+        var w_flat = w_blocks_np[b].flatten()
+        for r_c in range(c_out * 32):
+            block_base[r_c] = Int8(Int(py=w_flat[r_c]))
+            
+        var scales_base = (block_base + 122880).bitcast[Float32]()
+        var s_flat = scale_blocks_np[b]
+        for r in range(c_out):
+            scales_base[r] = Float32(Float64(py=s_flat[r]))
+            
+    # Run sparse matmul with standard threshold 1e-4
+    var num_tasks = num_physical_cores()
+    q8_matmul_w2_block_column(w_packed_ptr, x_ptr, out_ptr, c_in, c_out, num_tasks, c_memcpy, w2_scratch, Float32(1e-4))
+    
+    # Verify correctness: any loss of active blocks would cause error
+    for r in range(c_out):
+        var expected = Float32(Float64(py=expected_np[r]))
+        var actual = out_ptr[r]
+        var diff = abs(expected - actual)
+        if diff > 1e-3:
+            print("Block Sparsity Regression Mismatch at row", r, "Expected:", expected, "Actual:", actual)
+            raise Error("Block Sparsity Regression: active blocks were incorrectly discarded!")
+            
+    w_packed_ptr.free()
+    x_ptr.free()
+    out_ptr.free()
+    w2_scratch.free()
+    print("test_block_sparsity_regression passed successfully!")
+
 # ==============================================================================
 # GPU Integration Tests (direct AMD KFD/DRM Userspace Queue & Shader Execution)
 # ==============================================================================
@@ -1818,6 +1901,7 @@ def main() raises:
     test_q4_matmul_vec()
     test_attention_no_scaling()
     test_q8_matmul_w2_block_column()
+    test_block_sparsity_regression()
     test_early_exit()
     test_gpu_integration()
     print("=========================================================")
