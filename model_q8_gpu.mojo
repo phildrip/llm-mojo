@@ -1545,11 +1545,7 @@ def main() raises:
                     k_cache[step_cache_offset + i] = cur_k_vec[i]
                     v_cache[step_cache_offset + i] = cur_v_vec[i]
                     
-                def prefill_head_worker(h: Int) capturing -> None:
-                    var local_idx = pos % 2
-                    var local_q = q if local_idx == 0 else q_1
-                    var local_attn_out = attn_out if local_idx == 0 else attn_out_1
-                    
+                for h in range(layer_heads):
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
@@ -1559,23 +1555,21 @@ def main() raises:
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score_vec = SIMD[DType.float32, 16](0.0)
                         for d in range(0, layer_head_dim, 16):
-                            score_vec += local_q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
+                            score_vec += cur_q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
                         head_scores[t] = score_vec.reduce_add()
                         
                     softmax(head_scores, pos + 1)
                     
                     for d in range(0, layer_head_dim, 16):
-                        local_attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
+                        cur_attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
                         
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var s_vec = SIMD[DType.float32, 16](head_scores[t])
                         for d in range(0, layer_head_dim, 16):
                             var v = v_cache.load[16](t_cache_offset + d)
-                            var acc = local_attn_out.load[16](h_offset + d)
-                            local_attn_out.store[16](h_offset + d, acc + s_vec * v)
-                        
-                parallelize[prefill_head_worker](layer_heads)
+                            var acc = cur_attn_out.load[16](h_offset + d)
+                            cur_attn_out.store[16](h_offset + d, acc + s_vec * v)
                         
                 # Compute wo on GPU!
                 gpu_ctx.launch_matmul(weights.wo_packed.__int__(), weights.wo_scales.__int__(), cur_attn_out.__int__(), proj_attn_out.__int__(), layer_heads * layer_head_dim, CONFIG.embed_dim)
