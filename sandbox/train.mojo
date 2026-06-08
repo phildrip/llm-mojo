@@ -30,7 +30,7 @@ def generate_sample[
     
     var token_ids = List[Int32]()
     for i in range(prompt_len):
-        token_ids.append(Int32(encoded[i]))
+        token_ids.append(Int32(Int(py=encoded[i])))
         
     print("Prompt:", start_text)
     

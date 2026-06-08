@@ -2,9 +2,10 @@ from std.ffi import OwnedDLHandle
 from std.memory import alloc
 from std.math import sqrt, exp, log, cos, sin
 from std.random import rand
+from std.algorithm import parallelize
 
 # -----------------------------------------------------------------------------
-# 1. High-Performance Vectorized Math Kernels
+# 1. High-Performance Vectorized & Parallelized Math Kernels
 # -----------------------------------------------------------------------------
 
 @always_inline
@@ -17,10 +18,12 @@ def matmul(
     K: Int,
 ):
     # C = A * B. C is M x N, A is M x K, B is K x N
-    for i in range(M * N):
-        C[i] = 0.0
-        
-    for i in range(M):
+    # Parallelize over rows of C (M)
+    def worker(i: Int) capturing -> None:
+        # Initialize row i of C
+        for j in range(N):
+            C[i * N + j] = 0.0
+            
         for k in range(K):
             var a_val = A[i * K + k]
             var a_simd = SIMD[DType.float32, 8](a_val)
@@ -36,6 +39,8 @@ def matmul(
                 C[i * N + j] += a_val * B[k * N + j]
                 j += 1
 
+    parallelize[worker](M)
+
 @always_inline
 def matmul_AtB(
     C: UnsafePointer[Float32, MutExternalOrigin],
@@ -46,11 +51,12 @@ def matmul_AtB(
     K: Int,
 ):
     # C = A^T * B. C is M x N, A is K x M, B is K x N
-    for i in range(M * N):
-        C[i] = 0.0
-        
-    for k in range(K):
-        for i in range(M):
+    # Parallelize over rows of C (M)
+    def worker(i: Int) capturing -> None:
+        for j in range(N):
+            C[i * N + j] = 0.0
+            
+        for k in range(K):
             var a_val = A[k * M + i]
             var a_simd = SIMD[DType.float32, 8](a_val)
             
@@ -65,6 +71,8 @@ def matmul_AtB(
                 C[i * N + j] += a_val * B[k * N + j]
                 j += 1
 
+    parallelize[worker](M)
+
 @always_inline
 def matmul_ABt(
     C: UnsafePointer[Float32, MutExternalOrigin],
@@ -75,7 +83,8 @@ def matmul_ABt(
     K: Int,
 ):
     # C = A * B^T. C is M x N, A is M x K, B is N x K
-    for i in range(M):
+    # Parallelize over rows of C (M)
+    def worker(i: Int) capturing -> None:
         for j in range(N):
             var acc = SIMD[DType.float32, 8](0.0)
             var k = 0
@@ -91,6 +100,8 @@ def matmul_ABt(
                 k += 1
                 
             C[i * N + j] = sum
+
+    parallelize[worker](M)
 
 @always_inline
 def rms_norm_fwd(
