@@ -1,4 +1,4 @@
-from sys import OwnedDLHandle
+from std.ffi import OwnedDLHandle
 from std.memory import alloc
 from std.random import rand
 
@@ -53,10 +53,12 @@ struct DataLoader:
         _ = c_close(fd)
         print("DataLoader successfully loaded", self.total_tokens, "tokens from", filepath)
 
-    def get_batch(self, batch_size: Int, seq_len: Int, x: UnsafePointer[Int32, _], y: UnsafePointer[Int32, _]):
+    def get_batch(self, batch_size: Int, seq_len: Int, x: UnsafePointer[Int32, MutExternalOrigin], y: UnsafePointer[Int32, MutExternalOrigin]):
+        var r_ptr = alloc[Float64](1)
         # Draw random start positions and slice
         for b in range(batch_size):
-            var r = rand()
+            rand(r_ptr, 1)
+            var r = r_ptr[0]
             var max_pos = self.total_tokens - seq_len - 1
             var start_pos = Int(r * Float64(max_pos))
             
@@ -65,3 +67,5 @@ struct DataLoader:
                 var y_val = Int32(self.data[start_pos + t + 1])
                 x[b * seq_len + t] = x_val
                 y[b * seq_len + t] = y_val
+        r_ptr.free()
+
