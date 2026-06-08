@@ -385,6 +385,7 @@ struct MiniTransformer[
     num_layers: Int,
     vocab_size: Int,
     max_seq_len: Int,
+    reuse_attn: Bool = False,
 ]:
     var total_size: Int
     var weights: UnsafePointer[Float32, MutExternalOrigin]
@@ -613,8 +614,14 @@ struct MiniTransformer[
             var q_ptr = act.q + l * N * D
             var k_ptr = act.k + l * N * D
             var v_ptr = act.v + l * N * D
-            matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N, D, D)
-            matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N, D, D)
+            
+            comptime if Self.reuse_attn:
+                if l == 0:
+                    matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N, D, D)
+                    matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N, D, D)
+            else:
+                matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N, D, D)
+                matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N, D, D)
             matmul(v_ptr, norm1_ptr, self.get_wv_w(l), N, D, D)
             
             # Multi-head attention scores and probabilities
@@ -622,25 +629,50 @@ struct MiniTransformer[
             var probs_ptr = act.attn_probs + l * B * H * S * S
             var context_ptr = act.context + l * N * D
             
-            # Compute QK^T / sqrt(d) causally
-            var inv_sqrt_d = 1.0 / sqrt(Float32(d))
-            for b in range(B):
-                for h in range(H):
-                    for i in range(S):
-                        for j in range(i + 1):
-                            var q_idx = (b * S + i) * D + h * d
-                            var k_idx = (b * S + j) * D + h * d
-                            
-                            var score = Float32(0.0)
-                            for c in range(d):
-                                score += q_ptr[q_idx + c] * k_ptr[k_idx + c]
-                            
-                            scores_ptr[((b * H + h) * S + i) * S + j] = score * inv_sqrt_d
-                        for j in range(i + 1, S):
-                            scores_ptr[((b * H + h) * S + i) * S + j] = -1e9 # Mask out future
-                            
-            # Softmax
-            softmax_fwd(scores_ptr, probs_ptr, B, H, S)
+            comptime if Self.reuse_attn:
+                if l == 0:
+                    # Compute QK^T / sqrt(d) causally
+                    var inv_sqrt_d = 1.0 / sqrt(Float32(d))
+                    for b in range(B):
+                        for h in range(H):
+                            for i in range(S):
+                                for j in range(i + 1):
+                                    var q_idx = (b * S + i) * D + h * d
+                                    var k_idx = (b * S + j) * D + h * d
+                                    
+                                    var score = Float32(0.0)
+                                    for c in range(d):
+                                        score += q_ptr[q_idx + c] * k_ptr[k_idx + c]
+                                    
+                                    scores_ptr[((b * H + h) * S + i) * S + j] = score * inv_sqrt_d
+                                for j in range(i + 1, S):
+                                    scores_ptr[((b * H + h) * S + i) * S + j] = -1e9 # Mask out future
+                                    
+                    # Softmax
+                    softmax_fwd(scores_ptr, probs_ptr, B, H, S)
+                else:
+                    # Reuse probabilities from Layer 0
+                    probs_ptr = act.attn_probs + 0 * B * H * S * S
+            else:
+                # Compute QK^T / sqrt(d) causally
+                var inv_sqrt_d = 1.0 / sqrt(Float32(d))
+                for b in range(B):
+                    for h in range(H):
+                        for i in range(S):
+                            for j in range(i + 1):
+                                var q_idx = (b * S + i) * D + h * d
+                                var k_idx = (b * S + j) * D + h * d
+                                
+                                var score = Float32(0.0)
+                                for c in range(d):
+                                    score += q_ptr[q_idx + c] * k_ptr[k_idx + c]
+                                
+                                scores_ptr[((b * H + h) * S + i) * S + j] = score * inv_sqrt_d
+                            for j in range(i + 1, S):
+                                scores_ptr[((b * H + h) * S + i) * S + j] = -1e9 # Mask out future
+                                
+                # Softmax
+                softmax_fwd(scores_ptr, probs_ptr, B, H, S)
             
             # Context = probs * V
             for b in range(B):
@@ -715,6 +747,9 @@ struct MiniTransformer[
         # Zero all gradients first
         for i in range(self.total_size):
             self.grads[i] = 0.0
+            
+        for i in range(act.L * act.B * act.H * act.S * act.S):
+            act.d_attn_probs[i] = 0.0
             
         # 1. Compute loss and softmax of logits at the logits output layer
         var loss = Float32(0.0)
@@ -825,20 +860,28 @@ struct MiniTransformer[
             matmul_ABt(d_context_ptr, d_attn_out_ptr, self.get_wo_w(l), N, D, D)
             
             # Multi-head attention backward
-            var probs_ptr = act.attn_probs + l * B * H * S * S
+            var layer_offset: Int
+            comptime if Self.reuse_attn:
+                layer_offset = 0
+            else:
+                layer_offset = l
+                
+            var probs_ptr = act.attn_probs + layer_offset * B * H * S * S
             var d_scores_ptr = act.d_scores + l * B * H * S * S
-            var d_probs_ptr = act.d_attn_probs + l * B * H * S * S
+            var d_probs_ptr = act.d_attn_probs + layer_offset * B * H * S * S
             
             var q_ptr = act.q + l * N * D
             var k_ptr = act.k + l * N * D
             var v_ptr = act.v + l * N * D
             
             # 1. d_probs and d_v
-            # Clear d_v and d_probs
+            # Clear d_v for this layer
             for i in range(N * D):
                 d_v_ptr[i] = 0.0
-            for i in range(B * H * S * S):
-                d_probs_ptr[i] = 0.0
+                
+            comptime if not Self.reuse_attn:
+                for i in range(B * H * S * S):
+                    d_probs_ptr[i] = 0.0
                 
             for b in range(B):
                 for h in range(H):
@@ -857,42 +900,84 @@ struct MiniTransformer[
                                 # Accumulate d_v
                                 d_v_ptr[v_idx + c] += prob_val * d_context_ptr[context_grad_offset + c]
                                 
-                            d_probs_ptr[prob_offset + j] = dot_ctx_v
+                            d_probs_ptr[prob_offset + j] += dot_ctx_v
                             
-            # 2. Softmax backward to get d_scores
-            softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S)
-            
-            # 3. Projections backward to get dQ and dK
-            var inv_sqrt_d = 1.0 / sqrt(Float32(d))
-            for i in range(N * D):
-                d_q_ptr[i] = 0.0
-                d_k_ptr[i] = 0.0
+            comptime if Self.reuse_attn:
+                if l == 0:
+                    # 2. Softmax backward to get d_scores
+                    softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S)
+                    
+                    # 3. Projections backward to get dQ and dK
+                    var inv_sqrt_d = 1.0 / sqrt(Float32(d))
+                    for i in range(N * D):
+                        d_q_ptr[i] = 0.0
+                        d_k_ptr[i] = 0.0
+                        
+                    for b in range(B):
+                        for h in range(H):
+                            for i in range(S):
+                                for j in range(i + 1):
+                                    var d_score = d_scores_ptr[((b * H + h) * S + i) * S + j] * inv_sqrt_d
+                                    var q_idx = (b * S + i) * D + h * d
+                                    var k_idx = (b * S + j) * D + h * d
+                                    
+                                    for c in range(d):
+                                        d_q_ptr[q_idx + c] += d_score * k_ptr[k_idx + c]
+                                        d_k_ptr[k_idx + c] += d_score * q_ptr[q_idx + c]
+                                        
+                    # Projections Weight Backward (Wq and Wk)
+                    matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N)
+                    matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N)
+            else:
+                # 2. Softmax backward to get d_scores
+                softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S)
                 
-            for b in range(B):
-                for h in range(H):
-                    for i in range(S):
-                        for j in range(i + 1):
-                            var d_score = d_scores_ptr[((b * H + h) * S + i) * S + j] * inv_sqrt_d
-                            var q_idx = (b * S + i) * D + h * d
-                            var k_idx = (b * S + j) * D + h * d
-                            
-                            for c in range(d):
-                                d_q_ptr[q_idx + c] += d_score * k_ptr[k_idx + c]
-                                d_k_ptr[k_idx + c] += d_score * q_ptr[q_idx + c]
+                # 3. Projections backward to get dQ and dK
+                var inv_sqrt_d = 1.0 / sqrt(Float32(d))
+                for i in range(N * D):
+                    d_q_ptr[i] = 0.0
+                    d_k_ptr[i] = 0.0
+                    
+                for b in range(B):
+                    for h in range(H):
+                        for i in range(S):
+                            for j in range(i + 1):
+                                var d_score = d_scores_ptr[((b * H + h) * S + i) * S + j] * inv_sqrt_d
+                                var q_idx = (b * S + i) * D + h * d
+                                var k_idx = (b * S + j) * D + h * d
                                 
-            # Projections Weight Backward
-            matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N)
-            matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N)
+                                for c in range(d):
+                                    d_q_ptr[q_idx + c] += d_score * k_ptr[k_idx + c]
+                                    d_k_ptr[k_idx + c] += d_score * q_ptr[q_idx + c]
+                                    
+                # Projections Weight Backward (Wq and Wk)
+                matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N)
+                matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N)
+                
+            # Wv is always backpropagated
             matmul_AtB(self.get_wv_g(l), norm1_ptr, d_v_ptr, D, D, N)
             
             # Projections Input Backward (accumulate to d_norm1)
-            matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N, D, D)
-            matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N, D, D)
-            for i in range(N * D):
-                d_norm1_ptr[i] += temp_nd[i]
-            matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N, D, D)
-            for i in range(N * D):
-                d_norm1_ptr[i] += temp_nd[i]
+            comptime if Self.reuse_attn:
+                if l == 0:
+                    matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N, D, D)
+                    matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N, D, D)
+                    for i in range(N * D):
+                        d_norm1_ptr[i] += temp_nd[i]
+                    matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N, D, D)
+                    for i in range(N * D):
+                        d_norm1_ptr[i] += temp_nd[i]
+                else:
+                    # Only backpropagate through V
+                    matmul_ABt(d_norm1_ptr, d_v_ptr, self.get_wv_w(l), N, D, D)
+            else:
+                matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N, D, D)
+                matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N, D, D)
+                for i in range(N * D):
+                    d_norm1_ptr[i] += temp_nd[i]
+                matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N, D, D)
+                for i in range(N * D):
+                    d_norm1_ptr[i] += temp_nd[i]
                 
             # RMSNorm 1 backward
             rms_norm_bwd(layer_in, self.get_attn_norm_w(l), d_norm1_ptr, act.norm1_inv_rms + l * N, temp_nd, self.get_attn_norm_g(l), N, D)
