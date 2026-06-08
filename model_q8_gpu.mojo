@@ -234,11 +234,16 @@ struct GPUContext:
     var weights_gpu_buf: GPUMemoryBuffer
     var x_buf: GPUMemoryBuffer
     var norm_x_buf: GPUMemoryBuffer
+    var norm_x_buf_1: GPUMemoryBuffer
     var final_norm_x_buf: GPUMemoryBuffer
     var q_buf: GPUMemoryBuffer
+    var q_buf_1: GPUMemoryBuffer
     var k_vec_buf: GPUMemoryBuffer
+    var k_vec_buf_1: GPUMemoryBuffer
     var v_vec_buf: GPUMemoryBuffer
+    var v_vec_buf_1: GPUMemoryBuffer
     var attn_out_buf: GPUMemoryBuffer
+    var attn_out_buf_1: GPUMemoryBuffer
     var proj_attn_out_buf: GPUMemoryBuffer
     var h1_buf: GPUMemoryBuffer
     var h2_buf: GPUMemoryBuffer
@@ -272,11 +277,16 @@ struct GPUContext:
         self.weights_gpu_buf = GPUMemoryBuffer()
         self.x_buf = GPUMemoryBuffer()
         self.norm_x_buf = GPUMemoryBuffer()
+        self.norm_x_buf_1 = GPUMemoryBuffer()
         self.final_norm_x_buf = GPUMemoryBuffer()
         self.q_buf = GPUMemoryBuffer()
+        self.q_buf_1 = GPUMemoryBuffer()
         self.k_vec_buf = GPUMemoryBuffer()
+        self.k_vec_buf_1 = GPUMemoryBuffer()
         self.v_vec_buf = GPUMemoryBuffer()
+        self.v_vec_buf_1 = GPUMemoryBuffer()
         self.attn_out_buf = GPUMemoryBuffer()
+        self.attn_out_buf_1 = GPUMemoryBuffer()
         self.proj_attn_out_buf = GPUMemoryBuffer()
         self.h1_buf = GPUMemoryBuffer()
         self.h2_buf = GPUMemoryBuffer()
@@ -504,16 +514,26 @@ struct GPUContext:
             return UInt64(self.x_buf.va_addr + (cpu_addr - self.x_buf.cpu_addr))
         if self.norm_x_buf.size > 0 and cpu_addr >= self.norm_x_buf.cpu_addr and cpu_addr < self.norm_x_buf.cpu_addr + self.norm_x_buf.size:
             return UInt64(self.norm_x_buf.va_addr + (cpu_addr - self.norm_x_buf.cpu_addr))
+        if self.norm_x_buf_1.size > 0 and cpu_addr >= self.norm_x_buf_1.cpu_addr and cpu_addr < self.norm_x_buf_1.cpu_addr + self.norm_x_buf_1.size:
+            return UInt64(self.norm_x_buf_1.va_addr + (cpu_addr - self.norm_x_buf_1.cpu_addr))
         if self.final_norm_x_buf.size > 0 and cpu_addr >= self.final_norm_x_buf.cpu_addr and cpu_addr < self.final_norm_x_buf.cpu_addr + self.final_norm_x_buf.size:
             return UInt64(self.final_norm_x_buf.va_addr + (cpu_addr - self.final_norm_x_buf.cpu_addr))
         if self.q_buf.size > 0 and cpu_addr >= self.q_buf.cpu_addr and cpu_addr < self.q_buf.cpu_addr + self.q_buf.size:
             return UInt64(self.q_buf.va_addr + (cpu_addr - self.q_buf.cpu_addr))
+        if self.q_buf_1.size > 0 and cpu_addr >= self.q_buf_1.cpu_addr and cpu_addr < self.q_buf_1.cpu_addr + self.q_buf_1.size:
+            return UInt64(self.q_buf_1.va_addr + (cpu_addr - self.q_buf_1.cpu_addr))
         if self.k_vec_buf.size > 0 and cpu_addr >= self.k_vec_buf.cpu_addr and cpu_addr < self.k_vec_buf.cpu_addr + self.k_vec_buf.size:
             return UInt64(self.k_vec_buf.va_addr + (cpu_addr - self.k_vec_buf.cpu_addr))
+        if self.k_vec_buf_1.size > 0 and cpu_addr >= self.k_vec_buf_1.cpu_addr and cpu_addr < self.k_vec_buf_1.cpu_addr + self.k_vec_buf_1.size:
+            return UInt64(self.k_vec_buf_1.va_addr + (cpu_addr - self.k_vec_buf_1.cpu_addr))
         if self.v_vec_buf.size > 0 and cpu_addr >= self.v_vec_buf.cpu_addr and cpu_addr < self.v_vec_buf.cpu_addr + self.v_vec_buf.size:
             return UInt64(self.v_vec_buf.va_addr + (cpu_addr - self.v_vec_buf.cpu_addr))
+        if self.v_vec_buf_1.size > 0 and cpu_addr >= self.v_vec_buf_1.cpu_addr and cpu_addr < self.v_vec_buf_1.cpu_addr + self.v_vec_buf_1.size:
+            return UInt64(self.v_vec_buf_1.va_addr + (cpu_addr - self.v_vec_buf_1.cpu_addr))
         if self.attn_out_buf.size > 0 and cpu_addr >= self.attn_out_buf.cpu_addr and cpu_addr < self.attn_out_buf.cpu_addr + self.attn_out_buf.size:
             return UInt64(self.attn_out_buf.va_addr + (cpu_addr - self.attn_out_buf.cpu_addr))
+        if self.attn_out_buf_1.size > 0 and cpu_addr >= self.attn_out_buf_1.cpu_addr and cpu_addr < self.attn_out_buf_1.cpu_addr + self.attn_out_buf_1.size:
+            return UInt64(self.attn_out_buf_1.va_addr + (cpu_addr - self.attn_out_buf_1.cpu_addr))
         if self.proj_attn_out_buf.size > 0 and cpu_addr >= self.proj_attn_out_buf.cpu_addr and cpu_addr < self.proj_attn_out_buf.cpu_addr + self.proj_attn_out_buf.size:
             return UInt64(self.proj_attn_out_buf.va_addr + (cpu_addr - self.proj_attn_out_buf.cpu_addr))
         if self.h1_buf.size > 0 and cpu_addr >= self.h1_buf.cpu_addr and cpu_addr < self.h1_buf.cpu_addr + self.h1_buf.size:
@@ -1315,41 +1335,54 @@ def main() raises:
     _ = c_close(final_norm_fd)
     final_norm_path_ptr.free()
 
-    # Allocate GPU-mapped activations and caches
-    print(" -> Allocating GTT activation vectors...")
     var x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var norm_x_buf_1 = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var final_norm_x_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     
     var q_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var q_buf_1 = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var k_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var k_vec_buf_1 = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var v_vec_buf = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var v_vec_buf_1 = gpu_ctx.alloc_gpu_buffer(((2048 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     
     var attn_out_buf = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
+    var attn_out_buf_1 = gpu_ctx.alloc_gpu_buffer(((8192 * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var proj_attn_out_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.embed_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var h1_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
     var h2_buf = gpu_ctx.alloc_gpu_buffer(((CONFIG.intermediate_dim * 4 + 4095) // 4096) * 4096 + 4096, gtt_cached_flags, cpu_access=True)
 
     gpu_ctx.x_buf = x_buf.copy()
     gpu_ctx.norm_x_buf = norm_x_buf.copy()
+    gpu_ctx.norm_x_buf_1 = norm_x_buf_1.copy()
     gpu_ctx.final_norm_x_buf = final_norm_x_buf.copy()
     gpu_ctx.q_buf = q_buf.copy()
+    gpu_ctx.q_buf_1 = q_buf_1.copy()
     gpu_ctx.k_vec_buf = k_vec_buf.copy()
+    gpu_ctx.k_vec_buf_1 = k_vec_buf_1.copy()
     gpu_ctx.v_vec_buf = v_vec_buf.copy()
+    gpu_ctx.v_vec_buf_1 = v_vec_buf_1.copy()
     gpu_ctx.attn_out_buf = attn_out_buf.copy()
+    gpu_ctx.attn_out_buf_1 = attn_out_buf_1.copy()
     gpu_ctx.proj_attn_out_buf = proj_attn_out_buf.copy()
     gpu_ctx.h1_buf = h1_buf.copy()
     gpu_ctx.h2_buf = h2_buf.copy()
 
     var x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=x_buf.cpu_addr)
     var norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=norm_x_buf.cpu_addr)
+    var norm_x_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=norm_x_buf_1.cpu_addr)
     var final_norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=final_norm_x_buf.cpu_addr)
     var q = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_buf.cpu_addr)
+    var q_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_buf_1.cpu_addr)
     var k_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_vec_buf.cpu_addr)
+    var k_vec_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_vec_buf_1.cpu_addr)
     var v_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=v_vec_buf.cpu_addr)
+    var v_vec_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=v_vec_buf_1.cpu_addr)
     
     var attn_scores = alloc[Float32](CONFIG.num_heads * CONFIG.max_seq_len)
     var attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=attn_out_buf.cpu_addr)
+    var attn_out_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=attn_out_buf_1.cpu_addr)
     var proj_attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=proj_attn_out_buf.cpu_addr)
     var h1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=h1_buf.cpu_addr)
     var h2 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=h2_buf.cpu_addr)
@@ -1428,7 +1461,9 @@ def main() raises:
         for layer_idx in range(CONFIG.num_layers):
             print(" [DEBUG] Entering layer", layer_idx)
             var active_weights_ptr = weights_gpu_ptr + CONFIG.get_layer_offset(layer_idx)
+            print(" [DEBUG] active_weights_ptr offset calculated")
             var weights = CONFIG.get_layer_weights(layer_idx, active_weights_ptr)
+            print(" [DEBUG] get_layer_weights completed")
             var is_global = CONFIG.is_global_layer(layer_idx)
             var layer_heads = 16
             var layer_kv_heads = 1 if is_global else 8
@@ -1436,56 +1471,85 @@ def main() raises:
             var kv_stride = layer_kv_heads * layer_head_dim
             var ratio = layer_heads // layer_kv_heads
             
-            
+            # Enqueue the first position (pos = 0)
+            var active_slot_q = -1
+            var active_slot_k = -1
+            var active_slot_v = -1
+            if num_prompt_tokens > 0:
+                var first_local_x = prompt_x + 0
+                rms_norm(first_local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                active_slot_q = gpu_ctx.enqueue_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
+                active_slot_k = gpu_ctx.enqueue_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                if not is_global:
+                    active_slot_v = gpu_ctx.enqueue_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+
             # Loop over all prompt positions
             for pos in range(num_prompt_tokens):
                 var px_offset = pos * CONFIG.embed_dim
                 var local_x = prompt_x + px_offset
                 
-                print(" [DEBUG] Running rms_norm for pos", pos)
-                rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                var idx = pos % 2
+                var cur_norm_x = norm_x if idx == 0 else norm_x_1
+                var cur_q = q if idx == 0 else q_1
+                var cur_k_vec = k_vec if idx == 0 else k_vec_1
+                var cur_v_vec = v_vec if idx == 0 else v_vec_1
+                var cur_attn_out = attn_out if idx == 0 else attn_out_1
                 
-                # Compute q, k on GPU asynchronously!
-                print(" [DEBUG] Launching wq_packed and wk_packed matmuls asynchronously...")
-                var slot_q = gpu_ctx.enqueue_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), norm_x.__int__(), q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
-                var slot_k = gpu_ctx.enqueue_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), norm_x.__int__(), k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
-                var slot_v: Int = -1
-                
-                if not is_global:
-                    slot_v = gpu_ctx.enqueue_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), norm_x.__int__(), v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
-                
-                # Wait for the GPU to finish Q and K
-                gpu_ctx.wait_matmul(slot_q, q.__int__(), layer_heads * layer_head_dim)
-                gpu_ctx.wait_matmul(slot_k, k_vec.__int__(), layer_kv_heads * layer_head_dim)
-                
+                # Wait for the GPU to finish Q, K, and V projections for the current position
+                gpu_ctx.wait_matmul(active_slot_q, cur_q.__int__(), layer_heads * layer_head_dim)
+                gpu_ctx.wait_matmul(active_slot_k, cur_k_vec.__int__(), layer_kv_heads * layer_head_dim)
                 if is_global:
                     for i in range(kv_stride):
-                        v_vec[i] = k_vec[i]
+                        cur_v_vec[i] = cur_k_vec[i]
                 else:
-                    gpu_ctx.wait_matmul(slot_v, v_vec.__int__(), layer_kv_heads * layer_head_dim)
+                    gpu_ctx.wait_matmul(active_slot_v, cur_v_vec.__int__(), layer_kv_heads * layer_head_dim)
+                
+                # Asynchronously pre-enqueue projections for the next position (pos + 1)
+                var next_slot_q = -1
+                var next_slot_k = -1
+                var next_slot_v = -1
+                if pos + 1 < num_prompt_tokens:
+                    var next_pos = pos + 1
+                    var next_idx = next_pos % 2
+                    var next_norm_x = norm_x if next_idx == 0 else norm_x_1
+                    var next_q = q if next_idx == 0 else q_1
+                    var next_k_vec = k_vec if next_idx == 0 else k_vec_1
+                    var next_v_vec = v_vec if next_idx == 0 else v_vec_1
                     
+                    var next_local_x = prompt_x + next_pos * CONFIG.embed_dim
+                    rms_norm(next_local_x, weights.input_layernorm_weight, next_norm_x, CONFIG.embed_dim)
+                    
+                    next_slot_q = gpu_ctx.enqueue_matmul(weights.wq_packed.__int__(), weights.wq_scales.__int__(), next_norm_x.__int__(), next_q.__int__(), CONFIG.embed_dim, layer_heads * layer_head_dim)
+                    next_slot_k = gpu_ctx.enqueue_matmul(weights.wk_packed.__int__(), weights.wk_scales.__int__(), next_norm_x.__int__(), next_k_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                    if not is_global:
+                        next_slot_v = gpu_ctx.enqueue_matmul(weights.wv_packed.__int__(), weights.wv_scales.__int__(), next_norm_x.__int__(), next_v_vec.__int__(), CONFIG.embed_dim, layer_kv_heads * layer_head_dim)
+                
+                # While the next token's GPU work is running, CPU processes the current position
                 # Apply head-wise RMS normalization
                 for h in range(layer_heads):
-                    var head_ptr = q + h * layer_head_dim
+                    var head_ptr = cur_q + h * layer_head_dim
                     rms_norm(head_ptr, weights.q_norm_weight, head_ptr, layer_head_dim)
                 for h in range(layer_kv_heads):
-                    var head_ptr = k_vec + h * layer_head_dim
+                    var head_ptr = cur_k_vec + h * layer_head_dim
                     rms_norm(head_ptr, weights.k_norm_weight, head_ptr, layer_head_dim)
                 for h in range(layer_kv_heads):
-                    var head_ptr = v_vec + h * layer_head_dim
+                    var head_ptr = cur_v_vec + h * layer_head_dim
                     rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
                     
-                apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
-                apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                apply_rope(cur_q, layer_heads, layer_head_dim, pos, is_global)
+                apply_rope(cur_k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
                 
                 var layer_cache_offset = layer_cache_offsets[layer_idx]
                 var step_cache_offset = layer_cache_offset + pos * kv_stride
                 for i in range(kv_stride):
-                    k_cache[step_cache_offset + i] = k_vec[i]
-                    v_cache[step_cache_offset + i] = v_vec[i]
+                    k_cache[step_cache_offset + i] = cur_k_vec[i]
+                    v_cache[step_cache_offset + i] = cur_v_vec[i]
                     
-                @parameter
-                fn prefill_head_worker(h: Int) capturing -> None:
+                def prefill_head_worker(h: Int) capturing -> None:
+                    var local_idx = pos % 2
+                    var local_q = q if local_idx == 0 else q_1
+                    var local_attn_out = attn_out if local_idx == 0 else attn_out_1
+                    
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
@@ -1495,26 +1559,26 @@ def main() raises:
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var score_vec = SIMD[DType.float32, 16](0.0)
                         for d in range(0, layer_head_dim, 16):
-                            score_vec += q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
+                            score_vec += local_q.load[16](h_offset + d) * k_cache.load[16](t_cache_offset + d)
                         head_scores[t] = score_vec.reduce_add()
                         
                     softmax(head_scores, pos + 1)
                     
                     for d in range(0, layer_head_dim, 16):
-                        attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
+                        local_attn_out.store[16](h_offset + d, SIMD[DType.float32, 16](0.0))
                         
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                         var s_vec = SIMD[DType.float32, 16](head_scores[t])
                         for d in range(0, layer_head_dim, 16):
                             var v = v_cache.load[16](t_cache_offset + d)
-                            var acc = attn_out.load[16](h_offset + d)
-                            attn_out.store[16](h_offset + d, acc + s_vec * v)
+                            var acc = local_attn_out.load[16](h_offset + d)
+                            local_attn_out.store[16](h_offset + d, acc + s_vec * v)
                         
                 parallelize[prefill_head_worker](layer_heads)
                         
                 # Compute wo on GPU!
-                gpu_ctx.launch_matmul(weights.wo_packed.__int__(), weights.wo_scales.__int__(), attn_out.__int__(), proj_attn_out.__int__(), layer_heads * layer_head_dim, CONFIG.embed_dim)
+                gpu_ctx.launch_matmul(weights.wo_packed.__int__(), weights.wo_scales.__int__(), cur_attn_out.__int__(), proj_attn_out.__int__(), layer_heads * layer_head_dim, CONFIG.embed_dim)
                 
                 # Post-attention normalization on projected attention output
                 rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -1522,11 +1586,11 @@ def main() raises:
                     local_x[i] += proj_attn_out[i]
                     
                 # Pre-feedforward normalization
-                rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                rms_norm(local_x, weights.pre_feedforward_layernorm_weight, cur_norm_x, CONFIG.embed_dim)
                 
                 # Compute w1, w3 on GPU asynchronously!
-                var slot_w1 = gpu_ctx.enqueue_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
-                var slot_w3 = gpu_ctx.enqueue_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                var slot_w1 = gpu_ctx.enqueue_matmul(weights.w1_packed.__int__(), weights.w1_scales.__int__(), cur_norm_x.__int__(), h1.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
+                var slot_w3 = gpu_ctx.enqueue_matmul(weights.w3_packed.__int__(), weights.w3_scales.__int__(), cur_norm_x.__int__(), h2.__int__(), CONFIG.embed_dim, CONFIG.intermediate_dim)
                 
                 gpu_ctx.wait_matmul(slot_w1, h1.__int__(), CONFIG.intermediate_dim)
                 gpu_ctx.wait_matmul(slot_w3, h2.__int__(), CONFIG.intermediate_dim)
@@ -1544,6 +1608,11 @@ def main() raises:
                 var scalar = weights.layer_scalar[0]
                 for i in range(CONFIG.embed_dim):
                     local_x[i] *= scalar
+
+                # Advance pipeline state
+                active_slot_q = next_slot_q
+                active_slot_k = next_slot_k
+                active_slot_v = next_slot_v
 
         # Copy the last prompt token's hidden state to x
         var last_px_offset = (num_prompt_tokens - 1) * CONFIG.embed_dim
@@ -1662,8 +1731,7 @@ def main() raises:
                     v_cache[step_cache_offset + i] = v_vec[i]
                     
                 var ratio = layer_heads // layer_kv_heads
-                @parameter
-                fn gen_head_worker(h: Int) capturing -> None:
+                def gen_head_worker(h: Int) capturing -> None:
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
                     var g_offset = g * layer_head_dim
@@ -1764,11 +1832,16 @@ def main() raises:
     gpu_ctx.free_gpu_buffer(weights_gpu_buf)
     gpu_ctx.free_gpu_buffer(x_buf)
     gpu_ctx.free_gpu_buffer(norm_x_buf)
+    gpu_ctx.free_gpu_buffer(norm_x_buf_1)
     gpu_ctx.free_gpu_buffer(final_norm_x_buf)
     gpu_ctx.free_gpu_buffer(q_buf)
+    gpu_ctx.free_gpu_buffer(q_buf_1)
     gpu_ctx.free_gpu_buffer(k_vec_buf)
+    gpu_ctx.free_gpu_buffer(k_vec_buf_1)
     gpu_ctx.free_gpu_buffer(v_vec_buf)
+    gpu_ctx.free_gpu_buffer(v_vec_buf_1)
     gpu_ctx.free_gpu_buffer(attn_out_buf)
+    gpu_ctx.free_gpu_buffer(attn_out_buf_1)
     gpu_ctx.free_gpu_buffer(proj_attn_out_buf)
     gpu_ctx.free_gpu_buffer(h1_buf)
     gpu_ctx.free_gpu_buffer(h2_buf)
