@@ -363,6 +363,20 @@ def q8_matmul_vec(
         parallelize[dense_worker](num_tasks)
 
 @always_inline
+def sort_floats(mut arr: List[Float32]):
+    var n = len(arr)
+    var gap = n // 2
+    while gap > 0:
+        for i in range(gap, n):
+            var temp = arr[i]
+            var j = i
+            while j >= gap and arr[j - gap] > temp:
+                arr[j] = arr[j - gap]
+                j -= gap
+            arr[j] = temp
+        gap = gap // 2
+
+@always_inline
 def q8_matmul_w2_block_column(
     W_packed: UnsafePointer[Int8, _],
     x: UnsafePointer[Float32, _],
@@ -370,19 +384,35 @@ def q8_matmul_w2_block_column(
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
-    threshold: Float32 = 1e-4,
+    top_k_pct: Float32 = 0.30,
 ):
     var c_in_blocks = c_in // 32
     
-    var active_blocks = List[Int]()
+    # 1. Compute block importance/energy (sum of absolute values of activations)
+    var importance = List[Float32](capacity=c_in_blocks)
     for b in range(c_in_blocks):
-        var active = False
+        var imp: Float32 = 0.0
         var x_offset = b * 32
         for i in range(32):
-            if abs(x[x_offset + i]) > threshold:
-                active = True
-                break
-        if active:
+            imp += abs(x[x_offset + i])
+        importance.append(imp)
+        
+    # 2. Sort the importances to find the threshold for Top-K blocks
+    var sorted_importance = importance.copy()
+    sort_floats(sorted_importance)
+    
+    var top_k_blocks = Int(top_k_pct * Float32(c_in_blocks))
+    if top_k_blocks < 1:
+        top_k_blocks = 1
+    elif top_k_blocks > c_in_blocks:
+        top_k_blocks = c_in_blocks
+        
+    var threshold_val = sorted_importance[c_in_blocks - top_k_blocks]
+    
+    # 3. Collect active blocks
+    var active_blocks = List[Int]()
+    for b in range(c_in_blocks):
+        if importance[b] >= threshold_val and importance[b] > 0.0:
             active_blocks.append(b)
             
     var num_active = len(active_blocks)
@@ -393,6 +423,7 @@ def q8_matmul_w2_block_column(
         
     var chunk_size = c_out // num_tasks
     
+    # 4. Parallelized CPU multiplication
     def sparse_worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else c_out
@@ -422,6 +453,7 @@ def q8_matmul_w2_block_column(
             out_ptr[r] = acc.reduce_add()
             
     parallelize[sparse_worker](num_tasks)
+
 
 @always_inline
 def fast_tanh(x: Float32) -> Float32:
@@ -646,6 +678,12 @@ def main() raises:
     var h2 = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out_gate = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out = alloc[Float32](CONFIG.embed_dim)
+    var x_old = alloc[Float32](CONFIG.embed_dim)
+    var common_tokens = [
+        108, 109, 110, 111,
+        235248, 235265, 235292, 235276, 235284,
+        476, 502, 518, 544, 570, 601, 612, 634, 642, 673, 696, 713, 728, 759, 798, 811
+    ]
 
     # Precompute layer cache offsets and total cache size
     var layer_cache_offsets = List[Int]()
@@ -868,7 +906,7 @@ def main() raises:
                     if attempts > 1000000000:
                         raise Error("Prefill weights paging I/O timed out waiting for sparse W2 blocks")
                         
-                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -948,6 +986,16 @@ def main() raises:
         
         # 3. Subsequent generation steps
         var tokens_generated = 1
+        var early_exits_l12 = 0
+        var early_exits_l24 = 0
+        var sum_cos_l12: Float32 = 0.0
+        var count_l12 = 0
+        var min_cos_l12: Float32 = 1.0
+        var max_cos_l12: Float32 = -1.0
+        var sum_cos_l24: Float32 = 0.0
+        var count_l24 = 0
+        var min_cos_l24: Float32 = 1.0
+        var max_cos_l24: Float32 = -1.0
         var t_gen_start = py.time()
         for pos in range(num_prompt_tokens, max_steps):
             # Layer 0 weight prefetch (stable base only!)
@@ -960,8 +1008,13 @@ def main() raises:
             for i in range(CONFIG.embed_dim):
                 x[i] = embed_ptr[token_emb_offset + i] * scale
                 
-            # Run the 48 layers of Transformer forward pass
+            # Run the 40 layers of Transformer forward pass
+            var early_exit_triggered = False
+            var early_exit_layer = CONFIG.num_layers
             for layer_idx in range(CONFIG.num_layers):
+                if layer_idx == 12 or layer_idx == 24:
+                    for i in range(CONFIG.embed_dim):
+                        x_old[i] = x[i]
                 var active_weights_ptr = w_a_ptr if layer_idx % 2 == 0 else w_b_ptr
                 var next_weights_ptr = w_b_ptr if layer_idx % 2 == 0 else w_a_ptr
                 
@@ -1091,7 +1144,7 @@ def main() raises:
                     if attempts > 1000000000:
                         raise Error("Decode weights paging I/O timed out waiting for sparse W2 blocks")
                         
-                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks, Float32(1e-4))
+                q8_matmul_w2_block_column(weights.w2_packed, ffn_out_gate, ffn_out, CONFIG.intermediate_dim, CONFIG.embed_dim, num_tasks)
                 
                 # Post-feedforward normalization on MLP output
                 rms_norm(ffn_out, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
@@ -1102,6 +1155,101 @@ def main() raises:
                 var scalar = weights.layer_scalar[0]
                 for i in range(CONFIG.embed_dim):
                     x[i] *= scalar
+                    
+                # Unified Early-Exit Depth Skipping Check (Heuristic C via scale-invariant Cosine Similarity)
+                if layer_idx == 12 or layer_idx == 24:
+                    var dot_vec = SIMD[DType.float32, 16](0.0)
+                    var sq_x_vec = SIMD[DType.float32, 16](0.0)
+                    var sq_x_old_vec = SIMD[DType.float32, 16](0.0)
+                    
+                    for c in range(0, CONFIG.embed_dim, 16):
+                        var xv = x.load[16](c)
+                        var xov = x_old.load[16](c)
+                        dot_vec += xv * xov
+                        sq_x_vec += xv * xv
+                        sq_x_old_vec += xov * xov
+                        
+                    var dot_prod = dot_vec.reduce_add()
+                    var sum_sq_x = sq_x_vec.reduce_add()
+                    var sum_sq_x_old = sq_x_old_vec.reduce_add()
+                    
+                    var norm_x = sqrt(sum_sq_x)
+                    var norm_x_old = sqrt(sum_sq_x_old)
+                    var cosine_sim = dot_prod / (norm_x * norm_x_old + 1e-9)
+                    
+                    # Update real-time stats
+                    if layer_idx == 12:
+                        sum_cos_l12 += cosine_sim
+                        count_l12 += 1
+                        if cosine_sim < min_cos_l12: min_cos_l12 = cosine_sim
+                        if cosine_sim > max_cos_l12: max_cos_l12 = cosine_sim
+                    else:
+                        sum_cos_l24 += cosine_sim
+                        count_l24 += 1
+                        if cosine_sim < min_cos_l24: min_cos_l24 = cosine_sim
+                        if cosine_sim > max_cos_l24: max_cos_l24 = cosine_sim
+                        
+                    var threshold_extreme = Float32(1.01)
+                    var threshold_moderate = Float32(1.01)
+
+
+
+                    
+                    var exit_now = False
+                    if cosine_sim > threshold_extreme:
+                        exit_now = True
+                    elif cosine_sim > threshold_moderate:
+                        # Run sub-sampled projection head over common tokens
+                        rms_norm(x, final_norm_weight, final_norm_x, CONFIG.embed_dim)
+                        
+                        var max_sub_logit: Float32 = -999999.0
+                        var sub_logits = List[Float32]()
+                        for i in range(len(common_tokens)):
+                            var r = common_tokens[i]
+                            var r_offset = r * CONFIG.embed_dim
+                            var acc = SIMD[DType.float32, 8](0.0)
+                            for c in range(0, CONFIG.embed_dim, 8):
+                                acc = acc + final_norm_x.load[8](c) * embed_ptr.load[8](r_offset + c)
+                            var logit = acc.reduce_add()
+                            logit = Float32(30.0) * fast_tanh(logit / Float32(30.0))
+                            sub_logits.append(logit)
+                            if logit > max_sub_logit:
+                                max_sub_logit = logit
+                                
+                        var sum_exp_sub: Float32 = 0.0
+                        for i in range(len(sub_logits)):
+                            sum_exp_sub += exp(sub_logits[i] - max_sub_logit)
+                            
+                        var top_prob = 1.0 / sum_exp_sub
+                        if top_prob > 0.90:
+                            exit_now = True
+                            
+                    if exit_now:
+                        if layer_idx == 12:
+                            early_exits_l12 += 1
+                        else:
+                            early_exits_l24 += 1
+                        early_exit_triggered = True
+                        early_exit_layer = layer_idx
+                        
+                        # Wait for the pending prefetch of layer_idx + 1 to complete so io_uring is clean!
+                        if layer_idx + 1 < CONFIG.num_layers and not next_layer_completed:
+                            var tag_next_val: UInt64 = UInt64(3000 + pos * 10 + layer_idx + 1)
+                            wait_for_tag(ring, tag_next_val, out_tag_ptr)
+                            
+                        # Recover/Propagate KV cache to skipped layers from position pos - 1
+                        for skipped_layer in range(layer_idx + 1, CONFIG.num_layers):
+                            var is_gl = CONFIG.is_global_layer(skipped_layer)
+                            var l_kv_heads = 1 if is_gl else 8
+                            var l_head_dim = 512 if is_gl else 256
+                            var l_stride = l_kv_heads * l_head_dim
+                            var l_cache_offset = layer_cache_offsets[skipped_layer]
+                            var s_cache_offset = l_cache_offset + pos * l_stride
+                            var p_cache_offset = l_cache_offset + (pos - 1) * l_stride
+                            for i in range(l_stride):
+                                k_cache[s_cache_offset + i] = k_cache[p_cache_offset + i]
+                                v_cache[s_cache_offset + i] = v_cache[p_cache_offset + i]
+                        break
                     
                 if layer_idx + 1 < CONFIG.num_layers:
                     if not next_layer_completed:
@@ -1136,7 +1284,21 @@ def main() raises:
             
         var t_gen_end = py.time()
         var gen_time = Float64(py=(t_gen_end - t_gen_start))
-        print("\n[Mojo Bench] Generation completed in", gen_time, "sec (" + String(Float64(tokens_generated) / gen_time) + " t/s)")
+        print("\n\n========================================= EARLY-EXIT DIAGNOSTICS =========================================")
+        print("  Total Tokens Generated:        ", tokens_generated)
+        print("  Early Exits at Layer 12 (32%):  ", early_exits_l12, " (", String(Float64(early_exits_l12) * 100.0 / Float64(tokens_generated)), "%)")
+        print("  Early Exits at Layer 24 (62%):  ", early_exits_l24, " (", String(Float64(early_exits_l24) * 100.0 / Float64(tokens_generated)), "%)")
+        var avg_layers = (Float64(early_exits_l12) * 13.0 + Float64(early_exits_l24) * 25.0 + Float64(tokens_generated - early_exits_l12 - early_exits_l24) * 40.0) / Float64(tokens_generated)
+        print("  Average Layers Executed:       ", avg_layers, " / 40 (", String(avg_layers * 100.0 / 40.0), "%)")
+        var bandwidth_saved = (1.0 - (avg_layers / 40.0)) * 100.0
+        print("  Estimated DDR Bandwidth Saved:  ", bandwidth_saved, "%")
+        print("  --------------------------------------------------------------------------------------------------------")
+        var avg_cos_l12 = sum_cos_l12 / Float32(count_l12) if count_l12 > 0 else Float32(0.0)
+        var avg_cos_l24 = sum_cos_l24 / Float32(count_l24) if count_l24 > 0 else Float32(0.0)
+        print("  Layer 12 Cosine Similarity:     Min: ", String(min_cos_l12 if count_l12 > 0 else Float32(0.0)), " | Max: ", String(max_cos_l12 if count_l12 > 0 else Float32(0.0)), " | Avg: ", String(avg_cos_l12))
+        print("  Layer 24 Cosine Similarity:     Min: ", String(min_cos_l24 if count_l24 > 0 else Float32(0.0)), " | Max: ", String(max_cos_l24 if count_l24 > 0 else Float32(0.0)), " | Avg: ", String(avg_cos_l24))
+        print("==========================================================================================================")
+        print("[Mojo Bench] Generation completed in", gen_time, "sec (" + String(Float64(tokens_generated) / gen_time) + " t/s)")
         
         local_max_logits.free()
         local_next_tokens.free()
@@ -1172,5 +1334,6 @@ def main() raises:
     h2.free()
     ffn_out_gate.free()
     ffn_out.free()
+    x_old.free()
     k_cache.free()
     v_cache.free()
