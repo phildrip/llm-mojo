@@ -10,15 +10,16 @@ def main() raises:
     comptime seq_len = 8
     
     print("Initializing MiniTransformer...")
-    # Quick, lightweight 2-layer test transformer
+    # Quick, lightweight 3-layer test transformer
     var model = MiniTransformer[
         embed_dim=128,
         intermediate_dim=256,
         num_heads=4,
-        num_layers=2,
+        num_layers=3,
         vocab_size=50257,
         max_seq_len=64,
-        reuse_attn=True,
+        reuse_attn=False,
+        hourglass=True,
     ]()
     
     print("Allocating Activations...")
@@ -28,7 +29,7 @@ def main() raises:
         embed_dim=128,
         intermediate_dim=256,
         num_heads=4,
-        num_layers=2,
+        num_layers=3,
         vocab_size=50257,
     )
     

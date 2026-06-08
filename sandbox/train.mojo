@@ -19,8 +19,9 @@ def generate_sample[
     vocab_size: Int,
     max_seq_len: Int,
     reuse_attn: Bool = False,
+    hourglass: Bool = False,
 ](
-    model: MiniTransformer[embed_dim, intermediate_dim, num_heads, num_layers, vocab_size, max_seq_len, reuse_attn],
+    model: MiniTransformer[embed_dim, intermediate_dim, num_heads, num_layers, vocab_size, max_seq_len, reuse_attn, hourglass],
     py_tokenizer: PythonObject,
     start_text: String,
     num_tokens: Int,
@@ -101,14 +102,17 @@ def main() raises:
     comptime vocab_size = 50257
     comptime max_seq_len = 64
     
-    comptime reuse_attn = True
+    comptime reuse_attn = False
+    comptime hourglass = True
     
     # Initialize DataLoader
     print("Loading TinyStories validation dataset...")
     var loader = DataLoader("sandbox/tinystories_train.bin")
     
     # Initialize Model
-    if reuse_attn:
+    if hourglass:
+        print("Instantiating 15M Parameter Sandbox Mutated Model (Dynamic Hourglass Pooling)...")
+    elif reuse_attn:
         print("Instantiating 15M Parameter Sandbox Mutated Model (Decoupled Attention Map Re-use)...")
     else:
         print("Instantiating 15M Parameter Sandbox Base Model...")
@@ -120,6 +124,7 @@ def main() raises:
         vocab_size=vocab_size,
         max_seq_len=max_seq_len,
         reuse_attn=reuse_attn,
+        hourglass=hourglass,
     ]()
     
     # Pre-allocate activations for training batch
@@ -178,6 +183,7 @@ def main() raises:
                 vocab_size=vocab_size,
                 max_seq_len=max_seq_len,
                 reuse_attn=reuse_attn,
+                hourglass=hourglass,
             ](model, py_tokenizer, "Once upon a time, there was a little", 20)
             
     var end_time = std.time.perf_counter()

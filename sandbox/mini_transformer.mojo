@@ -244,6 +244,54 @@ def softmax_bwd(
                     d_scores[offset + j] = 0.0
 
 # -----------------------------------------------------------------------------
+# 1.5. Hourglass Pooling/Unpooling Helpers (In-Place, Zero-Allocation)
+# -----------------------------------------------------------------------------
+
+@always_inline
+def pool_activations(x: UnsafePointer[Float32, MutExternalOrigin], out_x: UnsafePointer[Float32, MutExternalOrigin], B: Int, S: Int, D: Int):
+    for b in range(B):
+        for i in range(S // 2):
+            var target_offset = (b * (S // 2) + i) * D
+            var src1_offset = (b * S + 2 * i) * D
+            var src2_offset = (b * S + 2 * i + 1) * D
+            for d in range(D):
+                out_x[target_offset + d] = 0.5 * (x[src1_offset + d] + x[src2_offset + d])
+
+@always_inline
+def unpool_activations(x: UnsafePointer[Float32, MutExternalOrigin], out_x: UnsafePointer[Float32, MutExternalOrigin], B: Int, S: Int, D: Int):
+    for b in range(B - 1, -1, -1):
+        for i in range((S // 2) - 1, -1, -1):
+            var target1_offset = (b * S + 2 * i) * D
+            var target2_offset = (b * S + 2 * i + 1) * D
+            var src_offset = (b * (S // 2) + i) * D
+            for d in range(D - 1, -1, -1):
+                var val = x[src_offset + d]
+                out_x[target1_offset + d] = val
+                out_x[target2_offset + d] = val
+
+@always_inline
+def pool_gradients(dx: UnsafePointer[Float32, MutExternalOrigin], out_dx: UnsafePointer[Float32, MutExternalOrigin], B: Int, S: Int, D: Int):
+    for b in range(B):
+        for i in range(S // 2):
+            var target_offset = (b * (S // 2) + i) * D
+            var src1_offset = (b * S + 2 * i) * D
+            var src2_offset = (b * S + 2 * i + 1) * D
+            for d in range(D):
+                out_dx[target_offset + d] = dx[src1_offset + d] + dx[src2_offset + d]
+
+@always_inline
+def unpool_gradients(dx: UnsafePointer[Float32, MutExternalOrigin], out_dx: UnsafePointer[Float32, MutExternalOrigin], B: Int, S: Int, D: Int):
+    for b in range(B - 1, -1, -1):
+        for i in range((S // 2) - 1, -1, -1):
+            var target1_offset = (b * S + 2 * i) * D
+            var target2_offset = (b * S + 2 * i + 1) * D
+            var src_offset = (b * (S // 2) + i) * D
+            for d in range(D - 1, -1, -1):
+                var val = 0.5 * dx[src_offset + d]
+                out_dx[target1_offset + d] = val
+                out_dx[target2_offset + d] = val
+
+# -----------------------------------------------------------------------------
 # 2. Pre-allocated Activations Struct (Zero-Allocation Loop)
 # -----------------------------------------------------------------------------
 
@@ -386,6 +434,7 @@ struct MiniTransformer[
     vocab_size: Int,
     max_seq_len: Int,
     reuse_attn: Bool = False,
+    hourglass: Bool = False,
 ]:
     var total_size: Int
     var weights: UnsafePointer[Float32, MutExternalOrigin]
@@ -603,53 +652,66 @@ struct MiniTransformer[
             
         # 2. Iterate layers
         for l in range(L):
+            comptime if Self.hourglass and Self.num_layers >= 3:
+                if l == 1:
+                    pool_activations(act.layer_out + 1 * N * D, act.layer_out + 1 * N * D, B, S, D)
+                elif l == L - 1:
+                    unpool_activations(act.layer_out + (L - 1) * N * D, act.layer_out + (L - 1) * N * D, B, S, D)
+                    
+            var S_layer = S
+            var N_layer = N
+            comptime if Self.hourglass and Self.num_layers >= 3:
+                if l > 0 and l < L - 1:
+                    S_layer = S // 2
+                    N_layer = B * S_layer
+                    
             var layer_in = act.layer_out + l * N * D
             var norm1_ptr = act.norm1 + l * N * D
             var norm1_inv_rms_ptr = act.norm1_inv_rms + l * N
             
             # RMSNorm 1
-            rms_norm_fwd(layer_in, self.get_attn_norm_w(l), norm1_ptr, norm1_inv_rms_ptr, N, D)
+            rms_norm_fwd(layer_in, self.get_attn_norm_w(l), norm1_ptr, norm1_inv_rms_ptr, N_layer, D)
             
             # Q, K, V Projections
             var q_ptr = act.q + l * N * D
             var k_ptr = act.k + l * N * D
             var v_ptr = act.v + l * N * D
             
-            comptime if Self.reuse_attn:
+            comptime if Self.reuse_attn and not Self.hourglass:
                 if l == 0:
-                    matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N, D, D)
-                    matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N, D, D)
+                    matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N_layer, D, D)
+                    matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N_layer, D, D)
             else:
-                matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N, D, D)
-                matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N, D, D)
-            matmul(v_ptr, norm1_ptr, self.get_wv_w(l), N, D, D)
+                matmul(q_ptr, norm1_ptr, self.get_wq_w(l), N_layer, D, D)
+                matmul(k_ptr, norm1_ptr, self.get_wk_w(l), N_layer, D, D)
+            matmul(v_ptr, norm1_ptr, self.get_wv_w(l), N_layer, D, D)
             
             # Multi-head attention scores and probabilities
             var scores_ptr = act.scores + l * B * H * S * S
             var probs_ptr = act.attn_probs + l * B * H * S * S
             var context_ptr = act.context + l * N * D
             
-            comptime if Self.reuse_attn:
+            comptime if Self.reuse_attn and not Self.hourglass:
                 if l == 0:
                     # Compute QK^T / sqrt(d) causally
                     var inv_sqrt_d = 1.0 / sqrt(Float32(d))
                     for b in range(B):
                         for h in range(H):
-                            for i in range(S):
+                            for i in range(S_layer):
                                 for j in range(i + 1):
-                                    var q_idx = (b * S + i) * D + h * d
-                                    var k_idx = (b * S + j) * D + h * d
+                                    var q_idx = (b * S_layer + i) * D + h * d
+                                    var k_idx = (b * S_layer + j) * D + h * d
                                     
                                     var score = Float32(0.0)
                                     for c in range(d):
                                         score += q_ptr[q_idx + c] * k_ptr[k_idx + c]
                                     
-                                    scores_ptr[((b * H + h) * S + i) * S + j] = score * inv_sqrt_d
-                                for j in range(i + 1, S):
-                                    scores_ptr[((b * H + h) * S + i) * S + j] = -1e9 # Mask out future
+                                    scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] = score * inv_sqrt_d
+                                for j in range(i + 1, S_layer):
+                                    scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] = -1e9 # Mask out future
                                     
                     # Softmax
-                    softmax_fwd(scores_ptr, probs_ptr, B, H, S)
+                    softmax_fwd(scores_ptr, probs_ptr, B, H, S_layer)
                 else:
                     # Reuse probabilities from Layer 0
                     probs_ptr = act.attn_probs + 0 * B * H * S * S
@@ -658,67 +720,67 @@ struct MiniTransformer[
                 var inv_sqrt_d = 1.0 / sqrt(Float32(d))
                 for b in range(B):
                     for h in range(H):
-                        for i in range(S):
+                        for i in range(S_layer):
                             for j in range(i + 1):
-                                var q_idx = (b * S + i) * D + h * d
-                                var k_idx = (b * S + j) * D + h * d
+                                var q_idx = (b * S_layer + i) * D + h * d
+                                var k_idx = (b * S_layer + j) * D + h * d
                                 
                                 var score = Float32(0.0)
                                 for c in range(d):
                                     score += q_ptr[q_idx + c] * k_ptr[k_idx + c]
                                 
-                                scores_ptr[((b * H + h) * S + i) * S + j] = score * inv_sqrt_d
-                            for j in range(i + 1, S):
-                                scores_ptr[((b * H + h) * S + i) * S + j] = -1e9 # Mask out future
+                                scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] = score * inv_sqrt_d
+                            for j in range(i + 1, S_layer):
+                                scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] = -1e9 # Mask out future
                                 
                 # Softmax
-                softmax_fwd(scores_ptr, probs_ptr, B, H, S)
+                softmax_fwd(scores_ptr, probs_ptr, B, H, S_layer)
             
             # Context = probs * V
             for b in range(B):
                 for h in range(H):
-                    for i in range(S):
-                        var prob_offset = ((b * H + h) * S + i) * S
-                        var out_offset = (b * S + i) * D + h * d
+                    for i in range(S_layer):
+                        var prob_offset = ((b * H + h) * S_layer + i) * S_layer
+                        var out_offset = (b * S_layer + i) * D + h * d
                         
                         for c in range(d):
                             var weighted_val = Float32(0.0)
                             for j in range(i + 1):
-                                var v_idx = (b * S + j) * D + h * d + c
+                                var v_idx = (b * S_layer + j) * D + h * d + c
                                 weighted_val += probs_ptr[prob_offset + j] * v_ptr[v_idx]
                             context_ptr[out_offset + c] = weighted_val
                             
             # Attention Output projection
             var attn_out_ptr = act.attn_out + l * N * D
-            matmul(attn_out_ptr, context_ptr, self.get_wo_w(l), N, D, D)
+            matmul(attn_out_ptr, context_ptr, self.get_wo_w(l), N_layer, D, D)
             
             # Residual 1
             var layer_mid = act.norm2 + l * N * D # Temporarily write here, or mlp_in
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 layer_mid[i] = layer_in[i] + attn_out_ptr[i]
                 
             # RMSNorm 2
             var norm2_ptr = act.norm2 + l * N * D
             var norm2_inv_rms_ptr = act.norm2_inv_rms + l * N
-            rms_norm_fwd(layer_mid, self.get_mlp_norm_w(l), norm2_ptr, norm2_inv_rms_ptr, N, D)
+            rms_norm_fwd(layer_mid, self.get_mlp_norm_w(l), norm2_ptr, norm2_inv_rms_ptr, N_layer, D)
             
             # MLP Linear 1
             var mlp_in_ptr = act.mlp_in + l * N * M
-            matmul(mlp_in_ptr, norm2_ptr, self.get_win_w(l), N, M, D)
+            matmul(mlp_in_ptr, norm2_ptr, self.get_win_w(l), N_layer, M, D)
             
             # ReLU activation
             var mlp_act_ptr = act.mlp_act + l * N * M
-            for i in range(N * M):
+            for i in range(N_layer * M):
                 var val = mlp_in_ptr[i]
                 mlp_act_ptr[i] = val if val > 0.0 else 0.0
                 
             # MLP Linear 2
             var mlp_out_ptr = act.mlp_out + l * N * D
-            matmul(mlp_out_ptr, mlp_act_ptr, self.get_wout_w(l), N, D, M)
+            matmul(mlp_out_ptr, mlp_act_ptr, self.get_wout_w(l), N_layer, D, M)
             
             # Residual 2
             var next_layer_in = act.layer_out + (l + 1) * N * D
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 next_layer_in[i] = layer_mid[i] + mlp_out_ptr[i]
                 
         # 3. Final layer RMSNorm
@@ -800,6 +862,13 @@ struct MiniTransformer[
         var temp_nd = alloc[Float32](N * D)
         
         for l in range(L - 1, -1, -1):
+            var S_layer = S
+            var N_layer = N
+            comptime if Self.hourglass and Self.num_layers >= 3:
+                if l > 0 and l < L - 1:
+                    S_layer = S // 2
+                    N_layer = B * S_layer
+
             var layer_in = act.layer_out + l * N * D
             var next_layer_in_grad = act.d_layer_out + (l + 1) * N * D
             var layer_in_grad = act.d_layer_out + l * N * D
@@ -823,45 +892,42 @@ struct MiniTransformer[
             var d_norm1_ptr = act.d_norm1 + l * N * D
             
             # Residual 2 backward: d_layer_mid = d_layer_out_next, d_mlp_out = d_layer_out_next
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 d_mlp_out_ptr[i] = next_layer_in_grad[i]
                 
             # MLP Out projection backward
-            matmul_AtB(self.get_wout_g(l), mlp_act_ptr, d_mlp_out_ptr, M, D, N)
-            matmul_ABt(d_mlp_act_ptr, d_mlp_out_ptr, self.get_wout_w(l), N, M, D)
+            matmul_AtB(self.get_wout_g(l), mlp_act_ptr, d_mlp_out_ptr, M, D, N_layer)
+            matmul_ABt(d_mlp_act_ptr, d_mlp_out_ptr, self.get_wout_w(l), N_layer, M, D)
             
             # ReLU backward
-            for i in range(N * M):
+            for i in range(N_layer * M):
                 d_mlp_in_ptr[i] = d_mlp_act_ptr[i] if mlp_in_ptr[i] > 0.0 else 0.0
                 
             # MLP In projection backward
-            matmul_AtB(self.get_win_g(l), norm2_ptr, d_mlp_in_ptr, D, M, N)
-            matmul_ABt(d_norm2_ptr, d_mlp_in_ptr, self.get_win_w(l), N, D, M)
+            matmul_AtB(self.get_win_g(l), norm2_ptr, d_mlp_in_ptr, D, M, N_layer)
+            matmul_ABt(d_norm2_ptr, d_mlp_in_ptr, self.get_win_w(l), N_layer, D, M)
             
             # RMSNorm 2 backward: input is layer_mid = layer_in + attn_out
-            # We must construct actual layer_mid because norm2_ptr contains norm2_fwd result, wait!
-            # Ah! norm2_ptr contains the RMSNormalized values, not layer_mid!
-            # Reconstruct layer_mid since: layer_mid = layer_in + attn_out!
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 temp_nd[i] = layer_in[i] + attn_out_ptr[i]
                 
-            rms_norm_bwd(temp_nd, self.get_mlp_norm_w(l), d_norm2_ptr, act.norm2_inv_rms + l * N, layer_in_grad, self.get_mlp_norm_g(l), N, D)
+            rms_norm_bwd(temp_nd, self.get_mlp_norm_w(l), d_norm2_ptr, act.norm2_inv_rms + l * N, layer_in_grad, self.get_mlp_norm_g(l), N_layer, D)
             
             # Add gradient from subsequent layer (Residual 2)
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 layer_in_grad[i] += next_layer_in_grad[i]
                 
             # Residual 1 backward: d_attn_out = d_layer_in_grad (accumulated so far)
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 d_attn_out_ptr[i] = layer_in_grad[i]
                 
             # Attention Output projection backward
-            matmul_AtB(self.get_wo_g(l), context_ptr, d_attn_out_ptr, D, D, N)
-            matmul_ABt(d_context_ptr, d_attn_out_ptr, self.get_wo_w(l), N, D, D)
+            matmul_AtB(self.get_wo_g(l), context_ptr, d_attn_out_ptr, D, D, N_layer)
+            matmul_ABt(d_context_ptr, d_attn_out_ptr, self.get_wo_w(l), N_layer, D, D)
             
             # Multi-head attention backward
             var layer_offset: Int
-            comptime if Self.reuse_attn:
+            comptime if Self.reuse_attn and not Self.hourglass:
                 layer_offset = 0
             else:
                 layer_offset = l
@@ -876,21 +942,21 @@ struct MiniTransformer[
             
             # 1. d_probs and d_v
             # Clear d_v for this layer
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 d_v_ptr[i] = 0.0
                 
-            comptime if not Self.reuse_attn:
-                for i in range(B * H * S * S):
+            comptime if not (Self.reuse_attn and not Self.hourglass):
+                for i in range(B * H * S_layer * S_layer):
                     d_probs_ptr[i] = 0.0
                 
             for b in range(B):
                 for h in range(H):
-                    for i in range(S):
-                        var prob_offset = ((b * H + h) * S + i) * S
-                        var context_grad_offset = (b * S + i) * D + h * d
+                    for i in range(S_layer):
+                        var prob_offset = ((b * H + h) * S_layer + i) * S_layer
+                        var context_grad_offset = (b * S_layer + i) * D + h * d
                         
                         for j in range(i + 1):
-                            var v_idx = (b * S + j) * D + h * d
+                            var v_idx = (b * S_layer + j) * D + h * d
                             var prob_val = probs_ptr[prob_offset + j]
                             
                             # Accumulate d_probs
@@ -902,89 +968,95 @@ struct MiniTransformer[
                                 
                             d_probs_ptr[prob_offset + j] += dot_ctx_v
                             
-            comptime if Self.reuse_attn:
+            comptime if Self.reuse_attn and not Self.hourglass:
                 if l == 0:
                     # 2. Softmax backward to get d_scores
-                    softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S)
+                    softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S_layer)
                     
                     # 3. Projections backward to get dQ and dK
                     var inv_sqrt_d = 1.0 / sqrt(Float32(d))
-                    for i in range(N * D):
+                    for i in range(N_layer * D):
                         d_q_ptr[i] = 0.0
                         d_k_ptr[i] = 0.0
                         
                     for b in range(B):
                         for h in range(H):
-                            for i in range(S):
+                            for i in range(S_layer):
                                 for j in range(i + 1):
-                                    var d_score = d_scores_ptr[((b * H + h) * S + i) * S + j] * inv_sqrt_d
-                                    var q_idx = (b * S + i) * D + h * d
-                                    var k_idx = (b * S + j) * D + h * d
+                                    var d_score = d_scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] * inv_sqrt_d
+                                    var q_idx = (b * S_layer + i) * D + h * d
+                                    var k_idx = (b * S_layer + j) * D + h * d
                                     
                                     for c in range(d):
                                         d_q_ptr[q_idx + c] += d_score * k_ptr[k_idx + c]
                                         d_k_ptr[k_idx + c] += d_score * q_ptr[q_idx + c]
                                         
                     # Projections Weight Backward (Wq and Wk)
-                    matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N)
-                    matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N)
+                    matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N_layer)
+                    matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N_layer)
             else:
                 # 2. Softmax backward to get d_scores
-                softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S)
+                softmax_bwd(probs_ptr, d_probs_ptr, d_scores_ptr, B, H, S_layer)
                 
                 # 3. Projections backward to get dQ and dK
                 var inv_sqrt_d = 1.0 / sqrt(Float32(d))
-                for i in range(N * D):
+                for i in range(N_layer * D):
                     d_q_ptr[i] = 0.0
                     d_k_ptr[i] = 0.0
                     
                 for b in range(B):
                     for h in range(H):
-                        for i in range(S):
+                        for i in range(S_layer):
                             for j in range(i + 1):
-                                var d_score = d_scores_ptr[((b * H + h) * S + i) * S + j] * inv_sqrt_d
-                                var q_idx = (b * S + i) * D + h * d
-                                var k_idx = (b * S + j) * D + h * d
+                                var d_score = d_scores_ptr[((b * H + h) * S_layer + i) * S_layer + j] * inv_sqrt_d
+                                var q_idx = (b * S_layer + i) * D + h * d
+                                var k_idx = (b * S_layer + j) * D + h * d
                                 
                                 for c in range(d):
                                     d_q_ptr[q_idx + c] += d_score * k_ptr[k_idx + c]
                                     d_k_ptr[k_idx + c] += d_score * q_ptr[q_idx + c]
                                     
                 # Projections Weight Backward (Wq and Wk)
-                matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N)
-                matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N)
+                matmul_AtB(self.get_wq_g(l), norm1_ptr, d_q_ptr, D, D, N_layer)
+                matmul_AtB(self.get_wk_g(l), norm1_ptr, d_k_ptr, D, D, N_layer)
                 
             # Wv is always backpropagated
-            matmul_AtB(self.get_wv_g(l), norm1_ptr, d_v_ptr, D, D, N)
+            matmul_AtB(self.get_wv_g(l), norm1_ptr, d_v_ptr, D, D, N_layer)
             
             # Projections Input Backward (accumulate to d_norm1)
-            comptime if Self.reuse_attn:
+            comptime if Self.reuse_attn and not Self.hourglass:
                 if l == 0:
-                    matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N, D, D)
-                    matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N, D, D)
-                    for i in range(N * D):
+                    matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N_layer, D, D)
+                    matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N_layer, D, D)
+                    for i in range(N_layer * D):
                         d_norm1_ptr[i] += temp_nd[i]
-                    matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N, D, D)
-                    for i in range(N * D):
+                    matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N_layer, D, D)
+                    for i in range(N_layer * D):
                         d_norm1_ptr[i] += temp_nd[i]
                 else:
                     # Only backpropagate through V
-                    matmul_ABt(d_norm1_ptr, d_v_ptr, self.get_wv_w(l), N, D, D)
+                    matmul_ABt(d_norm1_ptr, d_v_ptr, self.get_wv_w(l), N_layer, D, D)
             else:
-                matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N, D, D)
-                matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N, D, D)
-                for i in range(N * D):
+                matmul_ABt(d_norm1_ptr, d_q_ptr, self.get_wq_w(l), N_layer, D, D)
+                matmul_ABt(temp_nd, d_k_ptr, self.get_wk_w(l), N_layer, D, D)
+                for i in range(N_layer * D):
                     d_norm1_ptr[i] += temp_nd[i]
-                matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N, D, D)
-                for i in range(N * D):
+                matmul_ABt(temp_nd, d_v_ptr, self.get_wv_w(l), N_layer, D, D)
+                for i in range(N_layer * D):
                     d_norm1_ptr[i] += temp_nd[i]
                 
             # RMSNorm 1 backward
-            rms_norm_bwd(layer_in, self.get_attn_norm_w(l), d_norm1_ptr, act.norm1_inv_rms + l * N, temp_nd, self.get_attn_norm_g(l), N, D)
+            rms_norm_bwd(layer_in, self.get_attn_norm_w(l), d_norm1_ptr, act.norm1_inv_rms + l * N, temp_nd, self.get_attn_norm_g(l), N_layer, D)
             
             # Accumulate layer_in_grad
-            for i in range(N * D):
+            for i in range(N_layer * D):
                 layer_in_grad[i] += temp_nd[i]
+                
+            comptime if Self.hourglass and Self.num_layers >= 3:
+                if l == L - 1:
+                    pool_gradients(act.d_layer_out + l * N * D, act.d_layer_out + l * N * D, B, S, D)
+                elif l == 1:
+                    unpool_gradients(act.d_layer_out + 1 * N * D, act.d_layer_out + 1 * N * D, B, S, D)
                 
         temp_nd.free()
         
