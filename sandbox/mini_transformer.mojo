@@ -42,6 +42,45 @@ def matmul(
     parallelize[worker](M)
 
 @always_inline
+def matmul_sparse(
+    C: UnsafePointer[Float32, MutExternalOrigin],
+    A: UnsafePointer[Float32, _],
+    B: UnsafePointer[Float32, _],
+    active_indices: UnsafePointer[Int, MutExternalOrigin],
+    num_active: UnsafePointer[Int, MutExternalOrigin],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    # C = A * B. C is M x N, A is M x K, B is K x N
+    # Parallelize over rows of C (M) using indirect index routing
+    def worker(i: Int) capturing -> None:
+        # Initialize row i of C
+        for j in range(N):
+            C[i * N + j] = 0.0
+            
+        var n_act = num_active[i]
+        var row_indices = active_indices + i * K
+        
+        for k_idx in range(n_act):
+            var k = row_indices[k_idx]
+            var a_val = A[i * K + k]
+            var a_simd = SIMD[DType.float32, 8](a_val)
+            
+            var j = 0
+            while j < N - 7:
+                var b_simd = B.load[8](k * N + j)
+                var c_simd = C.load[8](i * N + j)
+                C.store[8](i * N + j, c_simd + a_simd * b_simd)
+                j += 8
+                
+            while j < N:
+                C[i * N + j] += a_val * B[k * N + j]
+                j += 1
+
+    parallelize[worker](M)
+
+@always_inline
 def matmul_AtB(
     C: UnsafePointer[Float32, MutExternalOrigin],
     A: UnsafePointer[Float32, _],
@@ -86,6 +125,41 @@ def matmul_ABt(
     # Parallelize over rows of C (M)
     def worker(i: Int) capturing -> None:
         for j in range(N):
+            var acc = SIMD[DType.float32, 8](0.0)
+            var k = 0
+            while k < K - 7:
+                var a_simd = A.load[8](i * K + k)
+                var b_simd = B.load[8](j * K + k)
+                acc += a_simd * b_simd
+                k += 8
+                
+            var sum = acc.reduce_add()
+            while k < K:
+                sum += A[i * K + k] * B[j * K + k]
+                k += 1
+                
+            C[i * N + j] = sum
+
+    parallelize[worker](M)
+
+@always_inline
+def matmul_ABt_relu(
+    C: UnsafePointer[Float32, MutExternalOrigin],
+    A: UnsafePointer[Float32, _],
+    B: UnsafePointer[Float32, _],
+    relu_in: UnsafePointer[Float32, _],
+    M: Int,
+    N: Int,
+    K: Int,
+):
+    # C = A * B^T, but only compute if relu_in[i * N + j] > 0.0, else C[i * N + j] = 0.0
+    # Parallelize over rows of C (M)
+    def worker(i: Int) capturing -> None:
+        for j in range(N):
+            if relu_in[i * N + j] <= 0.0:
+                C[i * N + j] = 0.0
+                continue
+                
             var acc = SIMD[DType.float32, 8](0.0)
             var k = 0
             while k < K - 7:
@@ -351,6 +425,10 @@ struct Activations:
     var d_v: UnsafePointer[Float32, MutExternalOrigin]
     var d_norm1: UnsafePointer[Float32, MutExternalOrigin]
     
+    # Pre-allocated scratchpads for dynamic indirect indexing / sparsity
+    var active_indices: UnsafePointer[Int, MutExternalOrigin]
+    var num_active: UnsafePointer[Int, MutExternalOrigin]
+    
     def __init__(out self, batch_size: Int, seq_len: Int, embed_dim: Int, intermediate_dim: Int, num_heads: Int, num_layers: Int, vocab_size: Int):
         self.B = batch_size
         self.S = seq_len
@@ -363,6 +441,10 @@ struct Activations:
         
         self.x_tokens = alloc[Int32](self.N)
         self.y_tokens = alloc[Int32](self.N)
+        
+        # Pre-allocate sparse index structures once on heap (zero-allocation at runtime!)
+        self.active_indices = alloc[Int](self.L * self.N * self.M)
+        self.num_active = alloc[Int](self.L * self.N)
         
         # Calculate sizing of activations
         var sz_nd = self.N * self.D
@@ -421,6 +503,8 @@ struct Activations:
         self.x_tokens.free()
         self.y_tokens.free()
         self.mem_ptr.free()
+        self.active_indices.free()
+        self.num_active.free()
 
 # -----------------------------------------------------------------------------
 # 3. MiniTransformer Parameterized Struct
@@ -774,9 +858,20 @@ struct MiniTransformer[
                 var val = mlp_in_ptr[i]
                 mlp_act_ptr[i] = val if val > 0.0 else 0.0
                 
-            # MLP Linear 2
+            # Pre-scan activations for lossless dynamic indirect indexing
+            var active_indices_layer = act.active_indices + l * N * M
+            var num_active_layer = act.num_active + l * N
+            for i in range(N_layer):
+                var n_act = 0
+                for k in range(M):
+                    if mlp_act_ptr[i * M + k] != 0.0:
+                        active_indices_layer[i * M + n_act] = k
+                        n_act += 1
+                num_active_layer[i] = n_act
+                
+            # MLP Linear 2 using high-speed indirect indexed matmul_sparse
             var mlp_out_ptr = act.mlp_out + l * N * D
-            matmul(mlp_out_ptr, mlp_act_ptr, self.get_wout_w(l), N_layer, D, M)
+            matmul_sparse(mlp_out_ptr, mlp_act_ptr, self.get_wout_w(l), active_indices_layer, num_active_layer, N_layer, D, M)
             
             # Residual 2
             var next_layer_in = act.layer_out + (l + 1) * N * D
@@ -897,7 +992,7 @@ struct MiniTransformer[
                 
             # MLP Out projection backward
             matmul_AtB(self.get_wout_g(l), mlp_act_ptr, d_mlp_out_ptr, M, D, N_layer)
-            matmul_ABt(d_mlp_act_ptr, d_mlp_out_ptr, self.get_wout_w(l), N_layer, M, D)
+            matmul_ABt_relu(d_mlp_act_ptr, d_mlp_out_ptr, self.get_wout_w(l), mlp_in_ptr, N_layer, M, D)
             
             # ReLU backward
             for i in range(N_layer * M):
