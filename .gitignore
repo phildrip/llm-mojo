@@ -26,4 +26,14 @@ comparison_results.txt
 /model_q8_ram
 /model_q8_gpu
 /train
-
+/model_speculative_moe
+/model_speculative_q4
+/model_speculative_svd
+/model_speculative_ternary_q4
+/quantize_embed_q4
+/test_spec
+/test_ternary
+/test_ternary_scaled
+/test_ptr
+*.pdf
+input.txt

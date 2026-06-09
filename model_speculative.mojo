@@ -1732,6 +1732,95 @@ def main() raises:
                 current_K = max(current_K - 1, 1)
 
             # Commit steps & rollback position pointer
+            if num_accepted == K_actual:
+                # The draft model never ran with input draft_tokens[K_actual], so its key/value at pos + K_actual is missing.
+                # Run a single forward step of the draft model on draft_tokens[K_actual] at position pos + K_actual
+                # to populate the draft KV cache correctly.
+                var curr = draft_tokens[K_actual]
+                var token_emb_offset = curr * DRAFT_CONFIG.embed_dim
+                for i in range(DRAFT_CONFIG.embed_dim):
+                    draft_x[i] = embed_ptr[token_emb_offset + i] * scale
+                
+                for layer_idx in range(DRAFT_CONFIG.num_layers):
+                    var weights = DRAFT_CONFIG.get_layer_weights(layer_idx, draft_base_ptr + DRAFT_CONFIG.get_layer_offset(layer_idx))
+                    var is_global = DRAFT_CONFIG.is_global_layer(layer_idx)
+                    var layer_heads = 16
+                    var layer_kv_heads = 1 if is_global else 8
+                    var layer_head_dim = 512 if is_global else 256
+                    var kv_stride = layer_kv_heads * layer_head_dim
+                    var ratio = layer_heads // layer_kv_heads
+                    
+                    rms_norm(draft_x, weights.input_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
+                    
+                    q4_matmul_vec(weights.wq_packed, weights.wq_scales, draft_norm_x, draft_q, DRAFT_CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                    q4_matmul_vec(weights.wk_packed, weights.wk_scales, draft_norm_x, draft_k_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    
+                    if is_global:
+                        for i in range(kv_stride):
+                            draft_v_vec[i] = draft_k_vec[i]
+                    else:
+                        q4_matmul_vec(weights.wv_packed, weights.wv_scales, draft_norm_x, draft_v_vec, DRAFT_CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                        
+                    for h in range(layer_heads):
+                        var head_ptr = draft_q + h * layer_head_dim
+                        rms_norm(head_ptr, weights.q_norm_weight, head_ptr, layer_head_dim)
+                    for h in range(layer_kv_heads):
+                        var head_ptr = draft_k_vec + h * layer_head_dim
+                        rms_norm(head_ptr, weights.k_norm_weight, head_ptr, layer_head_dim)
+                    for h in range(layer_kv_heads):
+                        var head_ptr = draft_v_vec + h * layer_head_dim
+                        rms_norm_noscale(head_ptr, head_ptr, layer_head_dim)
+                        
+                    apply_rope(draft_q, layer_heads, layer_head_dim, pos + K_actual, is_global)
+                    apply_rope(draft_k_vec, layer_kv_heads, layer_head_dim, pos + K_actual, is_global)
+                    
+                    var layer_cache_offset = layer_cache_offsets[layer_idx]
+                    var step_cache_offset = layer_cache_offset + (pos + K_actual) * kv_stride
+                    for i in range(kv_stride):
+                        draft_k_cache[step_cache_offset + i] = draft_k_vec[i]
+                        draft_v_cache[step_cache_offset + i] = draft_v_vec[i]
+                        
+                    for h in range(layer_heads):
+                        var h_offset = h * layer_head_dim
+                        var g = h // ratio
+                        var g_offset = g * layer_head_dim
+                        for t in range(pos + K_actual + 1):
+                            var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                            var score: Float32 = 0.0
+                            for d in range(layer_head_dim):
+                                score += draft_q[h_offset + d] * draft_k_cache[t_cache_offset + d]
+                            draft_attn_scores[t] = score
+                            
+                        softmax(draft_attn_scores, pos + K_actual + 1)
+                        
+                        for d in range(layer_head_dim):
+                            var val_sum: Float32 = 0.0
+                            for t in range(pos + K_actual + 1):
+                                var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
+                                val_sum += draft_attn_scores[t] * draft_v_cache[t_cache_offset + d]
+                            draft_attn_out[h_offset + d] = val_sum
+                            
+                    q4_matmul_vec(weights.wo_packed, weights.wo_scales, draft_attn_out, draft_proj_attn_out, layer_heads * layer_head_dim, DRAFT_CONFIG.embed_dim, num_tasks)
+                    
+                    rms_norm(draft_proj_attn_out, weights.post_attention_layernorm_weight, draft_proj_attn_out, DRAFT_CONFIG.embed_dim)
+                    for i in range(DRAFT_CONFIG.embed_dim):
+                        draft_x[i] += draft_proj_attn_out[i]
+                        
+                    rms_norm(draft_x, weights.pre_feedforward_layernorm_weight, draft_norm_x, DRAFT_CONFIG.embed_dim)
+                    q4_matmul_vec(weights.w1_packed, weights.w1_scales, draft_norm_x, draft_h1, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
+                    q4_matmul_vec(weights.w3_packed, weights.w3_scales, draft_norm_x, draft_h2, DRAFT_CONFIG.embed_dim, DRAFT_CONFIG.intermediate_dim, num_tasks)
+                    gelu_and_mul(draft_h1, draft_h2, draft_ffn_out_gate, DRAFT_CONFIG.intermediate_dim)
+                    
+                    q4_matmul_vec(weights.w2_packed, weights.w2_scales, draft_ffn_out_gate, draft_ffn_out, DRAFT_CONFIG.intermediate_dim, DRAFT_CONFIG.embed_dim, num_tasks)
+                    
+                    rms_norm(draft_ffn_out, weights.post_feedforward_layernorm_weight, draft_ffn_out, DRAFT_CONFIG.embed_dim)
+                    for i in range(DRAFT_CONFIG.embed_dim):
+                        draft_x[i] += draft_ffn_out[i]
+                        
+                    var scalar = weights.layer_scalar[0]
+                    for i in range(DRAFT_CONFIG.embed_dim):
+                        draft_x[i] *= scalar
+
             pos = pos + num_accepted + 1
             tokens_generated += num_accepted + 1
             current_token = next_starting_token
