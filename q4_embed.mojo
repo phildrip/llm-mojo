@@ -11,7 +11,7 @@ struct Q4Embedding:
     var scales: UnsafePointer[Float32, MutExternalOrigin]
     var _libc: OwnedDLHandle
 
-    def __init__(out self, path: String) raises:
+    def __init__(out self, path: String, vocab_size: Int = 0, embed_dim: Int = 0) raises:
         # Load libc FFI
         var libc = OwnedDLHandle("libc.so.6")
         var c_open = libc.get_function[def(Int, Int32, Int32) -> Int32]("open")
@@ -32,17 +32,21 @@ struct Q4Embedding:
         if fd < 0:
             raise Error("CRITICAL: Failed to open Q4 embedding file: " + path)
 
-        # Read 8-byte header: [vocab_size (Int32), embed_dim (Int32)]
-        var header_ptr = alloc[Int32](2)
-        var header_read = c_read(fd, header_ptr.__int__(), 8)
-        if header_read != 8:
-            _ = c_close(fd)
-            header_ptr.free()
-            raise Error("CRITICAL: Failed to read header from Q4 embedding file")
+        if vocab_size > 0 and embed_dim > 0:
+            self.vocab_size = vocab_size
+            self.embed_dim = embed_dim
+        else:
+            # Read 8-byte header: [vocab_size (Int32), embed_dim (Int32)]
+            var header_ptr = alloc[Int32](2)
+            var header_read = c_read(fd, header_ptr.__int__(), 8)
+            if header_read != 8:
+                _ = c_close(fd)
+                header_ptr.free()
+                raise Error("CRITICAL: Failed to read header from Q4 embedding file")
 
-        self.vocab_size = Int(header_ptr[0])
-        self.embed_dim = Int(header_ptr[1])
-        header_ptr.free()
+            self.vocab_size = Int(header_ptr[0])
+            self.embed_dim = Int(header_ptr[1])
+            header_ptr.free()
 
         # Size of packed weights and scales
         var packed_size_bytes = self.vocab_size * (self.embed_dim // 2)
@@ -70,39 +74,60 @@ struct Q4Embedding:
         memptr_S.free()
         self.scales = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=S_addr)
 
-        # Read packed weights and scales chunk-by-chunk to prevent high memory pressures during loading
-        # In our quantized file, we interleaved them chunk-by-chunk (8192 tokens per chunk).
-        # Let's read them back using the exact same interleaved chunk structure!
-        var chunk_size_tokens = 8192
-        var num_chunks = self.vocab_size // chunk_size_tokens
-        
-        var bytes_per_chunk_packed = chunk_size_tokens * (self.embed_dim // 2)
-        var bytes_per_chunk_scales = chunk_size_tokens * (self.embed_dim // 32) * 4
+        var is_flat = (vocab_size > 0 and embed_dim > 0)
 
-        var curr_packed_addr = W_addr
-        var curr_scales_addr = S_addr
-
-        for chunk_idx in range(num_chunks):
-            # Read packed weights for chunk
+        if is_flat:
+            # Read packed weights (flat)
             var read_p = 0
-            while read_p < bytes_per_chunk_packed:
-                var r = c_read(fd, curr_packed_addr + read_p, bytes_per_chunk_packed - read_p)
+            while read_p < packed_size_bytes:
+                var r = c_read(fd, W_addr + read_p, packed_size_bytes - read_p)
                 if r <= 0:
                     _ = c_close(fd)
-                    raise Error("CRITICAL: Error reading packed weights in chunk " + String(chunk_idx + 1))
+                    raise Error("CRITICAL: Error reading flat packed weights")
                 read_p += r
-            
-            # Read scales for chunk
+
+            # Read scales (flat)
             var read_s = 0
-            while read_s < bytes_per_chunk_scales:
-                var r = c_read(fd, curr_scales_addr + read_s, bytes_per_chunk_scales - read_s)
+            while read_s < scales_size_bytes:
+                var r = c_read(fd, S_addr + read_s, scales_size_bytes - read_s)
                 if r <= 0:
                     _ = c_close(fd)
-                    raise Error("CRITICAL: Error reading scales in chunk " + String(chunk_idx + 1))
+                    raise Error("CRITICAL: Error reading flat scales")
                 read_s += r
+        else:
+            # Read packed weights and scales chunk-by-chunk to prevent high memory pressures during loading
+            # In our quantized file, we interleaved them chunk-by-chunk (8192 tokens per chunk).
+            # Let's read them back using the exact same interleaved chunk structure!
+            var chunk_size_tokens = 8192
+            var num_chunks = self.vocab_size // chunk_size_tokens
             
-            curr_packed_addr += bytes_per_chunk_packed
-            curr_scales_addr += bytes_per_chunk_scales
+            var bytes_per_chunk_packed = chunk_size_tokens * (self.embed_dim // 2)
+            var bytes_per_chunk_scales = chunk_size_tokens * (self.embed_dim // 32) * 4
+
+            var curr_packed_addr = W_addr
+            var curr_scales_addr = S_addr
+
+            for chunk_idx in range(num_chunks):
+                # Read packed weights for chunk
+                var read_p = 0
+                while read_p < bytes_per_chunk_packed:
+                    var r = c_read(fd, curr_packed_addr + read_p, bytes_per_chunk_packed - read_p)
+                    if r <= 0:
+                        _ = c_close(fd)
+                        raise Error("CRITICAL: Error reading packed weights in chunk " + String(chunk_idx + 1))
+                    read_p += r
+                
+                # Read scales for chunk
+                var read_s = 0
+                while read_s < bytes_per_chunk_scales:
+                    var r = c_read(fd, curr_scales_addr + read_s, bytes_per_chunk_scales - read_s)
+                    if r <= 0:
+                        _ = c_close(fd)
+                        raise Error("CRITICAL: Error reading scales in chunk " + String(chunk_idx + 1))
+                    read_s += r
+                
+                curr_packed_addr += bytes_per_chunk_packed
+                curr_scales_addr += bytes_per_chunk_scales
 
         _ = c_close(fd)
         self._libc = libc^
