@@ -663,6 +663,9 @@ def main() raises:
     var local_max_logits = alloc[Float32](num_tasks)
     var local_next_tokens = alloc[Int](num_tasks)
 
+    var total_experts_evaluated: Int = 0
+    var total_experts_skipped: Int = 0
+
     # 6. Initialize tokenizer
     var py = Python.import_module("time")
     var transformers = Python.import_module("transformers")
@@ -869,7 +872,14 @@ def main() raises:
                 for i in range(CONFIG.top_k_experts):
                     var idx = top_idx[i]
                     var norm_prob = top_val[i] / (sum_top_val + 1e-10)
-                    top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                    if norm_prob < 0.05:
+                        top_weights[i] = 0.0
+                        if pos >= num_prompt_tokens:
+                            total_experts_skipped += 1
+                    else:
+                        top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                    if pos >= num_prompt_tokens:
+                        total_experts_evaluated += 1
 
                 for i in range(CONFIG.embed_dim):
                     moe_out[i] = 0.0
@@ -1013,6 +1023,13 @@ def main() raises:
             print_row("Misc Decode & Print Overhead", p_misc_decode)
             
             print("  " + pad_right("Total Profiled Time", 32) + ": " + pad_left(String(total_profile_time * 1000.0), 10) + " ms (100.0%) [" + pad_left(String((total_profile_time * 1000.0) / Float64(actual_decoded_tokens)), 8) + " ms/tok]")
+            print("---------------------------------------------------------")
+            print("Expert Pruning Statistics (Decode Phase Only):")
+            print("---------------------------------------------------------")
+            print("  Total Experts Evaluated         : " + String(total_experts_evaluated))
+            print("  Total Experts Pruned / Skipped  : " + String(total_experts_skipped))
+            var skip_pct = (Float64(total_experts_skipped) / Float64(total_experts_evaluated)) * 100.0 if total_experts_evaluated > 0 else 0.0
+            print("  Expert Pruning Ratio            : " + String(skip_pct) + "%")
             print("---------------------------------------------------------")
 
     # Cleanup memory
