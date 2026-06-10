@@ -641,12 +641,20 @@ def main() raises:
 
     while True:
         print()
-        var user_input = py_builtins.input("User > ")
-        var user_input_str = String(user_input).strip()
+        var user_input_str: String
+        try:
+            var user_input = py_builtins.input("User > ")
+            user_input_str = String(String(user_input).strip())
+        except err:
+            print("\nError reading input:", err)
+            break
+
+
         if user_input_str == "exit" or user_input_str == "quit":
             break
         if len(user_input_str) == 0:
             continue
+
 
         var prompt_str = String("<bos><|turn>user\n") + user_input_str + String("<turn|>\n<|turn>model\n")
         var encoded = tokenizer.encode(prompt_str, add_special_tokens=False)
