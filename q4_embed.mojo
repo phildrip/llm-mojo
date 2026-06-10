@@ -4,6 +4,28 @@ from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from std.math import tanh
 
+@always_inline
+def unpack_16bytes(
+    bytes: SIMD[DType.uint8, 16], 
+    mut w0: SIMD[DType.float32, 8], 
+    mut w1: SIMD[DType.float32, 8], 
+    mut w2: SIMD[DType.float32, 8], 
+    mut w3: SIMD[DType.float32, 8]
+):
+    var repeated_01 = bytes.shuffle[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]()
+    var shifted_01 = repeated_01 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_01 = (shifted_01 & 15).cast[DType.int8]() - 8
+    
+    var repeated_23 = bytes.shuffle[8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15]()
+    var shifted_23 = repeated_23 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_23 = (shifted_23 & 15).cast[DType.int8]() - 8
+    
+    w0 = masked_01.slice[8]().cast[DType.float32]()
+    w1 = masked_01.shift_left[8]().slice[8]().cast[DType.float32]()
+    w2 = masked_23.slice[8]().cast[DType.float32]()
+    w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
+
+
 struct Q4Embedding:
     var vocab_size: Int
     var embed_dim: Int
@@ -184,33 +206,27 @@ struct Q4Embedding:
             for r in range(start_r, end_r):
                 var row_packed_offset = r * (self.embed_dim // 2)
                 var row_scales_offset = r * (self.embed_dim // 32)
-                var sum: Float32 = 0.0
+                var acc = SIMD[DType.float32, 8](0.0)
                 
                 for b in range(num_blocks):
                     var scale = self.scales[row_scales_offset + b]
                     var block_packed_offset = row_packed_offset + b * 16
                     var block_x_offset = b * 32
                     
-                    var block_sum: Float32 = 0.0
-                    for j in range(4):
-                        var b0 = self.packed_weights[block_packed_offset + j * 4]
-                        var b1 = self.packed_weights[block_packed_offset + j * 4 + 1]
-                        var b2 = self.packed_weights[block_packed_offset + j * 4 + 2]
-                        var b3 = self.packed_weights[block_packed_offset + j * 4 + 3]
-                        
-                        var x_idx = block_x_offset + j * 8
-                        
-                        block_sum += x[x_idx]     * Float32(Int(b0 & 15) - 8)
-                        block_sum += x[x_idx + 1] * Float32(Int(b0 >> 4) - 8)
-                        block_sum += x[x_idx + 2] * Float32(Int(b1 & 15) - 8)
-                        block_sum += x[x_idx + 3] * Float32(Int(b1 >> 4) - 8)
-                        block_sum += x[x_idx + 4] * Float32(Int(b2 & 15) - 8)
-                        block_sum += x[x_idx + 5] * Float32(Int(b2 >> 4) - 8)
-                        block_sum += x[x_idx + 6] * Float32(Int(b3 & 15) - 8)
-                        block_sum += x[x_idx + 7] * Float32(Int(b3 >> 4) - 8)
-                        
-                    sum += block_sum * scale
+                    var bytes = self.packed_weights.load[16](block_packed_offset)
+                    
+                    var w0 = SIMD[DType.float32, 8]()
+                    var w1 = SIMD[DType.float32, 8]()
+                    var w2 = SIMD[DType.float32, 8]()
+                    var w3 = SIMD[DType.float32, 8]()
+                    unpack_16bytes(bytes, w0, w1, w2, w3)
+                    
+                    acc = acc + (w0 * x.load[8](block_x_offset)) * scale
+                    acc = acc + (w1 * x.load[8](block_x_offset + 8)) * scale
+                    acc = acc + (w2 * x.load[8](block_x_offset + 16)) * scale
+                    acc = acc + (w3 * x.load[8](block_x_offset + 24)) * scale
                 
+                var sum = acc.reduce_add()
                 # Apply fast tanh and scaling as per standard gemma4 scaling
                 var logit = Float32(30.0) * tanh(sum / Float32(30.0))
                 if logit > local_max_l:

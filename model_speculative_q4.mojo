@@ -658,12 +658,25 @@ def q8_matmul_w2_block_column(
 
 # --- 4-bit Q4_0 Unpacking & Matmul ---
 @always_inline
-def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
-    var chunk = SIMD[DType.uint8, 8](b0, b1, b2, b3, 0, 0, 0, 0)
-    var repeated = chunk.shuffle[0, 0, 1, 1, 2, 2, 3, 3]()
-    var shifted = repeated >> SIMD[DType.uint8, 8](0, 4, 0, 4, 0, 4, 0, 4)
-    var masked = shifted & 15
-    return (masked.cast[DType.int8]() - 8).cast[DType.float32]()
+def unpack_16bytes(
+    bytes: SIMD[DType.uint8, 16], 
+    mut w0: SIMD[DType.float32, 8], 
+    mut w1: SIMD[DType.float32, 8], 
+    mut w2: SIMD[DType.float32, 8], 
+    mut w3: SIMD[DType.float32, 8]
+):
+    var repeated_01 = bytes.shuffle[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]()
+    var shifted_01 = repeated_01 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_01 = (shifted_01 & 15).cast[DType.int8]() - 8
+    
+    var repeated_23 = bytes.shuffle[8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15]()
+    var shifted_23 = repeated_23 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_23 = (shifted_23 & 15).cast[DType.int8]() - 8
+    
+    w0 = masked_01.slice[8]().cast[DType.float32]()
+    w1 = masked_01.shift_left[8]().slice[8]().cast[DType.float32]()
+    w2 = masked_23.slice[8]().cast[DType.float32]()
+    w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
 
 
 @always_inline
@@ -698,10 +711,11 @@ def q4_matmul_vec(
                 # Load 16 bytes of packed weights at once
                 var bytes = W_packed.load[16](block_p)
                 
-                var w0 = unpack_4bytes(bytes[0], bytes[1], bytes[2], bytes[3])
-                var w1 = unpack_4bytes(bytes[4], bytes[5], bytes[6], bytes[7])
-                var w2 = unpack_4bytes(bytes[8], bytes[9], bytes[10], bytes[11])
-                var w3 = unpack_4bytes(bytes[12], bytes[13], bytes[14], bytes[15])
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
                 
                 acc = acc + (w0 * x.load[8](x_offset)) * scale
                 acc = acc + (w1 * x.load[8](x_offset + 8)) * scale

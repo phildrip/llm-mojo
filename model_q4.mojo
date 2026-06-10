@@ -270,12 +270,25 @@ def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float3
         out_ptr.store[8](i, v * inv_rms)
 
 @always_inline
-def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
-    var chunk = SIMD[DType.uint8, 8](b0, b1, b2, b3, 0, 0, 0, 0)
-    var repeated = chunk.shuffle[0, 0, 1, 1, 2, 2, 3, 3]()
-    var shifted = repeated >> SIMD[DType.uint8, 8](0, 4, 0, 4, 0, 4, 0, 4)
-    var masked = shifted & 15
-    return (masked.cast[DType.int8]() - 8).cast[DType.float32]()
+def unpack_16bytes(
+    bytes: SIMD[DType.uint8, 16], 
+    mut w0: SIMD[DType.float32, 8], 
+    mut w1: SIMD[DType.float32, 8], 
+    mut w2: SIMD[DType.float32, 8], 
+    mut w3: SIMD[DType.float32, 8]
+):
+    var repeated_01 = bytes.shuffle[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]()
+    var shifted_01 = repeated_01 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_01 = (shifted_01 & 15).cast[DType.int8]() - 8
+    
+    var repeated_23 = bytes.shuffle[8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15]()
+    var shifted_23 = repeated_23 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_23 = (shifted_23 & 15).cast[DType.int8]() - 8
+    
+    w0 = masked_01.slice[8]().cast[DType.float32]()
+    w1 = masked_01.shift_left[8]().slice[8]().cast[DType.float32]()
+    w2 = masked_23.slice[8]().cast[DType.float32]()
+    w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
 
 
 @always_inline
@@ -308,27 +321,13 @@ def q4_matmul_vec(
                 var x_offset = b * 32
                 
                 # Load 16 bytes of packed weights
-                var b0 = W_packed[block_p]
-                var b1 = W_packed[block_p + 1]
-                var b2 = W_packed[block_p + 2]
-                var b3 = W_packed[block_p + 3]
-                var b4 = W_packed[block_p + 4]
-                var b5 = W_packed[block_p + 5]
-                var b6 = W_packed[block_p + 6]
-                var b7 = W_packed[block_p + 7]
-                var b8 = W_packed[block_p + 8]
-                var b9 = W_packed[block_p + 9]
-                var b10 = W_packed[block_p + 10]
-                var b11 = W_packed[block_p + 11]
-                var b12 = W_packed[block_p + 12]
-                var b13 = W_packed[block_p + 13]
-                var b14 = W_packed[block_p + 14]
-                var b15 = W_packed[block_p + 15]
+                var bytes = W_packed.load[16](block_p)
                 
-                var w0 = unpack_4bytes(b0, b1, b2, b3)
-                var w1 = unpack_4bytes(b4, b5, b6, b7)
-                var w2 = unpack_4bytes(b8, b9, b10, b11)
-                var w3 = unpack_4bytes(b12, b13, b14, b15)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
                 
                 acc = acc + (w0 * x.load[8](x_offset)) * scale
                 acc = acc + (w1 * x.load[8](x_offset + 8)) * scale

@@ -355,6 +355,28 @@ def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.floa
 
 
 @always_inline
+def unpack_16bytes(
+    bytes: SIMD[DType.uint8, 16], 
+    mut w0: SIMD[DType.float32, 8], 
+    mut w1: SIMD[DType.float32, 8], 
+    mut w2: SIMD[DType.float32, 8], 
+    mut w3: SIMD[DType.float32, 8]
+):
+    var repeated_01 = bytes.shuffle[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]()
+    var shifted_01 = repeated_01 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_01 = (shifted_01 & 15).cast[DType.int8]() - 8
+    
+    var repeated_23 = bytes.shuffle[8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15]()
+    var shifted_23 = repeated_23 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+    var masked_23 = (shifted_23 & 15).cast[DType.int8]() - 8
+    
+    w0 = masked_01.slice[8]().cast[DType.float32]()
+    w1 = masked_01.shift_left[8]().slice[8]().cast[DType.float32]()
+    w2 = masked_23.slice[8]().cast[DType.float32]()
+    w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
+
+
+@always_inline
 def q4_matmul_vec(
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
@@ -391,10 +413,11 @@ def q4_matmul_vec(
                 
                 var bytes = W_packed.load[16](block_p)
                 
-                var w0 = unpack_4bytes(bytes[0], bytes[1], bytes[2], bytes[3])
-                var w1 = unpack_4bytes(bytes[4], bytes[5], bytes[6], bytes[7])
-                var w2 = unpack_4bytes(bytes[8], bytes[9], bytes[10], bytes[11])
-                var w3 = unpack_4bytes(bytes[12], bytes[13], bytes[14], bytes[15])
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
                 
                 acc = acc + (w0 * x.load[8](x_offset)) * scale
                 acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
@@ -403,7 +426,10 @@ def q4_matmul_vec(
                 
             out_ptr[r] = acc.reduce_add()
             
-    parallelize[worker](tasks)
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
 
 @always_inline
 def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
@@ -472,8 +498,20 @@ def get_top_k[k: Int](probs: UnsafePointer[Float32, _], top_idx: UnsafePointer[I
 
 
 # -----------------------------------------------------------------------------
-# 4. Main Executive Engine
+# 4. Custom Padding Helpers & Main Executive Engine
 # -----------------------------------------------------------------------------
+
+def pad_right(s: String, width: Int) -> String:
+    var res = s
+    while res.byte_length() < width:
+        res += " "
+    return res
+
+def pad_left(s: String, width: Int) -> String:
+    var res = s
+    while res.byte_length() < width:
+        res = " " + res
+    return res
 
 def main() raises:
     var num_tasks = num_physical_cores()
@@ -680,8 +718,24 @@ def main() raises:
         var t_prefill_start = std.time.perf_counter()
         var t_decode_start: Float64 = 0.0
 
+        # Micro-profiler accumulators (in seconds)
+        var p_embed_reconstruct: Float64 = 0.0
+        var p_attn_norm: Float64 = 0.0
+        var p_qkv_proj: Float64 = 0.0
+        var p_head_norm_rope_cache: Float64 = 0.0
+        var p_attn_dot_product: Float64 = 0.0
+        var p_wo_proj: Float64 = 0.0
+        var p_shared_mlp: Float64 = 0.0
+        var p_moe_router: Float64 = 0.0
+        var p_moe_experts: Float64 = 0.0
+        var p_moe_combine: Float64 = 0.0
+        var p_final_norm: Float64 = 0.0
+        var p_logit_proj: Float64 = 0.0
+        var p_misc_decode: Float64 = 0.0
+
         # Main Prefill & Generation Autoregressive Loop
         while pos < num_prompt_tokens + max_gen_steps:
+            var t0 = std.time.perf_counter()
             # Reconstruct the token embedding for the current step
             var current_token_id = prompt_tokens[pos] if pos < num_prompt_tokens else next_token
 
@@ -690,6 +744,10 @@ def main() raises:
             # Scale input embedding by sqrt(embed_dim)
             for i in range(CONFIG.embed_dim):
                 local_x[i] *= prompt_scale
+
+            var t1 = std.time.perf_counter()
+            if pos >= num_prompt_tokens:
+                p_embed_reconstruct += t1 - t0
 
             # Run layers
             for l in range(30):
@@ -702,9 +760,14 @@ def main() raises:
                 var ratio = layer_heads // layer_kv_heads
 
                 # 1. Attention Input Norm
+                var ta0 = std.time.perf_counter()
                 rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                var ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_attn_norm += ta1 - ta0
 
                 # 2. Attention projections
+                ta0 = std.time.perf_counter()
                 q4_matmul_vec(weights.wq_packed, weights.wq_scales, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
                 q4_matmul_vec(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                 if is_global:
@@ -712,8 +775,12 @@ def main() raises:
                         v_vec[i] = k_vec[i]
                 else:
                     q4_matmul_vec(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_qkv_proj += ta1 - ta0
 
-                # 3. Head-Normalizations
+                # 3. Head-Normalizations & RoPE & KV cache write
+                ta0 = std.time.perf_counter()
                 for h in range(layer_heads):
                     var head_ptr = q + h * layer_head_dim
                     rms_norm(head_ptr, weights.q_norm_weight, head_ptr, layer_head_dim)
@@ -734,8 +801,12 @@ def main() raises:
                 for i in range(kv_stride):
                     k_cache[step_cache_offset + i] = k_vec[i]
                     v_cache[step_cache_offset + i] = v_vec[i]
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_head_norm_rope_cache += ta1 - ta0
 
                 # 6. Dot-product Attention
+                ta0 = std.time.perf_counter()
                 for h in range(layer_heads):
                     var h_offset = h * layer_head_dim
                     var g = h // ratio
@@ -755,23 +826,35 @@ def main() raises:
                             var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
                             val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
                         attn_out[h_offset + d] = val_sum
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_attn_dot_product += ta1 - ta0
 
                 # 7. Out projection and Attention Residual Add
+                ta0 = std.time.perf_counter()
                 q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                 rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
                 for i in range(CONFIG.embed_dim):
                     local_x[i] += proj_attn_out[i]
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_wo_proj += ta1 - ta0
 
                 # 8. Parallel Feedforward: Shared MLP + sparse MoE Experts
                 # Path A: Shared MLP
+                ta0 = std.time.perf_counter()
                 rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
                 q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
                 q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
                 gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
                 q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
                 rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_shared_mlp += ta1 - ta0
 
                 # Path B: Router and Experts
+                ta0 = std.time.perf_counter()
                 rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
                 var r_scale_factor = Float32(1.0 / sqrt(2816.0))
                 for j in range(CONFIG.embed_dim):
@@ -791,7 +874,11 @@ def main() raises:
                 for i in range(CONFIG.embed_dim):
                     moe_out[i] = 0.0
                 rms_norm(local_x, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_moe_router += ta1 - ta0
 
+                ta0 = std.time.perf_counter()
                 def expert_worker(exp_idx: Int) capturing -> None:
                     var e = top_idx[exp_idx]
                     var w_e = top_weights[exp_idx]
@@ -815,7 +902,11 @@ def main() raises:
                     q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
 
                 parallelize[expert_worker](CONFIG.top_k_experts)
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_moe_experts += ta1 - ta0
 
+                ta0 = std.time.perf_counter()
                 for exp_idx in range(CONFIG.top_k_experts):
                     var w_e = top_weights[exp_idx]
                     if w_e == 0.0:
@@ -836,14 +927,28 @@ def main() raises:
                 for i in range(CONFIG.embed_dim):
                     local_x[i] += ffn_out[i]
                     local_x[i] *= scalar
+                ta1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_moe_combine += ta1 - ta0
 
             # Only predict and decode tokens after we process prompt or generate
             if pos >= num_prompt_tokens - 1:
                 # 1. Final layer norm
+                var tb0 = std.time.perf_counter()
                 rms_norm(local_x, final_norm_weight, target_final_norm_x, CONFIG.embed_dim)
+                var tb1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_final_norm += tb1 - tb0
+
                 # 2. Logit projections
+                tb0 = std.time.perf_counter()
                 embed.project_logits_parallel(target_final_norm_x, local_max_logits, local_next_tokens, num_tasks)
-                # 3. Find global max token
+                tb1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_logit_proj += tb1 - tb0
+
+                # 3. Miscellaneous & max find & print
+                tb0 = std.time.perf_counter()
                 var t_max_logit: Float32 = -999999.0
                 next_token = 0
                 for t in range(num_tasks):
@@ -861,6 +966,9 @@ def main() raises:
                 next_token_list.append(next_token)
                 var decoded = tokenizer.decode(next_token_list)
                 py_builtins.print(decoded, end="", flush=True)
+                tb1 = std.time.perf_counter()
+                if pos >= num_prompt_tokens:
+                    p_misc_decode += tb1 - tb0
 
             pos += 1
             if pos == num_prompt_tokens:
@@ -879,6 +987,33 @@ def main() raises:
             print("  Prefill duration: ", String(prefill_duration * 1000.0), " ms (", String((prefill_duration * 1000.0) / Float64(num_prompt_tokens)), " ms/tok)")
             print("  Decode duration:  ", String(decode_duration * 1000.0), " ms (", String((decode_duration * 1000.0) / Float64(actual_decoded_tokens)), " ms/tok)")
             print("  Decode speed:     ", String(decode_speed), " tokens/sec")
+            print("\n---------------------------------------------------------")
+            print("Micro-Profiling Report (Decode Phase Only):")
+            print("---------------------------------------------------------")
+            
+            var total_profile_time = p_embed_reconstruct + p_attn_norm + p_qkv_proj + p_head_norm_rope_cache + p_attn_dot_product + p_wo_proj + p_shared_mlp + p_moe_router + p_moe_experts + p_moe_combine + p_final_norm + p_logit_proj + p_misc_decode
+            
+            def print_row(name: String, time_sec: Float64):
+                var pct = (time_sec / total_profile_time) * 100.0 if total_profile_time > 0 else 0.0
+                var ms_per_tok = (time_sec * 1000.0) / Float64(actual_decoded_tokens)
+                print("  " + pad_right(name, 32) + ": " + pad_left(String(time_sec * 1000.0), 10) + " ms (" + pad_left(String(pct), 6) + "%) [" + pad_left(String(ms_per_tok), 8) + " ms/tok]")
+
+            print_row("Embed Reconstruct", p_embed_reconstruct)
+            print_row("Attention Input Norm (RMS)", p_attn_norm)
+            print_row("QKV Projections (Matmul)", p_qkv_proj)
+            print_row("Head Norm, RoPE & Cache", p_head_norm_rope_cache)
+            print_row("Attention Dot-Prod / Softmax", p_attn_dot_product)
+            print_row("WO Projection (Matmul)", p_wo_proj)
+            print_row("Shared MLP Path (Matmul)", p_shared_mlp)
+            print_row("MoE Router Path", p_moe_router)
+            print_row("MoE Active Experts (Top-k)", p_moe_experts)
+            print_row("MoE Combine & Layer Scale", p_moe_combine)
+            print_row("Final RMS Norm", p_final_norm)
+            print_row("Logit Projection (LM Head)", p_logit_proj)
+            print_row("Misc Decode & Print Overhead", p_misc_decode)
+            
+            print("  " + pad_right("Total Profiled Time", 32) + ": " + pad_left(String(total_profile_time * 1000.0), 10) + " ms (100.0%) [" + pad_left(String((total_profile_time * 1000.0) / Float64(actual_decoded_tokens)), 8) + " ms/tok]")
+            print("---------------------------------------------------------")
 
     # Cleanup memory
     free_c(base_addr)
