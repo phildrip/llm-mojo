@@ -350,10 +350,10 @@ struct Sequence(Movable):
     var max_gen: Int
     var is_finished: Bool
 
-    def __init__(out self, id: Int, prompt: String, tokens: List[Int], max_gen: Int):
+    def __init__(out self, id: Int, prompt: String, var tokens: List[Int], max_gen: Int):
         self.id = id
         self.prompt = prompt
-        self.tokens = tokens
+        self.tokens = tokens^
         self.block_table = List[Int]()
         self.pos = 0 # Starts at 0
         self.max_gen = max_gen
@@ -744,8 +744,8 @@ def main() raises:
     var r_scale_factor = Float32(1.0 / sqrt(Float32(CONFIG.embed_dim)))
 
     # 7. Set up scheduling queues for Continuous Batching
-    var pending_queue = List[UnsafePointer[Sequence]]()
-    var active_sequences = List[UnsafePointer[Sequence]]()
+    var pending_queue = List[UnsafePointer[Sequence, MutExternalOrigin]]()
+    var active_sequences = List[UnsafePointer[Sequence, MutExternalOrigin]]()
     
     var prompts = List[String]()
     prompts.append("The solar system is made of planets that revolve around the sun. For example,")
@@ -760,7 +760,7 @@ def main() raises:
             tokens.append(Int(py=encoded[j]))
         
         var seq_ptr = alloc[Sequence](1)
-        seq_ptr[] = Sequence(i + 1, prompts[i], tokens, 35) # Generate up to 35 tokens
+        seq_ptr[] = Sequence(i + 1, prompts[i], tokens^, 35) # Generate up to 35 tokens
         pending_queue.append(seq_ptr)
 
     var pending_idx = 0
@@ -777,9 +777,13 @@ def main() raises:
     var iteration = 0
     var global_start_time = std.time.perf_counter()
 
-    while len(active_sequences) > 0 or pending_idx < len(pending_queue):
+    while True:
+        if len(active_sequences) == 0 and pending_idx >= len(pending_queue):
+            break
         # Step A: Dequeue and prefill if there are empty slots
-        while len(active_sequences) < max_active_slots and pending_idx < len(pending_queue):
+        while True:
+            if len(active_sequences) >= max_active_slots or pending_idx >= len(pending_queue):
+                break
             var seq_ptr = pending_queue[pending_idx]
             pending_idx += 1
             print("\n[Scheduler] Dequeuing prompt #" + String(seq_ptr[].id) + " to fill active slot...")
@@ -1169,7 +1173,7 @@ def main() raises:
                 seq_ptr[].is_finished = True
 
         # Step C: Retire and free completed sequences
-        var next_active_sequences = List[UnsafePointer[Sequence]]()
+        var next_active_sequences = List[UnsafePointer[Sequence, MutExternalOrigin]]()
         for i in range(len(active_sequences)):
             var s_ptr = active_sequences[i]
             if s_ptr[].is_finished:
