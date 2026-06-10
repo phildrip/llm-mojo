@@ -659,16 +659,12 @@ def q8_matmul_w2_block_column(
 # --- 4-bit Q4_0 Unpacking & Matmul ---
 @always_inline
 def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
-    return SIMD[DType.float32, 8](
-        Float32(Int(b0 & 15) - 8),
-        Float32(Int((b0 >> 4) & 15) - 8),
-        Float32(Int(b1 & 15) - 8),
-        Float32(Int((b1 >> 4) & 15) - 8),
-        Float32(Int(b2 & 15) - 8),
-        Float32(Int((b2 >> 4) & 15) - 8),
-        Float32(Int(b3 & 15) - 8),
-        Float32(Int((b3 >> 4) & 15) - 8)
-    )
+    var chunk = SIMD[DType.uint8, 8](b0, b1, b2, b3, 0, 0, 0, 0)
+    var repeated = chunk.shuffle[0, 0, 1, 1, 2, 2, 3, 3]()
+    var shifted = repeated >> SIMD[DType.uint8, 8](0, 4, 0, 4, 0, 4, 0, 4)
+    var masked = shifted & 15
+    return (masked.cast[DType.int8]() - 8).cast[DType.float32]()
+
 
 @always_inline
 def q4_matmul_vec(
