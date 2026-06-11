@@ -879,10 +879,11 @@ def q4_matmul_vec(
                 var w3 = SIMD[DType.float32, 8]()
                 unpack_16bytes(bytes, w0, w1, w2, w3)
                 
-                acc = acc + (w0 * x.load[8](x_offset)) * scale
-                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
-                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
-                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                var block_acc = w0 * x.load[8](x_offset)
+                block_acc = block_acc + w1 * x.load[8](x_offset + 8)
+                block_acc = block_acc + w2 * x.load[8](x_offset + 16)
+                block_acc = block_acc + w3 * x.load[8](x_offset + 24)
+                acc = acc + block_acc * scale
                 
             out_ptr[r] = acc.reduce_add()
             
