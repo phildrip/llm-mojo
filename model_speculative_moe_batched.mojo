@@ -528,17 +528,26 @@ def mtp_embed_and_concat(
     out_concat: UnsafePointer[Float32, MutExternalOrigin],
     backbone_dim: Int,
     vocab_size: Int,
+    embed: Q4Embedding,
+    real_weights_loaded: Bool,
 ):
-    var scale = sqrt(Float32(backbone_dim))
-    var safe_token_id = token_id % vocab_size
-    if safe_token_id < 0:
-        safe_token_id = 0
-    var embd_offset = safe_token_id * backbone_dim
+    if real_weights_loaded:
+        embed.reconstruct(token_id, out_concat)
+        var scale = sqrt(Float32(backbone_dim))
+        for i in range(0, backbone_dim, 16):
+            var emb_v = out_concat.load[16](i) * scale
+            out_concat.store[16](i, emb_v)
+    else:
+        var scale = sqrt(Float32(backbone_dim))
+        var safe_token_id = token_id % vocab_size
+        if safe_token_id < 0:
+            safe_token_id = 0
+        var embd_offset = safe_token_id * backbone_dim
+        for i in range(0, backbone_dim, 16):
+            var emb_v = embd_matrix.load[16](embd_offset + i) * scale
+            out_concat.store[16](i, emb_v)
 
     for i in range(0, backbone_dim, 16):
-        var emb_v = embd_matrix.load[16](embd_offset + i) * scale
-        out_concat.store[16](i, emb_v)
-
         var rec_v = recurrent_h.load[16](i)
         out_concat.store[16](backbone_dim + i, rec_v)
 
@@ -555,8 +564,8 @@ def mtp_paged_attention(
     out_attn: UnsafePointer[Float32, MutExternalOrigin],
 ):
     var num_heads = 16
-    var num_kv_heads = 8
-    var head_dim = 256
+    var num_kv_heads = 8 if is_swa else 2
+    var head_dim = 256 if is_swa else 512
     var kv_stride = num_kv_heads * head_dim
     var ratio = num_heads // num_kv_heads
 
@@ -604,7 +613,8 @@ def run_assistant_layer(
     block_size: Int,
     k_pool: UnsafePointer[Float32, _],
     v_pool: UnsafePointer[Float32, _],
-    pos: Int,
+    rope_pos: Int,
+    kv_pos: Int,
     num_tasks: Int,
     embed_dim: Int,
     intermediate_dim: Int,
@@ -620,7 +630,7 @@ def run_assistant_layer(
 ):
     var is_global = (layer_idx == 3)
     var num_heads = 16
-    var head_dim = 256
+    var head_dim = 512 if is_global else 256
 
     mtp_rms_norm(x, weights.attn_norm_weight, norm_x, embed_dim)
     mtp_gemv(weights.wq, norm_x, q, num_heads * head_dim, embed_dim, num_tasks)
@@ -629,8 +639,8 @@ def run_assistant_layer(
         var head_ptr = q + h * head_dim
         mtp_rms_norm(head_ptr, weights.q_norm_weight, head_ptr, head_dim)
 
-    mtp_apply_rope(q, num_heads, head_dim, pos, is_global)
-    mtp_paged_attention(q, k_pool, v_pool, block_table, block_size, pos, not is_global, attn_scores, attn_out)
+    mtp_apply_rope(q, num_heads, head_dim, rope_pos, is_global)
+    mtp_paged_attention(q, k_pool, v_pool, block_table, block_size, kv_pos, not is_global, attn_scores, attn_out)
     mtp_gemv(weights.wo, attn_out, proj_attn_out, embed_dim, num_heads * head_dim, num_tasks)
     mtp_rms_norm(proj_attn_out, weights.attn_post_norm_weight, proj_attn_out, embed_dim)
 
@@ -656,20 +666,23 @@ def mtp_generate_step(
     block_size: Int,
     k_block_pools: List[UnsafePointer[Float32, MutExternalOrigin]],
     v_block_pools: List[UnsafePointer[Float32, MutExternalOrigin]],
-    pos: Int,
+    rope_pos: Int,
+    kv_pos: Int,
     out_h_next: UnsafePointer[Float32, MutExternalOrigin],
     out_logits: UnsafePointer[Float32, MutExternalOrigin],
     CONFIG: MTPConfig,
     num_tasks: Int,
+    embed: Q4Embedding,
+    real_weights_loaded: Bool,
 ) raises:
     var concat_dim = 2 * CONFIG.backbone_dim
     var x_concat = alloc[Float32](concat_dim)
     var x_assistant = alloc[Float32](CONFIG.embed_dim)
 
     var norm_x = alloc[Float32](CONFIG.embed_dim)
-    var q = alloc[Float32](16 * 256)
-    var attn_scores = alloc[Float32](pos + 1)
-    var attn_out = alloc[Float32](16 * 256)
+    var q = alloc[Float32](16 * 512)
+    var attn_scores = alloc[Float32](kv_pos + 1)
+    var attn_out = alloc[Float32](16 * 512)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
     var intermediate_dim = 8192
@@ -678,17 +691,17 @@ def mtp_generate_step(
     var ffn_out_gate = alloc[Float32](intermediate_dim)
     var ffn_out = alloc[Float32](CONFIG.embed_dim)
 
-    mtp_embed_and_concat(token_id, recurrent_h, weights.tok_embd, x_concat, CONFIG.backbone_dim, CONFIG.vocab_size)
+    mtp_embed_and_concat(token_id, recurrent_h, weights.tok_embd, x_concat, CONFIG.backbone_dim, CONFIG.vocab_size, embed, real_weights_loaded)
     mtp_gemv(weights.pre_proj, x_concat, x_assistant, CONFIG.embed_dim, concat_dim, num_tasks)
 
     var cur = x_assistant
     for il in range(CONFIG.num_layers):
-        var pool_idx = 27 if il < 3 else 28
+        var pool_idx = 27 if il < 3 else 29
         var k_pool = k_block_pools[pool_idx]
         var v_pool = v_block_pools[pool_idx]
 
         run_assistant_layer(
-            il, cur, layers[il], block_table, block_size, k_pool, v_pool, pos, num_tasks,
+            il, cur, layers[il], block_table, block_size, k_pool, v_pool, rope_pos, kv_pos, num_tasks,
             CONFIG.embed_dim, intermediate_dim,
             norm_x, q, attn_scores, attn_out, proj_attn_out,
             ffn_h1, ffn_h2, ffn_out_gate, ffn_out
@@ -847,6 +860,13 @@ def q4_matmul_vec(
     num_tasks: Int,
 ):
     var tasks = num_tasks
+    if c_out <= 256:
+        tasks = 1
+    elif c_out <= 1024:
+        tasks = 2 if tasks >= 2 else 1
+    elif c_out <= 2048:
+        tasks = 4 if tasks >= 4 else tasks
+        
     if tasks > c_out:
         tasks = c_out
     if tasks < 1:
@@ -860,31 +880,75 @@ def q4_matmul_vec(
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
         
-        for r in range(start_r, end_r):
-            var acc = SIMD[DType.float32, 8](0.0)
+        var r = start_r
+        while r < end_r - 1:
+            var acc0 = SIMD[DType.float32, 8](0.0)
+            var acc1 = SIMD[DType.float32, 8](0.0)
             
-            var r_offset_packed = r * c_in_packed
-            var r_offset_scales = r * c_in_blocks
+            var r_offset_packed0 = r * c_in_packed
+            var r_offset_scales0 = r * c_in_blocks
+            var r_offset_packed1 = (r + 1) * c_in_packed
+            var r_offset_scales1 = (r + 1) * c_in_blocks
             
             for b in range(c_in_blocks):
-                var scale = scales[r_offset_scales + b]
-                var block_p = r_offset_packed + b * 16
                 var x_offset = b * 32
+                var x_vec0 = x.load[8](x_offset)
+                var x_vec1 = x.load[8](x_offset + 8)
+                var x_vec2 = x.load[8](x_offset + 16)
+                var x_vec3 = x.load[8](x_offset + 24)
                 
-                var bytes = W_packed.load[16](block_p)
+                # Row 0
+                var scale0 = scales[r_offset_scales0 + b]
+                var bytes0 = W_packed.load[16](r_offset_packed0 + b * 16)
+                var w0_0 = SIMD[DType.float32, 8]()
+                var w0_1 = SIMD[DType.float32, 8]()
+                var w0_2 = SIMD[DType.float32, 8]()
+                var w0_3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes0, w0_0, w0_1, w0_2, w0_3)
                 
+                var block_acc0 = w0_0 * x_vec0
+                block_acc0 = block_acc0 + w0_1 * x_vec1
+                block_acc0 = block_acc0 + w0_2 * x_vec2
+                block_acc0 = block_acc0 + w0_3 * x_vec3
+                acc0 = acc0 + block_acc0 * scale0
+                
+                # Row 1
+                var scale1 = scales[r_offset_scales1 + b]
+                var bytes1 = W_packed.load[16](r_offset_packed1 + b * 16)
+                var w1_0 = SIMD[DType.float32, 8]()
+                var w1_1 = SIMD[DType.float32, 8]()
+                var w1_2 = SIMD[DType.float32, 8]()
+                var w1_3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes1, w1_0, w1_1, w1_2, w1_3)
+                
+                var block_acc1 = w1_0 * x_vec0
+                block_acc1 = block_acc1 + w1_1 * x_vec1
+                block_acc1 = block_acc1 + w1_2 * x_vec2
+                block_acc1 = block_acc1 + w1_3 * x_vec3
+                acc1 = acc1 + block_acc1 * scale1
+                
+            out_ptr[r] = acc0.reduce_add()
+            out_ptr[r + 1] = acc1.reduce_add()
+            r += 2
+            
+        if r < end_r:
+            var acc = SIMD[DType.float32, 8](0.0)
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+            for b in range(c_in_blocks):
+                var scale = scales[r_offset_scales + b]
+                var bytes = W_packed.load[16](r_offset_packed + b * 16)
+                var x_offset = b * 32
                 var w0 = SIMD[DType.float32, 8]()
                 var w1 = SIMD[DType.float32, 8]()
                 var w2 = SIMD[DType.float32, 8]()
                 var w3 = SIMD[DType.float32, 8]()
                 unpack_16bytes(bytes, w0, w1, w2, w3)
-                
                 var block_acc = w0 * x.load[8](x_offset)
                 block_acc = block_acc + w1 * x.load[8](x_offset + 8)
                 block_acc = block_acc + w2 * x.load[8](x_offset + 16)
                 block_acc = block_acc + w3 * x.load[8](x_offset + 24)
                 acc = acc + block_acc * scale
-                
             out_ptr[r] = acc.reduce_add()
             
     if tasks == 1:
@@ -894,11 +958,11 @@ def q4_matmul_vec(
 
 @always_inline
 def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
-    for i in range(size):
-        var x1 = h1[i]
-        var sig = 1.0 / (1.0 + exp(-1.702 * x1))
+    for i in range(0, size, 8):
+        var x1 = h1.load[8](i)
+        var sig = SIMD[DType.float32, 8](1.0) / (SIMD[DType.float32, 8](1.0) + exp(SIMD[DType.float32, 8](-1.702) * x1))
         var gelu = x1 * sig
-        out_ptr[i] = gelu * h2[i]
+        out_ptr.store[8](i, gelu * h2.load[8](i))
 
 @always_inline
 def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
@@ -1145,7 +1209,35 @@ def main() raises:
 
     # MTP SPECULATIVE DECODING SETUP
     var use_mtp = True
+    var real_weights_loaded = False
     var mtp_config = MTPConfig()
+
+    var assistant_file = String("assistant_weights.bin")
+    var ast_path_bytes = assistant_file.as_bytes()
+    var ast_path_ptr = alloc[UInt8](len(ast_path_bytes) + 1)
+    for i in range(len(ast_path_bytes)):
+        ast_path_ptr[i] = ast_path_bytes[i]
+    ast_path_ptr[len(ast_path_bytes)] = 0
+    var assistant_fd = c_open(ast_path_ptr.__int__(), 0, 0)
+    ast_path_ptr.free()
+
+    if assistant_fd >= 0:
+        real_weights_loaded = True
+        print("Found real speculator weights in 'assistant_weights.bin'. Setting vocab_size to 262144.")
+        mtp_config = MTPConfig(1024, 2816, 4, 262144)
+    else:
+        print("Real speculator weights not found. Falling back to dummy weights.")
+        mtp_config = MTPConfig(1024, 2816, 4, 10000)
+
+    def read_floats(fd: Int32, ptr: UnsafePointer[Float32, MutExternalOrigin], count: Int) raises:
+        var bytes_to_read = count * 4
+        var ptr_addr = ptr.__int__()
+        var total_bytes_read = 0
+        while total_bytes_read < bytes_to_read:
+            var r = c_read(fd, ptr_addr + total_bytes_read, bytes_to_read - total_bytes_read)
+            if r <= 0:
+                raise Error("Error reading assistant weights from file!")
+            total_bytes_read += r
 
     var mtp_tok_embd: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_pre_proj: UnsafePointer[Float32, MutExternalOrigin]
@@ -1166,44 +1258,105 @@ def main() raises:
 
     var mtp_layers = List[AssistantLayerWeights]()
 
-    if True: # Always allocate MTP weights for comparative benchmark
-        print("Allocating MTP Assistant model and layer weights...")
-        mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.backbone_dim)
+    print("Allocating MTP Assistant model and layer weights...")
+    if real_weights_loaded:
+        mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
+        mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
+        mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
+        mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
+        # Tie lm_head with tok_embd to save 1 GB RAM
+        mtp_lm_head = mtp_tok_embd
+    else:
+        mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
         mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
         mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
         mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
         mtp_lm_head = alloc[Float32](mtp_config.get_lm_head_size())
 
-        mtp_layer_attn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-        mtp_layer_wq = alloc[Float32](mtp_config.num_layers * 4096 * mtp_config.embed_dim)
-        mtp_layer_wo = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 4096)
-        mtp_layer_q_norm = alloc[Float32](mtp_config.num_layers * 256)
-        mtp_layer_attn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-        mtp_layer_ffn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-        mtp_layer_ffn_gate = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-        mtp_layer_ffn_up = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-        mtp_layer_ffn_down = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 8192)
-        mtp_layer_ffn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+    mtp_layer_attn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+    
+    var wq_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * 4096 * mtp_config.embed_dim
+    mtp_layer_wq = alloc[Float32](wq_size)
 
-        for il in range(mtp_config.num_layers):
-            mtp_layers.append(
-                AssistantLayerWeights(
-                    mtp_layer_attn_norm + il * mtp_config.embed_dim,
-                    mtp_layer_wq + il * 4096 * mtp_config.embed_dim,
-                    mtp_layer_wo + il * mtp_config.embed_dim * 4096,
-                    mtp_layer_q_norm + il * 256,
-                    mtp_layer_attn_post_norm + il * mtp_config.embed_dim,
-                    Float32(0.95),
-                    mtp_layer_ffn_norm + il * mtp_config.embed_dim,
-                    mtp_layer_ffn_gate + il * 8192 * mtp_config.embed_dim,
-                    mtp_layer_ffn_up + il * 8192 * mtp_config.embed_dim,
-                    mtp_layer_ffn_down + il * mtp_config.embed_dim * 8192,
-                    mtp_layer_ffn_post_norm + il * mtp_config.embed_dim
-                )
+    var wo_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * mtp_config.embed_dim * 4096
+    mtp_layer_wo = alloc[Float32](wo_size)
+
+    var q_norm_size = (3 * 256 + 512) if real_weights_loaded else mtp_config.num_layers * 256
+    mtp_layer_q_norm = alloc[Float32](q_norm_size)
+
+    mtp_layer_attn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+    mtp_layer_ffn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+    mtp_layer_ffn_gate = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
+    mtp_layer_ffn_up = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
+    mtp_layer_ffn_down = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 8192)
+    mtp_layer_ffn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+
+    for il in range(mtp_config.num_layers):
+        var wq_offset = il * 4096 * mtp_config.embed_dim if (not real_weights_loaded) else (il * 4096 * mtp_config.embed_dim if il < 3 else 3 * 4096 * mtp_config.embed_dim)
+        var wo_offset = il * mtp_config.embed_dim * 4096 if (not real_weights_loaded) else (il * mtp_config.embed_dim * 4096 if il < 3 else 3 * mtp_config.embed_dim * 4096)
+        var q_norm_offset = il * 256 if (not real_weights_loaded) else (il * 256 if il < 3 else 3 * 256)
+
+        mtp_layers.append(
+            AssistantLayerWeights(
+                mtp_layer_attn_norm + il * mtp_config.embed_dim,
+                mtp_layer_wq + wq_offset,
+                mtp_layer_wo + wo_offset,
+                mtp_layer_q_norm + q_norm_offset,
+                mtp_layer_attn_post_norm + il * mtp_config.embed_dim,
+                Float32(0.95),
+                mtp_layer_ffn_norm + il * mtp_config.embed_dim,
+                mtp_layer_ffn_gate + il * 8192 * mtp_config.embed_dim,
+                mtp_layer_ffn_up + il * 8192 * mtp_config.embed_dim,
+                mtp_layer_ffn_down + mtp_config.embed_dim * (il * 8192),
+                mtp_layer_ffn_post_norm + il * mtp_config.embed_dim
             )
+        )
 
+    if real_weights_loaded:
+        try:
+            print("Reading real weights from assistant_weights.bin...")
+            read_floats(assistant_fd, mtp_tok_embd, mtp_config.vocab_size * mtp_config.embed_dim)
+            read_floats(assistant_fd, mtp_pre_proj, mtp_config.get_pre_proj_size())
+            read_floats(assistant_fd, mtp_post_proj, mtp_config.get_post_proj_size())
+            read_floats(assistant_fd, mtp_output_norm_weight, mtp_config.embed_dim)
+
+            # Read layer weights for 4 layers
+            for il in range(mtp_config.num_layers):
+                var is_global = (il == 3)
+                print("  Loading real weights for Layer " + String(il) + "...")
+                read_floats(assistant_fd, mtp_layers[il].attn_norm_weight, mtp_config.embed_dim)
+                
+                var layer_head_dim = 512 if is_global else 256
+                var q_proj_size = 16 * layer_head_dim * mtp_config.embed_dim
+                read_floats(assistant_fd, mtp_layers[il].wq, q_proj_size)
+                
+                var o_proj_size = mtp_config.embed_dim * 16 * layer_head_dim
+                read_floats(assistant_fd, mtp_layers[il].wo, o_proj_size)
+                
+                read_floats(assistant_fd, mtp_layers[il].q_norm_weight, layer_head_dim)
+                read_floats(assistant_fd, mtp_layers[il].attn_post_norm_weight, mtp_config.embed_dim)
+                
+                # Layer scalar
+                var temp_scalar = alloc[Float32](1)
+                read_floats(assistant_fd, temp_scalar, 1)
+                mtp_layers[il].out_scale = temp_scalar[0]
+                temp_scalar.free()
+                
+                read_floats(assistant_fd, mtp_layers[il].ffn_norm_weight, mtp_config.embed_dim)
+                read_floats(assistant_fd, mtp_layers[il].ffn_gate, 8192 * mtp_config.embed_dim)
+                read_floats(assistant_fd, mtp_layers[il].ffn_up, 8192 * mtp_config.embed_dim)
+                read_floats(assistant_fd, mtp_layers[il].ffn_down, mtp_config.embed_dim * 8192)
+                read_floats(assistant_fd, mtp_layers[il].ffn_post_norm_weight, mtp_config.embed_dim)
+            
+            print("Successfully loaded all real speculator weights into RAM!")
+        except err:
+            print("CRITICAL: Error loading speculator weights: " + String(err))
+            _ = c_close(assistant_fd)
+            return
+        _ = c_close(assistant_fd)
+    else:
         print("Populating parameters with deterministic non-zero weights...")
-        for i in range(mtp_config.vocab_size * mtp_config.backbone_dim):
+        for i in range(mtp_config.vocab_size * mtp_config.embed_dim):
             mtp_tok_embd[i] = Float32(0.005) * Float32((i + 13) % 47)
         for i in range(mtp_config.get_pre_proj_size()):
             mtp_pre_proj[i] = Float32(0.0001) * Float32((i + 5) % 113)
@@ -1232,23 +1385,6 @@ def main() raises:
             mtp_layer_ffn_up[i] = Float32(0.0001) * Float32(i % 89)
             mtp_layer_ffn_down[i] = Float32(0.0001) * Float32(i % 73)
         print("Populated all MTP arrays successfully.")
-    else:
-        mtp_tok_embd = alloc[Float32](1)
-        mtp_pre_proj = alloc[Float32](1)
-        mtp_post_proj = alloc[Float32](1)
-        mtp_output_norm_weight = alloc[Float32](1)
-        mtp_lm_head = alloc[Float32](1)
-
-        mtp_layer_attn_norm = alloc[Float32](1)
-        mtp_layer_wq = alloc[Float32](1)
-        mtp_layer_wo = alloc[Float32](1)
-        mtp_layer_q_norm = alloc[Float32](1)
-        mtp_layer_attn_post_norm = alloc[Float32](1)
-        mtp_layer_ffn_norm = alloc[Float32](1)
-        mtp_layer_ffn_gate = alloc[Float32](1)
-        mtp_layer_ffn_up = alloc[Float32](1)
-        mtp_layer_ffn_down = alloc[Float32](1)
-        mtp_layer_ffn_post_norm = alloc[Float32](1)
 
     var mtp_weights = MTPWeights(mtp_tok_embd, mtp_pre_proj, mtp_post_proj, mtp_output_norm_weight, mtp_lm_head)
 
@@ -1334,22 +1470,28 @@ def main() raises:
                     var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
                     var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
                     
-                    var score: Float32 = 0.0
-                    for d in range(layer_head_dim):
-                        score += q[h_offset + d] * k_block_pools_ptr[][l][t_cache_offset + d]
-                    attn_scores[t] = score
+                    var score_vec = SIMD[DType.float32, 8](0.0)
+                    for d in range(0, layer_head_dim, 8):
+                        score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools_ptr[][l].load[8](t_cache_offset + d)
+                    attn_scores[t] = score_vec.reduce_add()
                     
                 softmax(attn_scores, pos + 1)
                 
-                for d in range(layer_head_dim):
-                    var val_sum: Float32 = 0.0
-                    for t in range(pos + 1):
-                        var t_logical_blk = t // block_size
-                        var t_blk_offset = t % block_size
-                        var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                        var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                        val_sum += attn_scores[t] * v_block_pools_ptr[][l][t_cache_offset + d]
-                    attn_out[h_offset + d] = val_sum
+                for d in range(0, layer_head_dim, 8):
+                    attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+                    
+                for t in range(pos + 1):
+                    var t_logical_blk = t // block_size
+                    var t_blk_offset = t % block_size
+                    var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
+                    var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
+                    
+                    var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
+                    for d in range(0, layer_head_dim, 8):
+                        attn_out.store[8](
+                            h_offset + d, 
+                            attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools_ptr[][l].load[8](t_cache_offset + d)
+                        )
                     
             q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
             rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -1544,6 +1686,7 @@ def main() raises:
 
         var iteration = 0
         var global_start_time = std.time.perf_counter()
+        var chat_generation_start_time: Float64 = 0.0
 
         while True:
             if len(active_sequences) == 0 and pending_idx >= len(pending_queue):
@@ -1588,6 +1731,8 @@ def main() raises:
                     print("  Prompt: \"" + seq_ptr[].prompt + "\"")
                 
                 var t_pref_start = std.time.perf_counter()
+                if is_chat_mode:
+                    chat_generation_start_time = t_pref_start
                 var num_prompt_tokens = len(seq_ptr[].tokens)
                 
                 # Execute prefill pass for each prompt token sequentially to build up the KV cache
@@ -1660,22 +1805,28 @@ def main() raises:
                                 var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
                                 var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
                                 
-                                var score: Float32 = 0.0
-                                for d in range(layer_head_dim):
-                                    score += q[h_offset + d] * k_block_pools[l][t_cache_offset + d]
-                                attn_scores[t] = score
+                                var score_vec = SIMD[DType.float32, 8](0.0)
+                                for d in range(0, layer_head_dim, 8):
+                                    score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools[l].load[8](t_cache_offset + d)
+                                attn_scores[t] = score_vec.reduce_add()
                                 
                             softmax(attn_scores, pos + 1)
                             
-                            for d in range(layer_head_dim):
-                                var val_sum: Float32 = 0.0
-                                for t in range(pos + 1):
-                                    var t_logical_blk = t // block_size
-                                    var t_blk_offset = t % block_size
-                                    var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                    var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                    val_sum += attn_scores[t] * v_block_pools[l][t_cache_offset + d]
-                                attn_out[h_offset + d] = val_sum
+                            for d in range(0, layer_head_dim, 8):
+                                attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+                                
+                            for t in range(pos + 1):
+                                var t_logical_blk = t // block_size
+                                var t_blk_offset = t % block_size
+                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
+                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
+                                
+                                var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
+                                for d in range(0, layer_head_dim, 8):
+                                    attn_out.store[8](
+                                        h_offset + d, 
+                                        attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools[l].load[8](t_cache_offset + d)
+                                    )
                                 
                         # 7. Out Projection & Residual Add
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
@@ -1810,11 +1961,14 @@ def main() raises:
                     var mtp_logits = alloc[Float32](mtp_config.vocab_size)
                     
                     var draft_active_token = current_token_id
-                    for _ in range(num_steps):
+                    for step_idx in range(num_steps):
+                        var rope_pos = pos + step_idx
+                        var kv_pos = pos - 1
                         mtp_generate_step(
                             draft_active_token, cur_recurrent_h, mtp_weights, mtp_layers,
                             seq_ptr[].block_table, block_size, k_block_pools, v_block_pools,
-                            pos - 1, mtp_h_next, mtp_logits, mtp_config, num_tasks
+                            rope_pos, kv_pos, mtp_h_next, mtp_logits, mtp_config, num_tasks,
+                            embed, real_weights_loaded
                         )
                         
                         var sampled_tok = 0
@@ -1830,6 +1984,12 @@ def main() raises:
                         for i in range(mtp_config.backbone_dim):
                             cur_recurrent_h[i] = mtp_h_next[i]
                             
+                    var draft_token_list = Python.list()
+                    for t_idx in range(1, len(draft_tokens)):
+                        draft_token_list.append(draft_tokens[t_idx])
+                    var draft_decoded = tokenizer.decode(draft_token_list)
+                    print("[DEBUG Req #" + String(seq_ptr[].id) + "] Draft predicted: \"" + String(draft_decoded) + "\" (tokens: " + String(draft_token_list) + ")")
+
                     var verified_all = True
                     for j in range(1, num_steps + 1):
                         var target_next_token = run_target_step(seq_ptr)
@@ -1965,22 +2125,28 @@ def main() raises:
                                 var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
                                 var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
                                 
-                                var score: Float32 = 0.0
-                                for d in range(layer_head_dim):
-                                    score += q[h_offset + d] * k_block_pools[l][t_cache_offset + d]
-                                attn_scores[t] = score
+                                var score_vec = SIMD[DType.float32, 8](0.0)
+                                for d in range(0, layer_head_dim, 8):
+                                    score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools[l].load[8](t_cache_offset + d)
+                                attn_scores[t] = score_vec.reduce_add()
                                 
                             softmax(attn_scores, pos + 1)
                             
-                            for d in range(layer_head_dim):
-                                var val_sum: Float32 = 0.0
-                                for t in range(pos + 1):
-                                    var t_logical_blk = t // block_size
-                                    var t_blk_offset = t % block_size
-                                    var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                    var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                    val_sum += attn_scores[t] * v_block_pools[l][t_cache_offset + d]
-                                attn_out[h_offset + d] = val_sum
+                            for d in range(0, layer_head_dim, 8):
+                                attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+                                
+                            for t in range(pos + 1):
+                                var t_logical_blk = t // block_size
+                                var t_blk_offset = t % block_size
+                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
+                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
+                                
+                                var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
+                                for d in range(0, layer_head_dim, 8):
+                                    attn_out.store[8](
+                                        h_offset + d, 
+                                        attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools[l].load[8](t_cache_offset + d)
+                                    )
                                 
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -2097,6 +2263,13 @@ def main() raises:
             for i in range(len(active_sequences)):
                 var s_ptr = active_sequences[i]
                 if s_ptr[].is_finished:
+                    if is_chat_mode:
+                        var t_chat_end = std.time.perf_counter()
+                        var chat_dur_sec = t_chat_end - chat_generation_start_time
+                        var chat_decode_tokens = len(s_ptr[].tokens) - s_ptr[].prompt_len
+                        var chat_tps = Float64(chat_decode_tokens) / (chat_dur_sec + 1e-10)
+                        var chat_tps_rounded = Float64(Int(chat_tps * 100.0 + 0.5)) / 100.0
+                        print("\n\n [Generation Speed: " + String(chat_tps_rounded) + " tokens/sec | generated " + String(chat_decode_tokens) + " tokens]")
                     if not is_chat_mode:
                         print("\n[Scheduler] Request #" + String(s_ptr[].id) + " finished! Retiring and freeing " + String(len(s_ptr[].block_table)) + " blocks...")
                     for b in range(len(s_ptr[].block_table)):
@@ -2215,7 +2388,8 @@ def main() raises:
     mtp_pre_proj.free()
     mtp_post_proj.free()
     mtp_output_norm_weight.free()
-    mtp_lm_head.free()
+    if mtp_lm_head.__int__() != mtp_tok_embd.__int__():
+        mtp_lm_head.free()
 
     mtp_layer_attn_norm.free()
     mtp_layer_wq.free()

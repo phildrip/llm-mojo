@@ -37,3 +37,14 @@ comparison_results.txt
 /test_ptr
 *.pdf
 input.txt
+/test_bin
+/model_speculative_moe_batched
+/model_speculative_moe_perf
+/model_test
+perf.data
+perf.data.old
+__pycache__/
+/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant
+/gemma-4-26B-A4B-it-qat-q4_0-unquantized
+
+
