@@ -44,6 +44,36 @@ pixi run mojo build model_speculative_moe_batched.mojo -o test_bin -Xlinker -lm
 
 ---
 
+## 🎮 Hardware Acceleration & AMD APU (Cezanne) Setup
+
+For environments utilizing integrated graphics, such as the **AMD Cezanne APU (Ryzen 7 5700G, Vega iGPU)**, direct GPU acceleration is supported via `model_q8_gpu.mojo`. Because AMD APUs are non-discrete "integrated" devices, the ROCm / HSA (Heterogeneous System Architecture) runtime and KFD (Kernel Fusion Driver) require specific configurations to properly expose the compute device:
+
+### 1. Device Permissions
+Your user account must have permissions to read and write to the ROCm compute device (`/dev/kfd`) and the direct rendering interfaces (`/dev/dri/`). Add your user to the `render` and `video` groups:
+```bash
+sudo usermod -aG render,video $USER
+```
+> [!IMPORTANT]
+> You must log out and log back in (or reboot) for these group changes to apply. You can verify device access with `ls -l /dev/kfd`.
+
+### 2. HSA GFX Version Override
+Since Cezanne's native GFX version (typically `gfx90c` / Vega 8) is unsupported or ignored by the default ROCm/HSA runtime, you must force compatibility by overriding the target GFX version to a supported discrete Vega architecture (`gfx900`):
+```bash
+export HSA_OVERRIDE_GFX_VERSION=9.0.0
+```
+
+### 3. Compiling & Running with GPU Acceleration
+To compile and run the GPU-accelerated version of the model:
+```bash
+# Compile the GPU-targeted model
+pixi run mojo build model_q8_gpu.mojo -o model_q8_gpu -Xlinker -lm
+
+# Run with the GFX override
+HSA_OVERRIDE_GFX_VERSION=9.0.0 ./model_q8_gpu
+```
+
+---
+
 ## 🧪 Current Research & WIP Focus Areas
 
 * **Quantization Activation Shift**: Because the main model is quantized to `Q4_0` to fit in RAM while the speculator remains in unquantized `FP32`, the resulting activation shift can cause the speculator's guesses to drift out-of-distribution (generating incoherent word-pieces). We are actively investigating calibration/scaling correction factors to realign the pre-projection layers.
