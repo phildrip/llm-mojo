@@ -36,10 +36,10 @@ struct Q4Embedding:
     def __init__(out self, path: String, vocab_size: Int = 0, embed_dim: Int = 0) raises:
         # Load libc FFI
         var libc = OwnedDLHandle("libc.so.6")
-        var c_open = libc.get_function[def(Int, Int32, Int32) -> Int32]("open")
-        var c_close = libc.get_function[def(Int32) -> Int32]("close")
-        var posix_memalign = libc.get_function[def(Int, Int, Int) -> Int32]("posix_memalign")
-        var c_read = libc.get_function[def(Int32, Int, Int) -> Int]("read")
+        var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
+        var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+        var posix_memalign = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int32]("posix_memalign")
+        var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
 
         # Convert path to null-terminated C string
         var path_bytes = path.as_bytes()

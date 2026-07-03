@@ -8,7 +8,7 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
-mojo = "0.26.2.0"
+mojo = "1.0.0b2.*"
 transformers = ">=5.10.2,<6"
 regex = ">=2026.5.9,<2027"
 huggingface_hub = ">=1.18.0,<2"

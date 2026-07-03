@@ -377,7 +377,7 @@ def unpack_16bytes(
 
 
 @always_inline
-def q4_matmul_vec(
+def q4_gemv_cpu(
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
     x: UnsafePointer[Float32, _],
@@ -410,15 +410,15 @@ def q4_matmul_vec(
                 var scale = scales[r_offset_scales + b]
                 var block_p = r_offset_packed + b * 16
                 var x_offset = b * 32
-                
+
                 var bytes = W_packed.load[16](block_p)
-                
+
                 var w0 = SIMD[DType.float32, 8]()
                 var w1 = SIMD[DType.float32, 8]()
                 var w2 = SIMD[DType.float32, 8]()
                 var w3 = SIMD[DType.float32, 8]()
                 unpack_16bytes(bytes, w0, w1, w2, w3)
-                
+
                 acc = acc + (w0 * x.load[8](x_offset)) * scale
                 acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
                 acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
@@ -529,11 +529,11 @@ def main() raises:
 
     # Initialize FFI and libc functions
     var libc = OwnedDLHandle("libc.so.6")
-    var c_open = libc.get_function[def(Int, Int32, Int32) -> Int32]("open")
-    var c_close = libc.get_function[def(Int32) -> Int32]("close")
-    var posix_memalign = libc.get_function[def(Int, Int, Int) -> Int32]("posix_memalign")
-    var free_c = libc.get_function[def(Int) -> None]("free")
-    var c_read = libc.get_function[def(Int32, Int, Int) -> Int]("read")
+    var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
+    var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+    var posix_memalign = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int32]("posix_memalign")
+    var free_c = libc.get_function[def(Int) thin abi("C") -> None]("free")
+    var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
 
     # 1. Allocate and Load MoE Weights (RAM-resident)
     var weights_file = String("gemma4_moe_weights_q4.bin")
@@ -771,13 +771,13 @@ def main() raises:
 
                 # 2. Attention projections
                 ta0 = std.time.perf_counter()
-                q4_matmul_vec(weights.wq_packed, weights.wq_scales, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
-                q4_matmul_vec(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                q4_gemv_cpu(weights.wq_packed, weights.wq_scales, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                q4_gemv_cpu(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                 if is_global:
                     for i in range(kv_stride):
                         v_vec[i] = k_vec[i]
                 else:
-                    q4_matmul_vec(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    q4_gemv_cpu(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
                     p_qkv_proj += ta1 - ta0
@@ -835,7 +835,7 @@ def main() raises:
 
                 # 7. Out projection and Attention Residual Add
                 ta0 = std.time.perf_counter()
-                q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
+                q4_gemv_cpu(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                 rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
                 for i in range(CONFIG.embed_dim):
                     local_x[i] += proj_attn_out[i]
@@ -847,10 +847,10 @@ def main() raises:
                 # Path A: Shared MLP
                 ta0 = std.time.perf_counter()
                 rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-                q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                q4_gemv_cpu(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                q4_gemv_cpu(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
                 gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
-                q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                q4_gemv_cpu(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
                 rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
@@ -862,7 +862,7 @@ def main() raises:
                 var r_scale_factor = Float32(1.0 / sqrt(2816.0))
                 for j in range(CONFIG.embed_dim):
                     scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
-                q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
+                q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
                 softmax(scores, CONFIG.num_experts)
                 get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
                 
@@ -901,7 +901,7 @@ def main() raises:
 
                     var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
                     var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
-                    q4_matmul_vec(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                    q4_gemv_cpu(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
 
                     var gate_ptr = exp_gate_up_out
                     var up_ptr = exp_gate_up_out + CONFIG.expert_mlp_dim
@@ -909,7 +909,7 @@ def main() raises:
 
                     var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
                     var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
-                    q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
+                    q4_gemv_cpu(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
 
                 parallelize[expert_worker](CONFIG.top_k_experts)
                 ta1 = std.time.perf_counter()
@@ -1003,7 +1003,7 @@ def main() raises:
             
             var total_profile_time = p_embed_reconstruct + p_attn_norm + p_qkv_proj + p_head_norm_rope_cache + p_attn_dot_product + p_wo_proj + p_shared_mlp + p_moe_router + p_moe_experts + p_moe_combine + p_final_norm + p_logit_proj + p_misc_decode
             
-            def print_row(name: String, time_sec: Float64):
+            def print_row(name: String, time_sec: Float64) {read total_profile_time, read actual_decoded_tokens}:
                 var pct = (time_sec / total_profile_time) * 100.0 if total_profile_time > 0 else 0.0
                 var ms_per_tok = (time_sec * 1000.0) / Float64(actual_decoded_tokens)
                 print("  " + pad_right(name, 32) + ": " + pad_left(String(time_sec * 1000.0), 10) + " ms (" + pad_left(String(pct), 6) + "%) [" + pad_left(String(ms_per_tok), 8) + " ms/tok]")
