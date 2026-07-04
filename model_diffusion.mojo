@@ -1355,17 +1355,20 @@ def main() raises:
                         var g_offset = g * layer_head_dim
                         for tt in range(seq_len):
                             var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
-                            var score: Float32 = 0.0
-                            for d in range(layer_head_dim):
-                                score += q_load[h_offset + d] * k_cache[t_cache_offset + d]
-                            scores_t[tt] = score
+                            var score_vec = SIMD[DType.float32, 8](0.0)
+                            for d in range(0, layer_head_dim, 8):
+                                score_vec += q_load.load[8](h_offset + d) * k_cache.load[8](t_cache_offset + d)
+                            scores_t[tt] = score_vec.reduce_add()
                         softmax(scores_t, seq_len)
-                        for d in range(layer_head_dim):
-                            var val_sum: Float32 = 0.0
-                            for tt in range(seq_len):
-                                var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
-                                val_sum += scores_t[tt] * v_cache[t_cache_offset + d]
-                            attn_out_ptr[h_offset + d] = val_sum
+                        for d in range(0, layer_head_dim, 8):
+                            attn_out_ptr.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+                        for tt in range(seq_len):
+                            var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                            var s_vec = SIMD[DType.float32, 8](scores_t[tt])
+                            for d in range(0, layer_head_dim, 8):
+                                var v_vec = v_cache.load[8](t_cache_offset + d)
+                                var acc = attn_out_ptr.load[8](h_offset + d)
+                                attn_out_ptr.store[8](h_offset + d, acc + s_vec * v_vec)
 
                 parallelize[attn_worker](CANVAS_LEN)
 

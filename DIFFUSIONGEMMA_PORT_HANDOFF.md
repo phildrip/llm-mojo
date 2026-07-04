@@ -1,12 +1,14 @@
-# DiffusionGemma Port — Handoff Spec (v2)
+# DiffusionGemma Port — Handoff Spec (v3)
 
 > **Purpose:** Fresh-context handoff for continuing the DiffusionGemma inference
 > port in Mojo. Everything needed to resume work without re-reading this
 > project's history. Paste this whole file into a new chat as the opening
 > message along with "let's continue the DiffusionGemma port".
 >
-> v1 (now obsolete) described the initial scaffold. v2 assumes the sampler
-> works end-to-end and the focus is on optimization + remaining edge cases.
+> v1 (obsolete) described the initial scaffold. v2 assumed the sampler works
+> and focused on optimization. v3 (this version) reflects post-Opt-A state:
+> SIMD attention is done, Opt B/C were attempted and didn't help, and the
+> remaining bottleneck is the MoE expert matmul kernel.
 
 ---
 
@@ -58,11 +60,19 @@ HuggingFace gated repo, ~1 hr BF16→Q4 conversion).
 
 ---
 
-## What's done (committed through `6e7b57b`, working)
+## What's done (committed through `cacbdf0` + uncommitted Opt A, working)
 
 The full DiffusionGemma inference path runs end-to-end. Verified output:
 `"hello"` → `"<channel|>Hello! How can I help you today?<eos>..."`
-in ~4-12 denoise steps (seed dependent), ~200-400s total.
+in ~4-12 denoise steps (seed dependent), ~120-240s total.
+
+**Opt A (SIMD attention) is implemented and committed in the working tree.**
+The attention inner loops in `attn_worker` now use `SIMD[DType.float32, 8]`
+loads + multiply + `reduce_add` for the score loop, and loop-swapped
+SIMD8 accumulate for the value-sum loop (zero → accumulate → store).
+This follows the exact pattern from `model.mojo:2314-2338` (a proven
+SIMD16 attention for the same model). Attention dropped from ~230ms/layer
+to ~20ms/layer (~11× speedup). Total step time: 28s → ~23.5s.
 
 ### `model_diffusion.mojo` (1752 lines)
 
@@ -177,7 +187,7 @@ stride params (-1) fall back to `c_in`/`c_out` for tight buffers.
 
 ---
 
-## Performance: where the time goes (28s/step)
+## Performance: where the time goes (~23.5s/step, post-Opt-A)
 
 Per-layer breakdown from profiling (averaged over layers 0, 15, 29):
 
@@ -185,15 +195,15 @@ Per-layer breakdown from profiling (averaged over layers 0, 15, 29):
 |---|---|---|---|
 | QKV proj (batched) | 130 | 3.9s | `q4_gemv_batch` with B=256; weights read once. Good. |
 | Head norms + RoPE + cache write | ~30 | 0.9s | Per-token, scalar. Cheap. |
-| Bidirectional attention | 230 | 6.9s | Parallelized over 256; **inner loop scalar** — `for d in range(head_dim)` does no SIMD. Biggest single bottleneck. |
+| Bidirectional attention | ~20 | 0.6s | **SIMD-ized (Opt A done).** Was 230ms/layer, now ~20ms. |
 | Wo proj (batched) | ~25 | 0.75s | Good. |
 | Shared MLP (batched, 3 matmuls) | 100 | 3.0s | `q4_gemv_batch` good but B-loop is sequential inside worker — no L1 tiling. |
 | MoE router | ~5 | 0.15s | Per-token, num_tasks=1. Cheap. |
-| MoE experts (8 per token × 256) | 300 | 9.0s | Parallelized over 256 tokens but each token's 8 expert matmuls hit random expert weights. **L3 thrash.** |
+| MoE experts (8 per token × 256) | 300 | 9.0s | Parallelized over 256 tokens but each token's 8 expert matmuls hit random expert weights. **L3 thrash. Now the #1 bottleneck (38% of step time).** |
 | Final combine + norm | ~70 | 2.1s | Per-token scalar. |
 | Sampler logit proj (batched) | ~1100 | once | 370MB embed weights read once. Good. |
 | Sampler softmax+entropy+sample+sc | ~2400 | once | Parallelized over 256 tokens, single-threaded inner. Softmax loop is the bulk (`for v in range(262K)` ×2). |
-| **Total/step** | | **~28s** | |
+| **Total/step** | | **~23.5s** | Down from ~28s (Opt A saved ~4.5s). |
 
 **L3 budget**: 64MB L3 total, ~32MB usable per worker (8 cores). Weights per
 layer ~20MB packed. Single-layer weights fit, but the per-token MoE access
@@ -210,71 +220,90 @@ is tiny — most of the time is weight streaming from DRAM.
 - Vega 8 iGPU (gfx90c) available via direct `/dev/kfd` (`test_kernels.mojo`
   has a working KFD FFI binding — not required for current CPU path).
 - AR decode was ~4.5 tok/s on the original `model_speculative_moe.mojo`.
-  Current diffusion at 28s/step × 7 steps avg = 200s for 256 tokens =
-  ~1.3 tok/s effective. **Slower than AR** because the bandwidth
-  amplification (read each weight once regardless of canvas size) is leaking
-  out via L3 thrashing and scalar attention.
+  Current diffusion at 23.5s/step × 5 steps avg = 118s for 256 tokens =
+  ~2.2 tok/s effective. **Still slower than AR** because the MoE expert
+  weights (460MB) far exceed L3 (32MB), causing L3 thrashing in the MoE
+  phase (9s/step, 38% of total). The bandwidth amplification from canvas
+  diffusion (read each decoder weight once for 256 tokens) works well for
+  QKV, FFN, and attention, but not for MoE where the 128-expert weight
+  space is too large for any cache level.
 
 ---
 
 ## Remaining work (ordered by expected impact)
 
-### Opt A: SIMD attention inner loop (highest impact, ~6.9s → ~1.5s)
+### Opt A: SIMD attention inner loop — DONE ✓
 
-The attention phase's inner loops in `attn_worker` are scalar:
-```mojo
-for d in range(layer_head_dim):
-    score += q_load[h_offset + d] * k_cache[t_cache_offset + d]
-```
-`q_load` and `k_cache` are both contiguous Float32 arrays. Replace with
-`SIMD[DType.float32, 8]` load + multiply + `reduce_add`, exactly like
-`q4_gemv_cpu`'s inner kernel does. Same applies to the value-sum loop. For
-`head_dim=256` (sliding) or `512` (global), this is 32 or 64 SIMD8 ops
-instead of 256/512 scalar ops. **Estimated 4-5× speedup on attention**,
-which is currently 25% of step time.
+Implemented in the working tree (uncommitted). The `attn_worker`'s score
+and value-sum loops now use `SIMD[DType.float32, 8]` loads + multiply +
+`reduce_add`, following the pattern from `model.mojo:2314-2338`. Attention
+dropped from ~230ms/layer to ~20ms/layer. See diff in `model_diffusion.mojo`
+around line 1355.
 
-Subtleties: `k_cache` layout is `[max_seq_len, kv_heads * head_dim]` per
-layer, so `t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset`
-is contiguous within a head but jumps by `kv_stride` between timesteps. The
-inner d-loop is the only contiguous bit — that's the one to SIMD-ize. Don't
-try to SIMD across `tt` (the seq_len loop) — different timesteps have
-different K cache rows; dot product requires per-tt accumulation.
+### Opt B: Tile `q4_gemv_batch`'s inner B-loop — TRIED, DIDN'T HELP
 
-### Opt B: Tile `q4_gemv_batch`'s inner B-loop (~7.7s → ~2s across QKV+FFN)
+Attempted: added a `tile_b` parameter to `q4_gemv_batch` that wraps the
+`for b in range(B)` loop with `for b_outer in range(0, B, tile)` +
+`for b in range(b_count)`. Tested with TILE_B=32 and TILE_B=128.
 
-In `q4_gemv_batch`, the worker loads a weight block ONCE then loops `for b
-in range(B)`, reading `X[b*x_stride + offset]`. With B=256 and `c_in=2816`,
-each weight block's 256 X-rows total `256 × 32 × 4B = 32KB` — exceeds L1
-(32KB). Tile: process B in chunks of ~32 (32 × 32 × 4B = 4KB, fits L1),
-re-loading weights per tile. The weight re-load is cheap (16B per block,
-cached in L2). X stays in L1, acc stays in registers.
+**Result:** Slightly *worse* than the original (QKV ~130ms → ~140ms/layer).
+The L3 cache (32MB shared) was already handling the 2.8MB X matrix
+adequately. The tiling overhead (weight block reloads per tile, runtime
+`b_count` loop bounds preventing optimization, split output stores)
+negated any L2 benefit. **Reverted.**
 
-Implementation: add a `TILE_B` parameter (default 32), wrap the `for b in
-range(B)` loop with an outer `for b_outer in range(0, B, TILE_B)` and inner
-`for b in range(b_outer, min(b_outer+TILE_B, B))`. The `acc` array should
-be sized to `TILE_B` not `B`. Output write happens after each tile completes.
+The real bottleneck in `q4_gemv_batch` is the `reduce_add` in the inner
+B-loop: `(w0 * X.load[8](x_base)).reduce_add()` does a horizontal SIMD
+reduction per b per block. For B=256 and 88 blocks, that's 256×4×88 =
+90112 reduce_adds per row. `q4_gemv_cpu` (single-vector) does only 1
+reduce_add per row (accumulates in SIMD form, reduces once at the end).
+But `q4_gemv_cpu` reads the weight once per token (no B reuse), so it's
+worse for large B. A custom kernel that combines SIMD accumulation
+(like `q4_gemv_cpu`) with B-reuse (like `q4_gemv_batch`) would be needed
+— essentially keeping B SIMD accumulators and updating them per block.
+With B=256 that's too many registers, but with tiling (TILE_B=8, using
+8 SIMD8 registers) it might work. This is a future optimization.
 
-Same applies to the sampler's batched logit projection (B=256, c_in=2816,
-c_out=262K) — that's another ~1100ms that would drop to ~300ms.
+### Opt C: Batch MoE experts — TRIED, BLOCKED BY RUNTIME CRASH
 
-### Opt C: Batch MoE experts across tokens picking the same expert (~9s → ~2s)
+Attempted: restructured MoE into (1) parallelized router pass, (2) sequential
+build of expert-to-token lists, (3) per-expert batched matmuls.
 
-Currently each of 256 tokens independently runs 8 expert matmuls. Many
-tokens pick the same expert (only 128 experts, top-8 → average ~16 tokens
-per expert). Re-arrange to: (1) compute all 256 tokens' router outputs and
-top-k, (2) for each of 128 experts, gather the indices of tokens that
-picked it, (3) batch the expert matmul over those tokens via
-`q4_gemv_batch`. Reads each expert's weights (~5.6MB) ONCE regardless of
-how many tokens picked it. The gather step is cheap.
+**Two issues found:**
 
-Implementation: after the parallelized router pass, build a
-`tokens_per_expert[128]` list of token indices. Then
-`for e in range(128): if len(tokens_per_expert[e]) > 0: q4_gemv_batch(...)`
-with B = `len(tokens_per_expert[e])`, X sliced from `canvas_moe_in` at the
-gathered token offsets, OUT sliced similarly. Watch out: the gather is
-stride-3 (each token's moe_in row is at `t * embed_dim`), so use
-`moe_in + token_idx * embed_dim` per-row — `q4_gemv_batch` already supports
-`in_stride`.
+1. **`q4_gemv_batch` with small B (~16) is no faster than per-token
+   `q4_gemv_cpu`.** The reduce_add overhead in the B-loop dominates at
+   small B. `q4_gemv_batch` does B×4×blocks reduce_adds per row;
+   `q4_gemv_cpu` does 1 per row. For B=16, the weight reuse (reading
+   expert weights once for 16 tokens) doesn't compensate. MoE stayed
+   at ~320ms/layer (same as the original per-token approach).
+
+2. **Closures defined inside a `for e in range(128)` loop crash the
+   Mojo runtime.** Defining `def expert_token_worker(i: Int) capturing`
+   inside the expert loop and calling it (even sequentially, not via
+   `parallelize`) causes a segfault in `libKGENCompilerRTShared.so`.
+   This is distinct from the known-working pattern of closures inside
+   the `for l in range(30)` layer loop (which `moe_worker` uses
+   successfully). The difference might be the number of closure
+   definitions (30 vs 3840) or the depth of loop nesting.
+
+   **Workaround for future attempts:** inline the worker code directly
+   in the loop body (no closure) for sequential execution, or define
+   the closure at the `for l` level and use a flat index to encode
+   (expert, token) pairs. The latter requires per-token output buffers
+   and a sequential reduction to avoid races on `canvas_moe_out`.
+
+**Reverted to original per-token `moe_worker`.** The MoE phase remains
+at ~300ms/layer (9s/step, 38% of step time) — the single biggest
+remaining bottleneck.
+
+**Path forward for MoE optimization:** Write a custom `q4_gemv_small_b`
+kernel that processes B~16 tokens with SIMD accumulation (not
+reduce_add per b). Keep B SIMD8 accumulators in registers, load weight
+block once, multiply with B X vectors, accumulate. Reduce all B
+accumulators to scalars at the end. This avoids both the reduce_add
+overhead and the weight re-read. Then use this kernel in the batched
+expert loop (sequential experts, L3 weight reuse across tokens).
 
 ### Opt D: Multi-turn conversation (functional gap, not perf)
 
@@ -338,9 +367,13 @@ CPU path is at theoretical floor (Opt A-C done).
 - **`out` parameter convention is reserved** too (out parameter for
   constructors). Don't name anything `out`.
 - **Closure captures in `parallelize`**: `def fn(i: Int) capturing -> None`
-  is fine. Closures defined inside a loop body get fresh captures per
-  iteration (verified empirically — `dec_expert_worker` defined inside
-  the per-layer loop works correctly).
+  is fine. Closures defined inside the **per-layer** loop (30 iterations)
+  work correctly (`moe_worker`, `attn_worker`, etc.). **BUT: closures
+  defined inside a `for e in range(128)` loop (3840 total iterations) crash
+  the Mojo runtime** (`libKGENCompilerRTShared.so` segfault). This was
+  discovered during Opt C. Inline the worker code directly in the loop
+  body for sequential execution, or define the closure at the `for l`
+  level and encode sub-indices in the task index.
 - **Python FFI**: `np_random.rand(N)` returns a PythonObject; index with
   `[t]` and wrap with `Float32(Float64(py=...))` to materialize. For
   `np_random.randint(low, high, N)`, same pattern.
@@ -352,35 +385,31 @@ CPU path is at theoretical floor (Opt A-C done).
 
 ## Files to read first when resuming
 
-1. `model_diffusion.mojo` lines 380-540 — math kernels including
-   `q4_gemv_batch` (the key optimization primitive).
-2. `model_diffusion.mojo` lines 1280-1470 — the denoise loop's decoder
-   forward (layer loop with phases 1a/1b/2a/2b/2c/2d/2e). This is what
-   needs Opt A (SIMD attention) and Opt C (batch MoE experts).
-3. `model_diffusion.mojo` lines 1490-1560 — the sampler worker. Needs
-   Opt B (tiling) for the logit projection.
-4. `q4_embed.mojo` lines 240-277 — `project_full_logits`. Used by old
-   per-token path; the batched path now goes through `q4_gemv_batch`
-   directly.
+1. `model_diffusion.mojo` lines 380-500 — math kernels including
+   `q4_gemv_batch` (the key optimization primitive) and `q4_gemv_cpu`
+   (single-vector, SIMD-accumulated, 1 reduce_add per row).
+2. `model_diffusion.mojo` lines 1345-1370 — the SIMD-ized `attn_worker`
+   (Opt A, done). Reference pattern for SIMD attention.
+3. `model_diffusion.mojo` lines 1396-1455 — the per-token `moe_worker`
+   (current MoE path, ~300ms/layer). This is the #1 remaining bottleneck.
+4. `model.mojo` lines 2314-2338 — reference SIMD16 attention (proven).
 5. `~/git/vllm/vllm/model_executor/models/diffusion_gemma.py` lines 503-660
    — sampler reference. Only consult if sampler behavior seems wrong.
 
 ## Suggested first concrete step on resume
 
-Implement **Opt A (SIMD attention)** — it's localized, ~15 lines of
-changes, and gives 4-5× on the second-biggest phase. In `attn_worker`
-inside the denoise loop (around `model_diffusion.mojo:1340`), replace
-the scalar `for d in range(layer_head_dim)` score and value-sum loops
-with SIMD[DType.float32, 8] loads + multiply + reduce_add, following the
-exact pattern from `q4_gemv_cpu` lines 404-427. Verify identical output
-on "hello" before moving on.
+**MoE expert kernel optimization** — the MoE phase is 9s/step (38% of
+the 23.5s total), making it the single biggest opportunity. Write a
+custom `q4_gemv_small_b` kernel that processes B~16 tokens with SIMD
+accumulation (like `q4_gemv_cpu`) instead of per-b `reduce_add` (like
+`q4_gemv_batch`). The kernel should keep B SIMD8 accumulators, load each
+weight block once, multiply with B X vectors, and reduce all accumulators
+at the end. Then use this in the batched expert loop (sequential experts,
+L3 weight reuse across tokens) — but inline the worker code directly (no
+closures inside the expert loop, see Gotchas).
 
-Then **Opt C (batch MoE)** — restructure the MoE phase to first gather
-per-expert token lists, then `q4_gemv_batch` each expert's selected tokens.
-Bigger refactor (~40 lines) but targets the single biggest phase (9s → 2s).
+If the MoE kernel is too complex, the next easiest win is **Opt D
+(multi-turn conversation)** — functional, not perf, and straightforward
+KV cache management.
 
-Then **Opt B (tile B-loop in `q4_gemv_batch`)** — helps both the FFN path
-and the sampler logit proj. Smallest impact of the three but unblocks the
-theoretical 3s/step floor.
-
-Save Opt D-G until CPU path is at theoretical floor.
+Save Opt E-G until CPU path is at theoretical floor.
