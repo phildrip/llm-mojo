@@ -432,12 +432,98 @@ def q4_gemv_cpu(
         parallelize[worker](tasks)
 
 @always_inline
+def q4_gemv_batch(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        var acc = alloc[Float32](B)
+
+        for r in range(start_r, end_r):
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+
+            for b in range(B):
+                acc[b] = 0.0
+
+            for blk in range(c_in_blocks):
+                var scale = scales[r_offset_scales + blk]
+                var block_p = r_offset_packed + blk * 16
+                var x_offset_base = blk * 32
+
+                var bytes = W_packed.load[16](block_p)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                for b in range(B):
+                    var x_base = b * x_stride + x_offset_base
+                    var p = (w0 * X.load[8](x_base)).reduce_add() * scale
+                    p += (w1 * X.load[8](x_base + 8)).reduce_add() * scale
+                    p += (w2 * X.load[8](x_base + 16)).reduce_add() * scale
+                    p += (w3 * X.load[8](x_base + 24)).reduce_add() * scale
+                    acc[b] += p
+
+            for b in range(B):
+                out_ptr[b * o_stride + r] = acc[b]
+
+        acc.free()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+@always_inline
 def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
     for i in range(size):
         var x1 = h1[i]
         var sig = 1.0 / (1.0 + exp(-1.702 * x1))
         var gelu = x1 * sig
         out_ptr[i] = gelu * h2[i]
+
+@always_inline
+def gelu_and_mul_batch(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+    for b in range(B):
+        var base = b * dim
+        for i in range(dim):
+            var x1 = h1[base + i]
+            var sig = 1.0 / (1.0 + exp(-1.702 * x1))
+            out_ptr[base + i] = x1 * sig * h2[base + i]
+
+@always_inline
+def rms_norm_batch(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+    for b in range(B):
+        rms_norm(x + b * dim, w, out_ptr + b * dim, dim)
+
+@always_inline
+def rms_norm_noscale_batch(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+    for b in range(B):
+        rms_norm_noscale(x + b * dim, out_ptr + b * dim, dim)
 
 @always_inline
 def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
@@ -831,11 +917,44 @@ def main() raises:
     comptime MAX_DENOISE_STEPS = 48
     comptime SC_SIZE = 2112
     comptime MAX_Q_SIZE = 16 * 512  # 8192 (global layer Q size; sliding = 16*256=4096)
+    comptime MAX_KV_SIZE = 8 * 512  # 4096 (max KV stride: sliding 8*256=2048, global 2*512=1024)
 
     # Canvas hidden states [CANVAS_LEN, embed_dim] — flows through layers
     var canvas_hidden = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
     # Canvas Q storage [CANVAS_LEN, MAX_Q_SIZE] — stored in phase 1, consumed in phase 2
     var canvas_q = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    # Canvas K/V storage [CANVAS_LEN, MAX_KV_SIZE] — for batched QKV proj
+    var canvas_k = alloc[Float32](CANVAS_LEN * MAX_KV_SIZE)
+    var canvas_v = alloc[Float32](CANVAS_LEN * MAX_KV_SIZE)
+    # Batched attention output [CANVAS_LEN, MAX_Q_SIZE]
+    var canvas_attn_out = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    # Batched Wo output [CANVAS_LEN, embed_dim]
+    var canvas_proj_attn = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Batched norm output [CANVAS_LEN, embed_dim]
+    var canvas_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Batched FFN intermediates
+    var canvas_ffn_gate = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_up = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_gated = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_down = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_shared_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_in = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_out = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_combined = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_ffn_out = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Per-token attention scores buffer for parallelized attention
+    var canvas_attn_scores = alloc[Float32](CANVAS_LEN * CONFIG.max_seq_len)
+    # Per-token MoE scratch buffers for parallelized MoE
+    var canvas_exp_gate_up = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts * (CONFIG.expert_mlp_dim * 2))
+    var canvas_exp_act = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts * CONFIG.expert_mlp_dim)
+    var canvas_exp_down = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts * CONFIG.embed_dim)
+    var canvas_router_scores = alloc[Float32](CANVAS_LEN * CONFIG.num_experts)
+    var canvas_top_idx = alloc[Int](CANVAS_LEN * CONFIG.top_k_experts)
+    var canvas_top_val = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts)
+    var canvas_top_weights = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts)
+    var canvas_scaled_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_routed_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
     # Canvas token ids [CANVAS_LEN]
     var canvas_tokens = alloc[Int](CANVAS_LEN)
     var argmax_canvas = alloc[Int](CANVAS_LEN)
@@ -1172,7 +1291,7 @@ def main() raises:
                 for i in range(CONFIG.embed_dim):
                     canvas_hidden[t * CONFIG.embed_dim + i] = sc_out_buf[i]
 
-            # Decoder forward: layer-first, bidirectional attention
+            # Decoder forward: layer-first, batched projections, bidirectional attention
             for l in range(30):
                 var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
                 var is_global = CONFIG.is_global_layer(l)
@@ -1183,41 +1302,49 @@ def main() raises:
                 var ratio = layer_heads // layer_kv_heads
                 var layer_cache_offset = kv_cache_offsets[l]
                 var seq_len = num_prompt_tokens + CANVAS_LEN
+                var q_size = layer_heads * layer_head_dim
 
-                # Phase 1: QKV + head norms + RoPE + cache write for all canvas tokens
+                var tl_qkv = std.time.perf_counter()
+                # Phase 1a: Batched attention input norm + QKV projections
+                rms_norm_batch(canvas_hidden, weights.input_layernorm_weight, canvas_norm, CANVAS_LEN, CONFIG.embed_dim)
+                q4_gemv_batch(weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, CANVAS_LEN, CONFIG.embed_dim, q_size, num_tasks, CONFIG.embed_dim, MAX_Q_SIZE)
+                q4_gemv_batch(weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
+                if is_global:
+                    for t in range(CANVAS_LEN):
+                        for i in range(kv_stride):
+                            canvas_v[t * MAX_KV_SIZE + i] = canvas_k[t * MAX_KV_SIZE + i]
+                else:
+                    q4_gemv_batch(weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
+                var tl_qkv_end = std.time.perf_counter()
+
+                # Phase 1b: Head norms + RoPE + KV cache write (per-token, element-wise)
                 for t in range(CANVAS_LEN):
                     var pos = num_prompt_tokens + t
-                    var hidden_in = canvas_hidden + t * CONFIG.embed_dim
                     var q_store = canvas_q + t * MAX_Q_SIZE
-
-                    rms_norm(hidden_in, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
-                    q4_gemv_cpu(weights.wq_packed, weights.wq_scales, norm_x, q_store, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
-                    q4_gemv_cpu(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
-                    if is_global:
-                        for i in range(kv_stride):
-                            v_vec[i] = k_vec[i]
-                    else:
-                        q4_gemv_cpu(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    var k_store = canvas_k + t * MAX_KV_SIZE
+                    var v_store = canvas_v + t * MAX_KV_SIZE
 
                     for h in range(layer_heads):
                         rms_norm(q_store + h * layer_head_dim, weights.q_norm_weight, q_store + h * layer_head_dim, layer_head_dim)
                     for h in range(layer_kv_heads):
-                        rms_norm(k_vec + h * layer_head_dim, weights.k_norm_weight, k_vec + h * layer_head_dim, layer_head_dim)
+                        rms_norm(k_store + h * layer_head_dim, weights.k_norm_weight, k_store + h * layer_head_dim, layer_head_dim)
                     for h in range(layer_kv_heads):
-                        rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
+                        rms_norm_noscale(v_store + h * layer_head_dim, v_store + h * layer_head_dim, layer_head_dim)
 
                     apply_rope(q_store, layer_heads, layer_head_dim, pos, is_global)
-                    apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                    apply_rope(k_store, layer_kv_heads, layer_head_dim, pos, is_global)
 
                     var step_cache_offset = layer_cache_offset + pos * kv_stride
                     for i in range(kv_stride):
-                        k_cache[step_cache_offset + i] = k_vec[i]
-                        v_cache[step_cache_offset + i] = v_vec[i]
+                        k_cache[step_cache_offset + i] = k_store[i]
+                        v_cache[step_cache_offset + i] = v_store[i]
 
-                # Phase 2: bidirectional attention + Wo proj + FFN for all canvas tokens
-                for t in range(CANVAS_LEN):
-                    var hidden_inout = canvas_hidden + t * CONFIG.embed_dim
+                # Phase 2a: Bidirectional attention (parallelized over canvas tokens)
+                var tl_attn = std.time.perf_counter()
+                def attn_worker(t: Int) capturing -> None:
                     var q_load = canvas_q + t * MAX_Q_SIZE
+                    var attn_out_ptr = canvas_attn_out + t * MAX_Q_SIZE
+                    var scores_t = canvas_attn_scores + t * CONFIG.max_seq_len
 
                     for h in range(layer_heads):
                         var h_offset = h * layer_head_dim
@@ -1228,82 +1355,124 @@ def main() raises:
                             var score: Float32 = 0.0
                             for d in range(layer_head_dim):
                                 score += q_load[h_offset + d] * k_cache[t_cache_offset + d]
-                            attn_scores[tt] = score
-                        softmax(attn_scores, seq_len)
+                            scores_t[tt] = score
+                        softmax(scores_t, seq_len)
                         for d in range(layer_head_dim):
                             var val_sum: Float32 = 0.0
                             for tt in range(seq_len):
                                 var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
-                                val_sum += attn_scores[tt] * v_cache[t_cache_offset + d]
-                            attn_out[h_offset + d] = val_sum
+                                val_sum += scores_t[tt] * v_cache[t_cache_offset + d]
+                            attn_out_ptr[h_offset + d] = val_sum
 
-                    q4_gemv_cpu(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
-                    rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
+                parallelize[attn_worker](CANVAS_LEN)
+
+                var tl_attn_end = std.time.perf_counter()
+
+                # Phase 2b: Batched Wo projection + post-attn norm + residual
+                q4_gemv_batch(weights.wo_packed, weights.wo_scales, canvas_attn_out, canvas_proj_attn, CANVAS_LEN, q_size, CONFIG.embed_dim, num_tasks, MAX_Q_SIZE, CONFIG.embed_dim)
+                rms_norm_batch(canvas_proj_attn, weights.post_attention_layernorm_weight, canvas_proj_attn, CANVAS_LEN, CONFIG.embed_dim)
+                for t in range(CANVAS_LEN):
+                    var hidden = canvas_hidden + t * CONFIG.embed_dim
+                    var proj = canvas_proj_attn + t * CONFIG.embed_dim
                     for i in range(CONFIG.embed_dim):
-                        hidden_inout[i] += proj_attn_out[i]
+                        hidden[i] += proj[i]
 
-                    rms_norm(hidden_inout, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-                    q4_gemv_cpu(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                    q4_gemv_cpu(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                    gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
-                    q4_gemv_cpu(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-                    rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+                # Phase 2c: Batched FFN (shared MLP path)
+                var tl_ffn = std.time.perf_counter()
+                rms_norm_batch(canvas_hidden, weights.pre_feedforward_layernorm_weight, canvas_norm, CANVAS_LEN, CONFIG.embed_dim)
+                q4_gemv_batch(weights.w_gate_packed, weights.w_gate_scales, canvas_norm, canvas_ffn_gate, CANVAS_LEN, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                q4_gemv_batch(weights.w_up_packed, weights.w_up_scales, canvas_norm, canvas_ffn_up, CANVAS_LEN, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                gelu_and_mul_batch(canvas_ffn_gate, canvas_ffn_up, canvas_ffn_gated, CANVAS_LEN, CONFIG.standard_mlp_dim)
+                q4_gemv_batch(weights.w_down_packed, weights.w_down_scales, canvas_ffn_gated, canvas_ffn_down, CANVAS_LEN, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                rms_norm_batch(canvas_ffn_down, weights.post_feedforward_layernorm_1_weight, canvas_shared_norm, CANVAS_LEN, CONFIG.embed_dim)
+                var tl_ffn_end = std.time.perf_counter()
 
-                    rms_norm_noscale(hidden_inout, norm_x, CONFIG.embed_dim)
-                    var r_scale_factor = Float32(1.0 / sqrt(2816.0))
+                # Phase 2d: MoE path (parallelized over tokens, sequential experts per token)
+                var tl_moe = std.time.perf_counter()
+                rms_norm_batch(canvas_hidden, weights.pre_feedforward_layernorm_2_weight, canvas_moe_in, CANVAS_LEN, CONFIG.embed_dim)
+                var r_scale_factor = Float32(1.0 / sqrt(2816.0))
+
+                def moe_worker(t: Int) capturing -> None:
+                    var hidden_inout = canvas_hidden + t * CONFIG.embed_dim
+                    var moe_in_t = canvas_moe_in + t * CONFIG.embed_dim
+                    var moe_out_t = canvas_moe_out + t * CONFIG.embed_dim
+                    var scores_t = canvas_router_scores + t * CONFIG.num_experts
+                    var top_idx_t = canvas_top_idx + t * CONFIG.top_k_experts
+                    var top_val_t = canvas_top_val + t * CONFIG.top_k_experts
+                    var top_weights_t = canvas_top_weights + t * CONFIG.top_k_experts
+                    var scaled_norm_t = canvas_scaled_norm + t * CONFIG.embed_dim
+                    var routed_norm_t = canvas_routed_norm + t * CONFIG.embed_dim
+
+                    rms_norm_noscale(hidden_inout, routed_norm_t, CONFIG.embed_dim)
                     for j in range(CONFIG.embed_dim):
-                        scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
-                    q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
-                    softmax(scores, CONFIG.num_experts)
-                    get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
+                        scaled_norm_t[j] = routed_norm_t[j] * weights.router_scale[j] * r_scale_factor
+                    q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_t, scores_t, CONFIG.embed_dim, CONFIG.num_experts, 1)
+                    softmax(scores_t, CONFIG.num_experts)
+                    get_top_k[8](scores_t, top_idx_t, top_val_t, CONFIG.num_experts)
+
                     var sum_top_val: Float32 = 0.0
                     for i in range(CONFIG.top_k_experts):
-                        sum_top_val += top_val[i]
+                        sum_top_val += top_val_t[i]
                     for i in range(CONFIG.top_k_experts):
-                        var idx = top_idx[i]
-                        var norm_prob = top_val[i] / (sum_top_val + 1e-10)
+                        var idx = top_idx_t[i]
+                        var norm_prob = top_val_t[i] / (sum_top_val + 1e-10)
                         if norm_prob < 0.05:
-                            top_weights[i] = 0.0
+                            top_weights_t[i] = 0.0
                         else:
-                            top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                            top_weights_t[i] = norm_prob * weights.router_per_expert_scale[idx]
                     for i in range(CONFIG.embed_dim):
-                        moe_out[i] = 0.0
-                    rms_norm(hidden_inout, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
+                        moe_out_t[i] = 0.0
 
-                    def dec_expert_worker(exp_idx: Int) capturing -> None:
-                        var e = top_idx[exp_idx]
-                        var w_e = top_weights[exp_idx]
+                    for exp_idx in range(CONFIG.top_k_experts):
+                        var e = top_idx_t[exp_idx]
+                        var w_e = top_weights_t[exp_idx]
                         if w_e == 0.0:
-                            return
-                        var exp_gate_up_out = gate_up_out_all + exp_idx * (CONFIG.expert_mlp_dim * 2)
-                        var exp_act = act_all + exp_idx * CONFIG.expert_mlp_dim
-                        var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                            continue
+                        var exp_gate_up_out = canvas_exp_gate_up + t * CONFIG.top_k_experts * (CONFIG.expert_mlp_dim * 2) + exp_idx * (CONFIG.expert_mlp_dim * 2)
+                        var exp_act = canvas_exp_act + t * CONFIG.top_k_experts * CONFIG.expert_mlp_dim + exp_idx * CONFIG.expert_mlp_dim
+                        var exp_down_out = canvas_exp_down + t * CONFIG.top_k_experts * CONFIG.embed_dim + exp_idx * CONFIG.embed_dim
                         var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
                         var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
-                        q4_gemv_cpu(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                        q4_gemv_cpu(exp_gate_up_packed, exp_gate_up_scales, moe_in_t, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
                         var gate_ptr = exp_gate_up_out
                         var up_ptr = exp_gate_up_out + CONFIG.expert_mlp_dim
                         gelu_and_mul(gate_ptr, up_ptr, exp_act, CONFIG.expert_mlp_dim)
                         var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
                         var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
                         q4_gemv_cpu(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
-                    parallelize[dec_expert_worker](CONFIG.top_k_experts)
 
                     for exp_idx in range(CONFIG.top_k_experts):
-                        var w_e = top_weights[exp_idx]
+                        var w_e = top_weights_t[exp_idx]
                         if w_e == 0.0:
                             continue
-                        var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                        var exp_down_out = canvas_exp_down + t * CONFIG.top_k_experts * CONFIG.embed_dim + exp_idx * CONFIG.embed_dim
                         for j in range(CONFIG.embed_dim):
-                            moe_out[j] += exp_down_out[j] * w_e
-                    rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
+                            moe_out_t[j] += exp_down_out[j] * w_e
+
+                parallelize[moe_worker](CANVAS_LEN)
+
+                # Phase 2e: Batched combine + final norm + residual + scalar
+                var tl_moe_end = std.time.perf_counter()
+                rms_norm_batch(canvas_moe_out, weights.post_feedforward_layernorm_2_weight, canvas_moe_norm, CANVAS_LEN, CONFIG.embed_dim)
+                var scalar = weights.layer_scalar[0]
+                for t in range(CANVAS_LEN):
+                    var hidden = canvas_hidden + t * CONFIG.embed_dim
+                    var shared_n = canvas_shared_norm + t * CONFIG.embed_dim
+                    var moe_n = canvas_moe_norm + t * CONFIG.embed_dim
+                    var combined = canvas_combined + t * CONFIG.embed_dim
+                    var ffn = canvas_ffn_out + t * CONFIG.embed_dim
                     for i in range(CONFIG.embed_dim):
-                        combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
-                    rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
-                    var scalar = weights.layer_scalar[0]
+                        combined[i] = shared_n[i] + moe_n[i]
+                    rms_norm(combined, weights.post_feedforward_layernorm_weight, ffn, CONFIG.embed_dim)
                     for i in range(CONFIG.embed_dim):
-                        hidden_inout[i] += ffn_out[i]
-                        hidden_inout[i] *= scalar
+                        hidden[i] += ffn[i]
+                        hidden[i] *= scalar
+
+                if l == 0 or l == 15 or l == 29:
+                    print("    layer ", l, " qkv=", String((tl_qkv_end - tl_qkv) * 1000), "ms",
+                          " attn=", String((tl_attn_end - tl_attn) * 1000), "ms",
+                          " ffn=", String((tl_ffn_end - tl_ffn) * 1000), "ms",
+                          " moe=", String((tl_moe_end - tl_moe) * 1000), "ms")
 
             # --- Sampler step ---
             # Temperature schedule
@@ -1528,6 +1697,31 @@ def main() raises:
     local_next_tokens.free()
     canvas_hidden.free()
     canvas_q.free()
+    canvas_k.free()
+    canvas_v.free()
+    canvas_attn_out.free()
+    canvas_proj_attn.free()
+    canvas_norm.free()
+    canvas_ffn_gate.free()
+    canvas_ffn_up.free()
+    canvas_ffn_gated.free()
+    canvas_ffn_down.free()
+    canvas_shared_norm.free()
+    canvas_moe_in.free()
+    canvas_moe_out.free()
+    canvas_moe_norm.free()
+    canvas_combined.free()
+    canvas_ffn_out.free()
+    canvas_attn_scores.free()
+    canvas_exp_gate_up.free()
+    canvas_exp_act.free()
+    canvas_exp_down.free()
+    canvas_router_scores.free()
+    canvas_top_idx.free()
+    canvas_top_val.free()
+    canvas_top_weights.free()
+    canvas_scaled_norm.free()
+    canvas_routed_norm.free()
     canvas_tokens.free()
     argmax_canvas.free()
     sc_embeds.free()
