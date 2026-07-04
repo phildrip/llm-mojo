@@ -972,6 +972,9 @@ def main() raises:
     # Sampler buffers
     var sampler_logits = alloc[Float32](CONFIG.vocab_size)
     var sampler_probs = alloc[Float32](CONFIG.vocab_size)
+    # Per-token logits/probs buffers for batched logit projection
+    var canvas_logits = alloc[Float32](CANVAS_LEN * CONFIG.vocab_size)
+    var canvas_probs = alloc[Float32](CANVAS_LEN * CONFIG.vocab_size)
     var token_entropy = alloc[Float32](CANVAS_LEN)
     var new_tokens = alloc[Int](CANVAS_LEN)
     var argmax_tokens = alloc[Int](CANVAS_LEN)
@@ -1484,69 +1487,73 @@ def main() raises:
                 temp = 1e-10
 
             # Per-canvas-position: full logits, log_softmax, entropy, sample, argmax, SC soft embed
-            var rand_u = np_random.rand(CANVAS_LEN)  # uniform for categorical sampling
+            var rand_u = np_random.rand(CANVAS_LEN)
+            var rand_buf = alloc[Float32](CANVAS_LEN)
             for t in range(CANVAS_LEN):
-                rms_norm(canvas_hidden + t * CONFIG.embed_dim, final_norm_weight,
-                         canvas_final_norm + t * CONFIG.embed_dim, CONFIG.embed_dim)
-                embed.project_full_logits(
-                    canvas_final_norm + t * CONFIG.embed_dim,
-                    sampler_logits, num_tasks,
-                )
+                rand_buf[t] = Float32(Float64(py=rand_u[t]))
 
-                # Scale by temperature
+            # Batched logit projection: read embed weights ONCE for all 256 tokens
+            rms_norm_batch(canvas_hidden, final_norm_weight, canvas_final_norm, CANVAS_LEN, CONFIG.embed_dim)
+            q4_gemv_batch(embed.packed_weights, embed.scales, canvas_final_norm, canvas_logits,
+                          CANVAS_LEN, CONFIG.embed_dim, CONFIG.vocab_size, num_tasks,
+                          CONFIG.embed_dim, CONFIG.vocab_size)
+
+            # Parallelized per-token: scale+softcap, softmax, entropy, argmax, sample, sc_embed
+            def sampler_worker(t: Int) capturing -> None:
+                var logits_t = canvas_logits + t * CONFIG.vocab_size
+                var probs_t = canvas_probs + t * CONFIG.vocab_size
+
                 for v in range(CONFIG.vocab_size):
-                    sampler_logits[v] = sampler_logits[v] / temp
+                    logits_t[v] = (Float32(30.0) * tanh(logits_t[v] / Float32(30.0))) / temp
 
-                # Log-softmax: find max, subtract, exp, sum, log
-                var max_logit: Float32 = sampler_logits[0]
+                var max_logit: Float32 = logits_t[0]
                 for v in range(1, CONFIG.vocab_size):
-                    if sampler_logits[v] > max_logit:
-                        max_logit = sampler_logits[v]
+                    if logits_t[v] > max_logit:
+                        max_logit = logits_t[v]
                 var sum_exp: Float32 = 0.0
                 for v in range(CONFIG.vocab_size):
-                    var lp = exp(sampler_logits[v] - max_logit)
-                    sampler_probs[v] = lp
+                    var lp = exp(logits_t[v] - max_logit)
+                    probs_t[v] = lp
                     sum_exp += lp
                 var log_sum = log(sum_exp + 1e-30)
 
-                # Entropy = -sum(probs * log_probs) = -sum(probs * (logit - max - log_sum))
                 var ent: Float32 = 0.0
                 for v in range(CONFIG.vocab_size):
-                    var p = sampler_probs[v] / (sum_exp + 1e-30)
-                    sampler_probs[v] = p
+                    var p = probs_t[v] / (sum_exp + 1e-30)
+                    probs_t[v] = p
                     if p > 1e-12:
-                        ent -= p * (sampler_logits[v] - max_logit - log_sum)
+                        ent -= p * (logits_t[v] - max_logit - log_sum)
                 token_entropy[t] = ent
 
-                # Argmax (clean, no noise)
                 var t_argmax = 0
-                var t_max_logit = sampler_logits[0]
+                var t_max_logit = logits_t[0]
                 for v in range(1, CONFIG.vocab_size):
-                    if sampler_logits[v] > t_max_logit:
-                        t_max_logit = sampler_logits[v]
+                    if logits_t[v] > t_max_logit:
+                        t_max_logit = logits_t[v]
                         t_argmax = v
                 argmax_tokens[t] = t_argmax
 
-                # Categorical sample: find token where cumsum(probs) >= u
-                var u = Float32(Float64(py=rand_u[t]))
+                var u = rand_buf[t]
                 var cumsum: Float32 = 0.0
-                var sampled = t_argmax  # fallback to argmax if cumsum doesn't reach u
+                var sampled = t_argmax
                 for v in range(CONFIG.vocab_size):
-                    cumsum += sampler_probs[v]
+                    cumsum += probs_t[v]
                     if cumsum >= u:
                         sampled = v
                         break
                 new_tokens[t] = sampled
 
-                # SC soft embed: (probs @ embed_weight) * normalizer
                 probs_to_soft_embed(
-                    sampler_probs,
+                    probs_t,
                     embed.packed_weights, embed.scales,
                     sc_embeds + t * CONFIG.embed_dim,
-                    CONFIG.vocab_size, CONFIG.embed_dim, num_tasks,
+                    CONFIG.vocab_size, CONFIG.embed_dim, 1,
                 )
                 for i in range(CONFIG.embed_dim):
                     sc_embeds[t * CONFIG.embed_dim + i] *= prompt_scale
+
+            parallelize[sampler_worker](CANVAS_LEN)
+            rand_buf.free()
 
             # Mean entropy + confidence
             var mean_ent: Float32 = 0.0
@@ -1734,6 +1741,8 @@ def main() raises:
     canvas_final_norm.free()
     sampler_logits.free()
     sampler_probs.free()
+    canvas_logits.free()
+    canvas_probs.free()
     token_entropy.free()
     new_tokens.free()
     argmax_tokens.free()

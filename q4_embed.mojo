@@ -271,4 +271,7 @@ struct Q4Embedding:
                 var sum = acc.reduce_add()
                 out_logits[r] = Float32(30.0) * tanh(sum / Float32(30.0))
 
-        parallelize[full_proj_worker](num_tasks)
+        if num_tasks == 1:
+            full_proj_worker(0)
+        else:
+            parallelize[full_proj_worker](num_tasks)
