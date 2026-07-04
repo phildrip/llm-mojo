@@ -236,3 +236,39 @@ struct Q4Embedding:
             local_next_tokens[t] = local_tok
             
         parallelize[initial_proj_worker](num_tasks)
+
+    @always_inline
+    def project_full_logits(
+        self,
+        x: UnsafePointer[Float32, _],
+        out_logits: UnsafePointer[Float32, MutExternalOrigin],
+        num_tasks: Int,
+    ) -> None:
+        var chunk_size = self.vocab_size // num_tasks
+        var num_blocks = self.embed_dim // 32
+
+        def full_proj_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else self.vocab_size
+            for r in range(start_r, end_r):
+                var row_packed_offset = r * (self.embed_dim // 2)
+                var row_scales_offset = r * (self.embed_dim // 32)
+                var acc = SIMD[DType.float32, 8](0.0)
+                for b in range(num_blocks):
+                    var scale = self.scales[row_scales_offset + b]
+                    var block_packed_offset = row_packed_offset + b * 16
+                    var block_x_offset = b * 32
+                    var bytes = self.packed_weights.load[16](block_packed_offset)
+                    var w0 = SIMD[DType.float32, 8]()
+                    var w1 = SIMD[DType.float32, 8]()
+                    var w2 = SIMD[DType.float32, 8]()
+                    var w3 = SIMD[DType.float32, 8]()
+                    unpack_16bytes(bytes, w0, w1, w2, w3)
+                    acc = acc + (w0 * x.load[8](block_x_offset)) * scale
+                    acc = acc + (w1 * x.load[8](block_x_offset + 8)) * scale
+                    acc = acc + (w2 * x.load[8](block_x_offset + 16)) * scale
+                    acc = acc + (w3 * x.load[8](block_x_offset + 24)) * scale
+                var sum = acc.reduce_add()
+                out_logits[r] = Float32(30.0) * tanh(sum / Float32(30.0))
+
+        parallelize[full_proj_worker](num_tasks)

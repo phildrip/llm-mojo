@@ -1,6 +1,6 @@
 from std.ffi import OwnedDLHandle
 from std.memory import alloc
-from std.math import sqrt, exp, cos, sin
+from std.math import sqrt, exp, cos, sin, tanh, log
 from std.python import Python, PythonObject
 import std.os
 from std.algorithm import parallelize
@@ -20,7 +20,7 @@ struct MoEConfig[
     top_k_experts: Int = 8,
     num_layers: Int = 30,
     vocab_size: Int = 262144,
-    max_seq_len: Int = 100,
+    max_seq_len: Int = 512,
 ]:
     @always_inline
     def is_global_layer(self, layer_idx: Int) -> Bool:
@@ -498,6 +498,104 @@ def get_top_k[k: Int](probs: UnsafePointer[Float32, _], top_idx: UnsafePointer[I
 
 
 # -----------------------------------------------------------------------------
+# 3b. Self-Conditioning MLP Forward (DiffusionGemma SC path)
+# -----------------------------------------------------------------------------
+# Mirrors vLLM DiffusionGemmaSelfConditioning.forward:
+#   x = pre_norm(soft_embeds)
+#   sc = down_proj(gelu(gate_proj(x)) * up_proj(x))
+#   out = post_norm_noscale(inputs_embeds + sc)   (post_norm has_weight=False)
+# With zero soft_embeds the SC signal vanishes and out = post_norm_noscale(inputs_embeds).
+
+def sc_forward(
+    inputs_embeds: UnsafePointer[Float32, _],
+    soft_embeds: UnsafePointer[Float32, _],
+    sc_gate_packed: UnsafePointer[UInt8, _],
+    sc_up_packed: UnsafePointer[UInt8, _],
+    sc_down_packed: UnsafePointer[UInt8, _],
+    sc_gate_scales: UnsafePointer[Float32, _],
+    sc_up_scales: UnsafePointer[Float32, _],
+    sc_down_scales: UnsafePointer[Float32, _],
+    sc_pre_norm: UnsafePointer[Float32, _],
+    buf_normed: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_gate: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_up: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_gated: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_down: UnsafePointer[Float32, MutUntrackedOrigin],
+    sc_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    embed_dim: Int,
+    sc_size: Int,
+    num_tasks: Int,
+):
+    # 1. pre_norm the soft_embeds (RMSNorm with sc_pre_norm weight)
+    rms_norm(soft_embeds, sc_pre_norm, buf_normed, embed_dim)
+    # 2. gate_proj and up_proj: [sc_size, embed_dim] x [embed_dim] -> [sc_size]
+    q4_gemv_cpu(sc_gate_packed, sc_gate_scales, buf_normed, buf_gate, embed_dim, sc_size, num_tasks)
+    q4_gemv_cpu(sc_up_packed, sc_up_scales, buf_normed, buf_up, embed_dim, sc_size, num_tasks)
+    # 3. gelu_and_mul: buf_gated = gelu(buf_gate) * buf_up
+    gelu_and_mul(buf_gate, buf_up, buf_gated, sc_size)
+    # 4. down_proj: [embed_dim, sc_size] x [sc_size] -> [embed_dim]
+    q4_gemv_cpu(sc_down_packed, sc_down_scales, buf_gated, buf_down, sc_size, embed_dim, num_tasks)
+    # 5. residual + post_norm (no learned weight)
+    for i in range(embed_dim):
+        sc_out[i] = inputs_embeds[i] + buf_down[i]
+    rms_norm_noscale(sc_out, sc_out, embed_dim)
+
+
+# -----------------------------------------------------------------------------
+# 3c. Diffusion Sampler Helpers
+# -----------------------------------------------------------------------------
+# Computes soft_embeds = (probs @ embed_weight) * normalizer for one canvas position.
+# embed_weight is stored as [vocab, embed_dim] in q4. We want out[d] = sum_r probs[r] * W[r,d].
+# Threshold: skip tokens with negligible prob (most of the vocab after softmax).
+def probs_to_soft_embed(
+    probs: UnsafePointer[Float32, _],
+    embed_packed: UnsafePointer[UInt8, _],
+    embed_scales: UnsafePointer[Float32, _],
+    sc_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    vocab_size: Int,
+    embed_dim: Int,
+    num_tasks: Int,
+):
+    for d in range(embed_dim):
+        sc_out[d] = 0.0
+    var num_blocks = embed_dim // 32
+    var chunk_size = vocab_size // num_tasks
+
+    def sc_worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else vocab_size
+        for r in range(start_r, end_r):
+            var p = probs[r]
+            if p < 1e-8:
+                continue
+            var row_packed_offset = r * (embed_dim // 2)
+            var row_scales_offset = r * (embed_dim // 32)
+            for b in range(num_blocks):
+                var scale = embed_scales[row_scales_offset + b]
+                var block_packed_offset = row_packed_offset + b * 16
+                var block_out_offset = b * 32
+                for j in range(4):
+                    var b0 = embed_packed[block_packed_offset + j * 4]
+                    var b1 = embed_packed[block_packed_offset + j * 4 + 1]
+                    var b2 = embed_packed[block_packed_offset + j * 4 + 2]
+                    var b3 = embed_packed[block_packed_offset + j * 4 + 3]
+                    var out_idx = block_out_offset + j * 8
+                    sc_out[out_idx]     += p * Float32(Int(b0 & 15) - 8) * scale
+                    sc_out[out_idx + 1] += p * Float32(Int(b0 >> 4) - 8) * scale
+                    sc_out[out_idx + 2] += p * Float32(Int(b1 & 15) - 8) * scale
+                    sc_out[out_idx + 3] += p * Float32(Int(b1 >> 4) - 8) * scale
+                    sc_out[out_idx + 4] += p * Float32(Int(b2 & 15) - 8) * scale
+                    sc_out[out_idx + 5] += p * Float32(Int(b2 >> 4) - 8) * scale
+                    sc_out[out_idx + 6] += p * Float32(Int(b3 & 15) - 8) * scale
+                    sc_out[out_idx + 7] += p * Float32(Int(b3 >> 4) - 8) * scale
+
+    if num_tasks == 1:
+        sc_worker(0)
+    else:
+        parallelize[sc_worker](num_tasks)
+
+
+# -----------------------------------------------------------------------------
 # 4. Custom Padding Helpers & Main Executive Engine
 # -----------------------------------------------------------------------------
 
@@ -728,6 +826,44 @@ def main() raises:
     var total_experts_evaluated: Int = 0
     var total_experts_skipped: Int = 0
 
+    # 5b. Diffusion canvas constants and buffers
+    comptime CANVAS_LEN = 256
+    comptime MAX_DENOISE_STEPS = 48
+    comptime SC_SIZE = 2112
+    comptime MAX_Q_SIZE = 16 * 512  # 8192 (global layer Q size; sliding = 16*256=4096)
+
+    # Canvas hidden states [CANVAS_LEN, embed_dim] — flows through layers
+    var canvas_hidden = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Canvas Q storage [CANVAS_LEN, MAX_Q_SIZE] — stored in phase 1, consumed in phase 2
+    var canvas_q = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    # Canvas token ids [CANVAS_LEN]
+    var canvas_tokens = alloc[Int](CANVAS_LEN)
+    var argmax_canvas = alloc[Int](CANVAS_LEN)
+    # Self-conditioning soft embeds [CANVAS_LEN, embed_dim]
+    var sc_embeds = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # SC MLP scratch buffers
+    var sc_buf_normed = alloc[Float32](CONFIG.embed_dim)
+    var sc_buf_gate = alloc[Float32](SC_SIZE)
+    var sc_buf_up = alloc[Float32](SC_SIZE)
+    var sc_buf_gated = alloc[Float32](SC_SIZE)
+    var sc_buf_down = alloc[Float32](CONFIG.embed_dim)
+    var sc_out_buf = alloc[Float32](CONFIG.embed_dim)
+    # Per-canvas-token final norm + logits storage
+    var canvas_final_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Sampler buffers
+    var sampler_logits = alloc[Float32](CONFIG.vocab_size)
+    var sampler_probs = alloc[Float32](CONFIG.vocab_size)
+    var token_entropy = alloc[Float32](CANVAS_LEN)
+    var new_tokens = alloc[Int](CANVAS_LEN)
+    var argmax_tokens = alloc[Int](CANVAS_LEN)
+    var sorted_idx = alloc[Int](CANVAS_LEN)
+    var sorted_ent = alloc[Float32](CANVAS_LEN)
+    var eb_mask = alloc[Bool](CANVAS_LEN)
+    var history = alloc[Int](2 * CANVAS_LEN)  # ST=2 slots
+
+    print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
+          (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
+
     # 6. Initialize tokenizer
     var py = Python.import_module("time")
     var transformers = Python.import_module("transformers")
@@ -766,24 +902,21 @@ def main() raises:
             prompt_tokens.append(Int(py=encoded[i]))
 
         var num_prompt_tokens = len(prompt_tokens)
-        var max_gen_steps = 100
-        if num_prompt_tokens + max_gen_steps > CONFIG.max_seq_len:
-            max_gen_steps = CONFIG.max_seq_len - num_prompt_tokens
+        if num_prompt_tokens + CANVAS_LEN > CONFIG.max_seq_len:
+            print("Prompt too long! Max ", CONFIG.max_seq_len - CANVAS_LEN, " tokens, got ", num_prompt_tokens)
+            continue
 
         # Zero-out the KV Cache for the new interaction
         for i in range(current_cache_offset):
             k_cache[i] = 0.0
             v_cache[i] = 0.0
 
-        print("Agent > ", end="", flush=True)
-
-        var pos = 0
-        var next_token = 0
+        print("Agent > (diffusion mode)")
 
         var t_prefill_start = std.time.perf_counter()
         var t_decode_start: Float64 = 0.0
 
-        # Micro-profiler accumulators (in seconds)
+        # Profiling accumulators (kept for compat with prefill per-layer code)
         var p_embed_reconstruct: Float64 = 0.0
         var p_attn_norm: Float64 = 0.0
         var p_qkv_proj: Float64 = 0.0
@@ -798,21 +931,11 @@ def main() raises:
         var p_logit_proj: Float64 = 0.0
         var p_misc_decode: Float64 = 0.0
 
-        # Main Prefill & Generation Autoregressive Loop
-        while pos < num_prompt_tokens + max_gen_steps:
-            var t0 = std.time.perf_counter()
-            # Reconstruct the token embedding for the current step
-            var current_token_id = prompt_tokens[pos] if pos < num_prompt_tokens else next_token
-
-            embed.reconstruct(current_token_id, local_x)
-            
-            # Scale input embedding by sqrt(embed_dim)
+        # --- Encoder Prefill (causal, token-first, writes K/V) ---
+        for pos in range(num_prompt_tokens):
+            embed.reconstruct(prompt_tokens[pos], local_x)
             for i in range(CONFIG.embed_dim):
                 local_x[i] *= prompt_scale
-
-            var t1 = std.time.perf_counter()
-            if pos >= num_prompt_tokens:
-                p_embed_reconstruct += t1 - t0
 
             # Run layers
             for l in range(30):
@@ -1003,96 +1126,371 @@ def main() raises:
                 if pos >= num_prompt_tokens:
                     p_moe_combine += ta1 - ta0
 
-            # Only predict and decode tokens after we process prompt or generate
-            if pos >= num_prompt_tokens - 1:
-                # 1. Final layer norm
-                var tb0 = std.time.perf_counter()
-                rms_norm(local_x, final_norm_weight, target_final_norm_x, CONFIG.embed_dim)
-                var tb1 = std.time.perf_counter()
-                if pos >= num_prompt_tokens:
-                    p_final_norm += tb1 - tb0
+        var t_prefill_end = std.time.perf_counter()
+        print("\n  Prefill: ", num_prompt_tokens, " tokens in ",
+              String((t_prefill_end - t_prefill_start) * 1000.0), " ms")
 
-                # 2. Logit projections
-                tb0 = std.time.perf_counter()
-                embed.project_logits_parallel(target_final_norm_x, local_max_logits, local_next_tokens, num_tasks)
-                tb1 = std.time.perf_counter()
-                if pos >= num_prompt_tokens:
-                    p_logit_proj += tb1 - tb0
+        # --- Canvas initialization ---
+        var np_random = Python.import_module("numpy.random")
+        var canvas_ids_py = np_random.randint(0, CONFIG.vocab_size, CANVAS_LEN)
+        for t in range(CANVAS_LEN):
+            canvas_tokens[t] = Int(py=canvas_ids_py[t])
+        for i in range(CANVAS_LEN * CONFIG.embed_dim):
+            sc_embeds[i] = 0.0
 
-                # 3. Miscellaneous & max find & print
-                tb0 = std.time.perf_counter()
-                var t_max_logit: Float32 = -999999.0
-                next_token = 0
-                for t in range(num_tasks):
-                    if local_max_logits[t] > t_max_logit:
-                        t_max_logit = local_max_logits[t]
-                        next_token = local_next_tokens[t]
+        # --- Sampler state ---
+        var denoise_step: Int = 0
+        var is_encoder_phase: Bool = False
+        var hist_len: Int = 0
 
-                if next_token == 1 or next_token == 106: # <eos> or <turn|>
-                    if t_decode_start == 0.0:
-                        t_decode_start = std.time.perf_counter()
-                    break
+        t_decode_start = std.time.perf_counter()
 
-                # Decode and print generated token
-                var next_token_list = Python.list()
-                next_token_list.append(next_token)
-                var decoded = tokenizer.decode(next_token_list)
-                py_builtins.print(decoded, end="", flush=True)
-                tb1 = std.time.perf_counter()
-                if pos >= num_prompt_tokens:
-                    p_misc_decode += tb1 - tb0
+        # --- Denoise loop ---
+        var t_max: Float32 = 0.8
+        var t_min: Float32 = 0.4
+        var entropy_bound: Float32 = 0.1
+        var confidence_threshold: Float32 = 0.005
 
-            pos += 1
-            if pos == num_prompt_tokens:
-                t_decode_start = std.time.perf_counter()
+        while denoise_step < MAX_DENOISE_STEPS:
+            print("  [denoise ", denoise_step, "]")
+
+            # Compute canvas embeddings + self-conditioning
+            for t in range(CANVAS_LEN):
+                embed.reconstruct(canvas_tokens[t], canvas_hidden + t * CONFIG.embed_dim)
+                for i in range(CONFIG.embed_dim):
+                    canvas_hidden[t * CONFIG.embed_dim + i] *= prompt_scale
+                sc_forward(
+                    canvas_hidden + t * CONFIG.embed_dim,
+                    sc_embeds + t * CONFIG.embed_dim,
+                    sc_gate_packed, sc_up_packed, sc_down_packed,
+                    sc_gate_scales, sc_up_scales, sc_down_scales,
+                    sc_pre_norm,
+                    sc_buf_normed, sc_buf_gate, sc_buf_up, sc_buf_gated, sc_buf_down,
+                    sc_out_buf,
+                    CONFIG.embed_dim, SC_SIZE, num_tasks,
+                )
+                for i in range(CONFIG.embed_dim):
+                    canvas_hidden[t * CONFIG.embed_dim + i] = sc_out_buf[i]
+
+            # Decoder forward: layer-first, bidirectional attention
+            for l in range(30):
+                var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+                var is_global = CONFIG.is_global_layer(l)
+                var layer_heads = 16
+                var layer_kv_heads = 2 if is_global else 8
+                var layer_head_dim = 512 if is_global else 256
+                var kv_stride = layer_kv_heads * layer_head_dim
+                var ratio = layer_heads // layer_kv_heads
+                var layer_cache_offset = kv_cache_offsets[l]
+                var seq_len = num_prompt_tokens + CANVAS_LEN
+
+                # Phase 1: QKV + head norms + RoPE + cache write for all canvas tokens
+                for t in range(CANVAS_LEN):
+                    var pos = num_prompt_tokens + t
+                    var hidden_in = canvas_hidden + t * CONFIG.embed_dim
+                    var q_store = canvas_q + t * MAX_Q_SIZE
+
+                    rms_norm(hidden_in, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                    q4_gemv_cpu(weights.wq_packed, weights.wq_scales, norm_x, q_store, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                    q4_gemv_cpu(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                    if is_global:
+                        for i in range(kv_stride):
+                            v_vec[i] = k_vec[i]
+                    else:
+                        q4_gemv_cpu(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+
+                    for h in range(layer_heads):
+                        rms_norm(q_store + h * layer_head_dim, weights.q_norm_weight, q_store + h * layer_head_dim, layer_head_dim)
+                    for h in range(layer_kv_heads):
+                        rms_norm(k_vec + h * layer_head_dim, weights.k_norm_weight, k_vec + h * layer_head_dim, layer_head_dim)
+                    for h in range(layer_kv_heads):
+                        rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
+
+                    apply_rope(q_store, layer_heads, layer_head_dim, pos, is_global)
+                    apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+
+                    var step_cache_offset = layer_cache_offset + pos * kv_stride
+                    for i in range(kv_stride):
+                        k_cache[step_cache_offset + i] = k_vec[i]
+                        v_cache[step_cache_offset + i] = v_vec[i]
+
+                # Phase 2: bidirectional attention + Wo proj + FFN for all canvas tokens
+                for t in range(CANVAS_LEN):
+                    var hidden_inout = canvas_hidden + t * CONFIG.embed_dim
+                    var q_load = canvas_q + t * MAX_Q_SIZE
+
+                    for h in range(layer_heads):
+                        var h_offset = h * layer_head_dim
+                        var g = h // ratio
+                        var g_offset = g * layer_head_dim
+                        for tt in range(seq_len):
+                            var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                            var score: Float32 = 0.0
+                            for d in range(layer_head_dim):
+                                score += q_load[h_offset + d] * k_cache[t_cache_offset + d]
+                            attn_scores[tt] = score
+                        softmax(attn_scores, seq_len)
+                        for d in range(layer_head_dim):
+                            var val_sum: Float32 = 0.0
+                            for tt in range(seq_len):
+                                var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                                val_sum += attn_scores[tt] * v_cache[t_cache_offset + d]
+                            attn_out[h_offset + d] = val_sum
+
+                    q4_gemv_cpu(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
+                    rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
+                    for i in range(CONFIG.embed_dim):
+                        hidden_inout[i] += proj_attn_out[i]
+
+                    rms_norm(hidden_inout, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                    q4_gemv_cpu(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                    q4_gemv_cpu(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                    gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                    q4_gemv_cpu(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                    rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+
+                    rms_norm_noscale(hidden_inout, norm_x, CONFIG.embed_dim)
+                    var r_scale_factor = Float32(1.0 / sqrt(2816.0))
+                    for j in range(CONFIG.embed_dim):
+                        scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+                    q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
+                    softmax(scores, CONFIG.num_experts)
+                    get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
+                    var sum_top_val: Float32 = 0.0
+                    for i in range(CONFIG.top_k_experts):
+                        sum_top_val += top_val[i]
+                    for i in range(CONFIG.top_k_experts):
+                        var idx = top_idx[i]
+                        var norm_prob = top_val[i] / (sum_top_val + 1e-10)
+                        if norm_prob < 0.05:
+                            top_weights[i] = 0.0
+                        else:
+                            top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                    for i in range(CONFIG.embed_dim):
+                        moe_out[i] = 0.0
+                    rms_norm(hidden_inout, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
+
+                    def dec_expert_worker(exp_idx: Int) capturing -> None:
+                        var e = top_idx[exp_idx]
+                        var w_e = top_weights[exp_idx]
+                        if w_e == 0.0:
+                            return
+                        var exp_gate_up_out = gate_up_out_all + exp_idx * (CONFIG.expert_mlp_dim * 2)
+                        var exp_act = act_all + exp_idx * CONFIG.expert_mlp_dim
+                        var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                        var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
+                        var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
+                        q4_gemv_cpu(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                        var gate_ptr = exp_gate_up_out
+                        var up_ptr = exp_gate_up_out + CONFIG.expert_mlp_dim
+                        gelu_and_mul(gate_ptr, up_ptr, exp_act, CONFIG.expert_mlp_dim)
+                        var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
+                        var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
+                        q4_gemv_cpu(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
+                    parallelize[dec_expert_worker](CONFIG.top_k_experts)
+
+                    for exp_idx in range(CONFIG.top_k_experts):
+                        var w_e = top_weights[exp_idx]
+                        if w_e == 0.0:
+                            continue
+                        var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                        for j in range(CONFIG.embed_dim):
+                            moe_out[j] += exp_down_out[j] * w_e
+                    rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
+                    for i in range(CONFIG.embed_dim):
+                        combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
+                    rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
+                    var scalar = weights.layer_scalar[0]
+                    for i in range(CONFIG.embed_dim):
+                        hidden_inout[i] += ffn_out[i]
+                        hidden_inout[i] *= scalar
+
+            # --- Sampler step ---
+            # Temperature schedule
+            var remaining = MAX_DENOISE_STEPS - denoise_step
+            if remaining < 1:
+                remaining = 1
+            var temp = t_min + (t_max - t_min) * Float32(remaining) / Float32(MAX_DENOISE_STEPS)
+            if temp < 1e-10:
+                temp = 1e-10
+
+            # Per-canvas-position: full logits, log_softmax, entropy, sample, argmax, SC soft embed
+            var rand_u = np_random.rand(CANVAS_LEN)  # uniform for categorical sampling
+            for t in range(CANVAS_LEN):
+                rms_norm(canvas_hidden + t * CONFIG.embed_dim, final_norm_weight,
+                         canvas_final_norm + t * CONFIG.embed_dim, CONFIG.embed_dim)
+                embed.project_full_logits(
+                    canvas_final_norm + t * CONFIG.embed_dim,
+                    sampler_logits, num_tasks,
+                )
+
+                # Scale by temperature
+                for v in range(CONFIG.vocab_size):
+                    sampler_logits[v] = sampler_logits[v] / temp
+
+                # Log-softmax: find max, subtract, exp, sum, log
+                var max_logit: Float32 = sampler_logits[0]
+                for v in range(1, CONFIG.vocab_size):
+                    if sampler_logits[v] > max_logit:
+                        max_logit = sampler_logits[v]
+                var sum_exp: Float32 = 0.0
+                for v in range(CONFIG.vocab_size):
+                    var lp = exp(sampler_logits[v] - max_logit)
+                    sampler_probs[v] = lp
+                    sum_exp += lp
+                var log_sum = log(sum_exp + 1e-30)
+
+                # Entropy = -sum(probs * log_probs) = -sum(probs * (logit - max - log_sum))
+                var ent: Float32 = 0.0
+                for v in range(CONFIG.vocab_size):
+                    var p = sampler_probs[v] / (sum_exp + 1e-30)
+                    sampler_probs[v] = p
+                    if p > 1e-12:
+                        ent -= p * (sampler_logits[v] - max_logit - log_sum)
+                token_entropy[t] = ent
+
+                # Argmax (clean, no noise)
+                var t_argmax = 0
+                var t_max_logit = sampler_logits[0]
+                for v in range(1, CONFIG.vocab_size):
+                    if sampler_logits[v] > t_max_logit:
+                        t_max_logit = sampler_logits[v]
+                        t_argmax = v
+                argmax_tokens[t] = t_argmax
+
+                # Categorical sample: find token where cumsum(probs) >= u
+                var u = Float32(Float64(py=rand_u[t]))
+                var cumsum: Float32 = 0.0
+                var sampled = t_argmax  # fallback to argmax if cumsum doesn't reach u
+                for v in range(CONFIG.vocab_size):
+                    cumsum += sampler_probs[v]
+                    if cumsum >= u:
+                        sampled = v
+                        break
+                new_tokens[t] = sampled
+
+                # SC soft embed: (probs @ embed_weight) * normalizer
+                probs_to_soft_embed(
+                    sampler_probs,
+                    embed.packed_weights, embed.scales,
+                    sc_embeds + t * CONFIG.embed_dim,
+                    CONFIG.vocab_size, CONFIG.embed_dim, num_tasks,
+                )
+                for i in range(CONFIG.embed_dim):
+                    sc_embeds[t * CONFIG.embed_dim + i] *= prompt_scale
+
+            # Mean entropy + confidence
+            var mean_ent: Float32 = 0.0
+            for t in range(CANVAS_LEN):
+                mean_ent += token_entropy[t]
+            mean_ent /= Float32(CANVAS_LEN)
+            var confident = mean_ent < confidence_threshold
+            print("    mean_entropy=", String(mean_ent), " temp=", String(temp),
+                  " confident=", confident)
+
+            # Entropy-bound acceptance mask: sort by ascending entropy, cumsum, cummax
+            # Selection sort for 256 elements
+            for t in range(CANVAS_LEN):
+                sorted_idx[t] = t
+                sorted_ent[t] = token_entropy[t]
+            for i in range(CANVAS_LEN):
+                var min_idx = i
+                for j in range(i + 1, CANVAS_LEN):
+                    if sorted_ent[j] < sorted_ent[min_idx]:
+                        min_idx = j
+                if min_idx != i:
+                    var tmp_e = sorted_ent[i]
+                    sorted_ent[i] = sorted_ent[min_idx]
+                    sorted_ent[min_idx] = tmp_e
+                    var tmp_i = sorted_idx[i]
+                    sorted_idx[i] = sorted_idx[min_idx]
+                    sorted_idx[min_idx] = tmp_i
+
+            # cumsum and cummax, accept where (cumsum - cummax) <= entropy_bound
+            var cumsum_ent: Float32 = 0.0
+            var cummax_ent: Float32 = 0.0
+            for t in range(CANVAS_LEN):
+                eb_mask[t] = False
+            for i in range(CANVAS_LEN):
+                cumsum_ent += sorted_ent[i]
+                if sorted_ent[i] > cummax_ent:
+                    cummax_ent = sorted_ent[i]
+                if (cumsum_ent - cummax_ent) <= entropy_bound:
+                    var orig_idx = sorted_idx[i]
+                    eb_mask[orig_idx] = True
+
+            # Update history: write argmax_tokens at slot hist_len % ST
+            var write_pos = hist_len % 2
+            for t in range(CANVAS_LEN):
+                history[write_pos * CANVAS_LEN + t] = argmax_tokens[t]
+            hist_len += 1
+
+            # Stability check: all ST slots agree
+            var stable = True
+            if hist_len >= 2:
+                for t in range(CANVAS_LEN):
+                    if history[0 * CANVAS_LEN + t] != history[1 * CANVAS_LEN + t]:
+                        stable = False
+                        break
+            else:
+                stable = False
+
+            # Convergence
+            var converged = (stable and confident and hist_len >= 2) or (denoise_step + 1 >= MAX_DENOISE_STEPS)
+            print("    stable=", stable, " converged=", converged)
+
+            # Update canvas: accept → new_tokens, reject → random re-noise
+            var n_accept = 0
+            for t in range(CANVAS_LEN):
+                if eb_mask[t]:
+                    n_accept += 1
+            var n_reject = CANVAS_LEN - n_accept
+            if n_reject > 0:
+                var reject_ids_py = np_random.randint(0, CONFIG.vocab_size, n_reject)
+                var reject_idx = 0
+                for t in range(CANVAS_LEN):
+                    if eb_mask[t]:
+                        canvas_tokens[t] = new_tokens[t]
+                    else:
+                        canvas_tokens[t] = Int(py=reject_ids_py[reject_idx])
+                        reject_idx += 1
+            else:
+                for t in range(CANVAS_LEN):
+                    canvas_tokens[t] = new_tokens[t]
+            print("    accepted=", n_accept, "/", CANVAS_LEN)
+
+            # Update argmax_canvas
+            for t in range(CANVAS_LEN):
+                argmax_canvas[t] = argmax_tokens[t]
+
+            # If converged: snap canvas to argmax and break
+            if converged:
+                for t in range(CANVAS_LEN):
+                    canvas_tokens[t] = argmax_canvas[t]
+                break
+
+            # Zero out sc_embeds for positions that will commit (none in denoise-only mode)
+            # All positions continue denoising, so sc_embeds stays
+
+            denoise_step += 1
 
         var t_end = std.time.perf_counter()
-        var prefill_duration = t_decode_start - t_prefill_start
-        var decode_duration = t_end - t_decode_start
-        var actual_decoded_tokens = pos - num_prompt_tokens
+        var denoise_duration = t_end - t_decode_start
 
         print("\n---------------------------------------------------------")
-        print("Generation complete!")
-        if actual_decoded_tokens > 0 and decode_duration > 0:
-            var decode_speed = Float64(actual_decoded_tokens) / decode_duration
-            print("Benchmark Results:")
-            print("  Prefill duration: ", String(prefill_duration * 1000.0), " ms (", String((prefill_duration * 1000.0) / Float64(num_prompt_tokens)), " ms/tok)")
-            print("  Decode duration:  ", String(decode_duration * 1000.0), " ms (", String((decode_duration * 1000.0) / Float64(actual_decoded_tokens)), " ms/tok)")
-            print("  Decode speed:     ", String(decode_speed), " tokens/sec")
-            print("\n---------------------------------------------------------")
-            print("Micro-Profiling Report (Decode Phase Only):")
-            print("---------------------------------------------------------")
-            
-            var total_profile_time = p_embed_reconstruct + p_attn_norm + p_qkv_proj + p_head_norm_rope_cache + p_attn_dot_product + p_wo_proj + p_shared_mlp + p_moe_router + p_moe_experts + p_moe_combine + p_final_norm + p_logit_proj + p_misc_decode
-            
-            def print_row(name: String, time_sec: Float64) {read total_profile_time, read actual_decoded_tokens}:
-                var pct = (time_sec / total_profile_time) * 100.0 if total_profile_time > 0 else 0.0
-                var ms_per_tok = (time_sec * 1000.0) / Float64(actual_decoded_tokens)
-                print("  " + pad_right(name, 32) + ": " + pad_left(String(time_sec * 1000.0), 10) + " ms (" + pad_left(String(pct), 6) + "%) [" + pad_left(String(ms_per_tok), 8) + " ms/tok]")
-
-            print_row("Embed Reconstruct", p_embed_reconstruct)
-            print_row("Attention Input Norm (RMS)", p_attn_norm)
-            print_row("QKV Projections (Matmul)", p_qkv_proj)
-            print_row("Head Norm, RoPE & Cache", p_head_norm_rope_cache)
-            print_row("Attention Dot-Prod / Softmax", p_attn_dot_product)
-            print_row("WO Projection (Matmul)", p_wo_proj)
-            print_row("Shared MLP Path (Matmul)", p_shared_mlp)
-            print_row("MoE Router Path", p_moe_router)
-            print_row("MoE Active Experts (Top-k)", p_moe_experts)
-            print_row("MoE Combine & Layer Scale", p_moe_combine)
-            print_row("Final RMS Norm", p_final_norm)
-            print_row("Logit Projection (LM Head)", p_logit_proj)
-            print_row("Misc Decode & Print Overhead", p_misc_decode)
-            
-            print("  " + pad_right("Total Profiled Time", 32) + ": " + pad_left(String(total_profile_time * 1000.0), 10) + " ms (100.0%) [" + pad_left(String((total_profile_time * 1000.0) / Float64(actual_decoded_tokens)), 8) + " ms/tok]")
-            print("---------------------------------------------------------")
-            print("Expert Pruning Statistics (Decode Phase Only):")
-            print("---------------------------------------------------------")
-            print("  Total Experts Evaluated         : " + String(total_experts_evaluated))
-            print("  Total Experts Pruned / Skipped  : " + String(total_experts_skipped))
-            var skip_pct = (Float64(total_experts_skipped) / Float64(total_experts_evaluated)) * 100.0 if total_experts_evaluated > 0 else 0.0
-            print("  Expert Pruning Ratio            : " + String(skip_pct) + "%")
-            print("---------------------------------------------------------")
+        print("Diffusion generation complete!")
+        print("  Prompt tokens:    ", num_prompt_tokens)
+        print("  Canvas length:    ", CANVAS_LEN)
+        print("  Denoise steps:    ", denoise_step + 1)
+        print("  Total denoise time: ", String(denoise_duration * 1000.0), " ms")
+        print("  Avg per step:     ", String(denoise_duration * 1000.0 / Float64(denoise_step + 1)), " ms")
+        print("  Output:")
+        var output_list = Python.list()
+        for t in range(CANVAS_LEN):
+            output_list.append(argmax_canvas[t])
+        var decoded_output = tokenizer.decode(output_list)
+        py_builtins.print("    ", decoded_output)
+        print("---------------------------------------------------------")
 
     # Cleanup memory
     free_c(base_addr)
@@ -1128,3 +1526,24 @@ def main() raises:
     target_final_norm_x.free()
     local_max_logits.free()
     local_next_tokens.free()
+    canvas_hidden.free()
+    canvas_q.free()
+    canvas_tokens.free()
+    argmax_canvas.free()
+    sc_embeds.free()
+    sc_buf_normed.free()
+    sc_buf_gate.free()
+    sc_buf_up.free()
+    sc_buf_gated.free()
+    sc_buf_down.free()
+    sc_out_buf.free()
+    canvas_final_norm.free()
+    sampler_logits.free()
+    sampler_probs.free()
+    token_entropy.free()
+    new_tokens.free()
+    argmax_tokens.free()
+    sorted_idx.free()
+    sorted_ent.free()
+    eb_mask.free()
+    history.free()
