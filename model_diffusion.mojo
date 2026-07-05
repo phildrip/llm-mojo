@@ -1131,10 +1131,11 @@ def main() raises:
         var p_misc_decode: Float64 = 0.0
 
         # --- Encoder Prefill (causal, token-first, writes K/V) ---
+        var p_scale_vec_prefill = SIMD[DType.float32, 8](prompt_scale)
         for pos in range(num_prompt_tokens):
             embed.reconstruct(prompt_tokens[pos], local_x)
-            for i in range(CONFIG.embed_dim):
-                local_x[i] *= prompt_scale
+            for i in range(0, CONFIG.embed_dim, 8):
+                local_x.store[8](i, local_x.load[8](i) * p_scale_vec_prefill)
 
             # Run layers
             for l in range(30):
@@ -1221,8 +1222,8 @@ def main() raises:
                 ta0 = std.time.perf_counter()
                 q4_gemv_cpu(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                 rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
-                for i in range(CONFIG.embed_dim):
-                    local_x[i] += proj_attn_out[i]
+                for i in range(0, CONFIG.embed_dim, 8):
+                    local_x.store[8](i, local_x.load[8](i) + proj_attn_out.load[8](i))
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
                     p_wo_proj += ta1 - ta0
@@ -1244,8 +1245,9 @@ def main() raises:
                 ta0 = std.time.perf_counter()
                 rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
                 var r_scale_factor = Float32(1.0 / sqrt(2816.0))
-                for j in range(CONFIG.embed_dim):
-                    scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+                var r_scale_vec = SIMD[DType.float32, 8](r_scale_factor)
+                for j in range(0, CONFIG.embed_dim, 8):
+                    scaled_norm_x.store[8](j, norm_x.load[8](j) * weights.router_scale.load[8](j) * r_scale_vec)
                 q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
                 softmax(scores, CONFIG.num_experts)
                 get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
@@ -1265,8 +1267,8 @@ def main() raises:
                     if pos >= num_prompt_tokens:
                         total_experts_evaluated += 1
 
-                for i in range(CONFIG.embed_dim):
-                    moe_out[i] = 0.0
+                for i in range(0, CONFIG.embed_dim, 8):
+                    moe_out.store[8](i, SIMD[DType.float32, 8](0.0))
                 rms_norm(local_x, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
@@ -1306,21 +1308,22 @@ def main() raises:
                     if w_e == 0.0:
                         continue
                     var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
-                    for j in range(CONFIG.embed_dim):
-                        moe_out[j] += exp_down_out[j] * w_e
+                    var w_e_vec = SIMD[DType.float32, 8](w_e)
+                    for j in range(0, CONFIG.embed_dim, 8):
+                        moe_out.store[8](j, moe_out.load[8](j) + exp_down_out.load[8](j) * w_e_vec)
 
                 rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
 
                 # Combine Shared MLP and MoE Path
-                for i in range(CONFIG.embed_dim):
-                    combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
+                for i in range(0, CONFIG.embed_dim, 8):
+                    combined_ffn.store[8](i, shared_h1_norm.load[8](i) + moe_out_norm.load[8](i))
                 rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
 
                 # Add to residual and multiply by layer_scalar
                 var scalar = weights.layer_scalar[0]
-                for i in range(CONFIG.embed_dim):
-                    local_x[i] += ffn_out[i]
-                    local_x[i] *= scalar
+                var scalar_vec = SIMD[DType.float32, 8](scalar)
+                for i in range(0, CONFIG.embed_dim, 8):
+                    local_x.store[8](i, (local_x.load[8](i) + ffn_out.load[8](i)) * scalar_vec)
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
                     p_moe_combine += ta1 - ta0
@@ -1393,8 +1396,10 @@ def main() raises:
                 q4_gemv_tiled[8](weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
                 if is_global:
                     for t in range(CANVAS_LEN):
-                        for i in range(kv_stride):
-                            canvas_v[t * MAX_KV_SIZE + i] = canvas_k[t * MAX_KV_SIZE + i]
+                        var v_ptr = canvas_v + t * MAX_KV_SIZE
+                        var k_ptr = canvas_k + t * MAX_KV_SIZE
+                        for i in range(0, kv_stride, 8):
+                            v_ptr.store[8](i, k_ptr.load[8](i))
                 else:
                     q4_gemv_tiled[8](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
                 var tl_qkv_end = std.time.perf_counter()
@@ -1417,9 +1422,9 @@ def main() raises:
                     apply_rope(k_store, layer_kv_heads, layer_head_dim, pos, is_global)
 
                     var step_cache_offset = layer_cache_offset + pos * kv_stride
-                    for i in range(kv_stride):
-                        k_cache[step_cache_offset + i] = k_store[i]
-                        v_cache[step_cache_offset + i] = v_store[i]
+                    for i in range(0, kv_stride, 8):
+                        k_cache.store[8](step_cache_offset + i, k_store.load[8](i))
+                        v_cache.store[8](step_cache_offset + i, v_store.load[8](i))
 
                 # Phase 2a: Bidirectional attention (parallelized over canvas tokens)
                 var tl_attn = std.time.perf_counter()
@@ -1475,8 +1480,8 @@ def main() raises:
                 for t in range(CANVAS_LEN):
                     var hidden = canvas_hidden + t * CONFIG.embed_dim
                     var proj = canvas_proj_attn + t * CONFIG.embed_dim
-                    for i in range(CONFIG.embed_dim):
-                        hidden[i] += proj[i]
+                    for i in range(0, CONFIG.embed_dim, 8):
+                        hidden.store[8](i, hidden.load[8](i) + proj.load[8](i))
 
                 # Phase 2c: Batched FFN (shared MLP path)
                 var tl_ffn = std.time.perf_counter()
@@ -1568,8 +1573,8 @@ def main() raises:
                 # 5. Zero out canvas_moe_out before the expert loop
                 for t in range(CANVAS_LEN):
                     var dst = canvas_moe_out + t * CONFIG.embed_dim
-                    for j in range(CONFIG.embed_dim):
-                        dst[j] = 0.0
+                    for j in range(0, CONFIG.embed_dim, 8):
+                        dst.store[8](j, SIMD[DType.float32, 8](0.0))
 
                 # 6. Sequential expert loop (no closures here!)
                 for e in range(128):
@@ -1732,8 +1737,10 @@ def main() raises:
                     sc_embeds + t * CONFIG.embed_dim,
                     CONFIG.vocab_size, CONFIG.embed_dim, 1,
                 )
-                for i in range(CONFIG.embed_dim):
-                    sc_embeds[t * CONFIG.embed_dim + i] *= prompt_scale
+                var sc_embeds_t = sc_embeds + t * CONFIG.embed_dim
+                var p_scale_vec = SIMD[DType.float32, 8](prompt_scale)
+                for i in range(0, CONFIG.embed_dim, 8):
+                    sc_embeds_t.store[8](i, sc_embeds_t.load[8](i) * p_scale_vec)
 
             parallelize[sampler_worker](CANVAS_LEN)
             rand_buf.free()
