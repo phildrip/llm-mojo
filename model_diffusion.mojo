@@ -577,20 +577,20 @@ def q4_gemv_tiled[TILE_B: Int](
 
 @always_inline
 def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
-    for i in range(size):
-        var x1 = h1[i]
-        var sig = 1.0 / (1.0 + exp(-1.702 * x1))
+    for i in range(0, size, 8):
+        var x1 = h1.load[8](i)
+        var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
         var gelu = x1 * sig
-        out_ptr[i] = gelu * h2[i]
+        out_ptr.store[8](i, gelu * h2.load[8](i))
 
 @always_inline
 def gelu_and_mul_batch(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
     for b in range(B):
         var base = b * dim
-        for i in range(dim):
-            var x1 = h1[base + i]
-            var sig = 1.0 / (1.0 + exp(-1.702 * x1))
-            out_ptr[base + i] = x1 * sig * h2[base + i]
+        for i in range(0, dim, 8):
+            var x1 = h1.load[8](base + i)
+            var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
+            out_ptr.store[8](base + i, x1 * sig * h2.load[8](base + i))
 
 @always_inline
 def rms_norm_batch(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
@@ -699,8 +699,8 @@ def sc_forward(
     # 4. down_proj: [embed_dim, sc_size] x [sc_size] -> [embed_dim]
     q4_gemv_cpu(sc_down_packed, sc_down_scales, buf_gated, buf_down, sc_size, embed_dim, num_tasks)
     # 5. residual + post_norm (no learned weight)
-    for i in range(embed_dim):
-        sc_out[i] = inputs_embeds[i] + buf_down[i]
+    for i in range(0, embed_dim, 8):
+        sc_out.store[8](i, inputs_embeds.load[8](i) + buf_down.load[8](i))
     rms_norm_noscale(sc_out, sc_out, embed_dim)
 
 
@@ -719,8 +719,8 @@ def probs_to_soft_embed(
     embed_dim: Int,
     num_tasks: Int,
 ):
-    for d in range(embed_dim):
-        sc_out[d] = 0.0
+    for d in range(0, embed_dim, 8):
+        sc_out.store[8](d, SIMD[DType.float32, 8](0.0))
     var num_blocks = embed_dim // 32
     var chunk_size = vocab_size // num_tasks
 
@@ -737,20 +737,19 @@ def probs_to_soft_embed(
                 var scale = embed_scales[row_scales_offset + b]
                 var block_packed_offset = row_packed_offset + b * 16
                 var block_out_offset = b * 32
-                for j in range(4):
-                    var b0 = embed_packed[block_packed_offset + j * 4]
-                    var b1 = embed_packed[block_packed_offset + j * 4 + 1]
-                    var b2 = embed_packed[block_packed_offset + j * 4 + 2]
-                    var b3 = embed_packed[block_packed_offset + j * 4 + 3]
-                    var out_idx = block_out_offset + j * 8
-                    sc_out[out_idx]     += p * Float32(Int(b0 & 15) - 8) * scale
-                    sc_out[out_idx + 1] += p * Float32(Int(b0 >> 4) - 8) * scale
-                    sc_out[out_idx + 2] += p * Float32(Int(b1 & 15) - 8) * scale
-                    sc_out[out_idx + 3] += p * Float32(Int(b1 >> 4) - 8) * scale
-                    sc_out[out_idx + 4] += p * Float32(Int(b2 & 15) - 8) * scale
-                    sc_out[out_idx + 5] += p * Float32(Int(b2 >> 4) - 8) * scale
-                    sc_out[out_idx + 6] += p * Float32(Int(b3 & 15) - 8) * scale
-                    sc_out[out_idx + 7] += p * Float32(Int(b3 >> 4) - 8) * scale
+
+                var bytes = embed_packed.load[16](block_packed_offset)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                var p_scale_vec = SIMD[DType.float32, 8](p * scale)
+                sc_out.store[8](block_out_offset, sc_out.load[8](block_out_offset) + w0 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 8, sc_out.load[8](block_out_offset + 8) + w1 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 16, sc_out.load[8](block_out_offset + 16) + w2 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 24, sc_out.load[8](block_out_offset + 24) + w3 * p_scale_vec)
 
     if num_tasks == 1:
         sc_worker(0)
