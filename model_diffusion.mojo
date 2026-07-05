@@ -499,6 +499,118 @@ def q4_gemv_batch(
     else:
         parallelize[worker](tasks)
 
+# Small-batch register-resident q4 GEMV kernel.
+# Pre-allocates MAX_B SIMD8 accumulators in CPU registers.
+# Loads each 16-byte quantized weight block exactly once, multiply-accumulating
+# against all B active token vectors in registers, and does a single
+# horizontal reduction per row at the end of the row loop.
+@always_inline
+def q4_gemv_small_b[MAX_B: Int](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        var acc = InlineArray[SIMD[DType.float32, 8], MAX_B](uninitialized=True)
+
+        for r in range(start_r, end_r):
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+
+            comptime for i in range(MAX_B):
+                acc[i] = SIMD[DType.float32, 8](0.0)
+
+            for blk in range(c_in_blocks):
+                var scale = scales[r_offset_scales + blk]
+                var block_p = r_offset_packed + blk * 16
+                var x_offset_base = blk * 32
+
+                var bytes = W_packed.load[16](block_p)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                # Pre-scale weights once per block to avoid multiplying scale on every token
+                w0 = w0 * scale
+                w1 = w1 * scale
+                w2 = w2 * scale
+                w3 = w3 * scale
+
+                comptime for i in range(MAX_B):
+                    if i < B:
+                        var x_base = i * x_stride + x_offset_base
+                        acc[i] = acc[i] + w0 * X.load[8](x_base)
+                        acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
+                        acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
+                        acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
+
+            comptime for i in range(MAX_B):
+                if i < B:
+                    out_ptr[i * o_stride + r] = acc[i].reduce_add()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+# Dynamically dispatches to the most narrow specialized small-batch kernel,
+# avoiding weight reload over-fetch loops by keeping weight loading to exactly once.
+@always_inline
+def q4_gemv_moe_dispatch(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    if B <= 1:
+        q4_gemv_small_b[1](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 2:
+        q4_gemv_small_b[2](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 4:
+        q4_gemv_small_b[4](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 8:
+        q4_gemv_small_b[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 12:
+        q4_gemv_small_b[12](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 16:
+        q4_gemv_small_b[16](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 24:
+        q4_gemv_small_b[24](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 32:
+        q4_gemv_small_b[32](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    else:
+        # Fallback to general tiled version
+        q4_gemv_tiled[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+
 # Tiled batched q4 GEMV. Per output row, processes B in tiles of TILE_B,
 # keeping TILE_B SIMD8 accumulators in registers. Each weight block is
 # loaded once per row (cached in L1 across tiles). Inner loop does
@@ -558,13 +670,19 @@ def q4_gemv_tiled[TILE_B: Int](
                     var w3 = SIMD[DType.float32, 8]()
                     unpack_16bytes(bytes, w0, w1, w2, w3)
 
+                    # Pre-scale weights once per block to avoid multiplying scale on every token
+                    w0 = w0 * scale
+                    w1 = w1 * scale
+                    w2 = w2 * scale
+                    w3 = w3 * scale
+
                     comptime for i in range(TILE_B):
                         if i < b_count:
                             var x_base = (b_outer + i) * x_stride + x_offset_base
-                            acc[i] = acc[i] + (w0 * X.load[8](x_base)) * scale
-                            acc[i] = acc[i] + (w1 * X.load[8](x_base + 8)) * scale
-                            acc[i] = acc[i] + (w2 * X.load[8](x_base + 16)) * scale
-                            acc[i] = acc[i] + (w3 * X.load[8](x_base + 24)) * scale
+                            acc[i] = acc[i] + w0 * X.load[8](x_base)
+                            acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
+                            acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
+                            acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
 
                 comptime for i in range(TILE_B):
                     if i < b_count:
@@ -1594,7 +1712,7 @@ def main() raises:
                     # Gate + Up projection
                     var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
                     var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
-                    q4_gemv_tiled[8](
+                    q4_gemv_moe_dispatch(
                         exp_gate_up_packed,
                         exp_gate_up_scales,
                         temp_x,
@@ -1617,7 +1735,7 @@ def main() raises:
                     # Down projection
                     var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
                     var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
-                    q4_gemv_tiled[8](
+                    q4_gemv_moe_dispatch(
                         exp_down_packed,
                         exp_down_scales,
                         temp_act,
