@@ -20,7 +20,7 @@ struct MoEConfig[
     num_experts: Int = 128,
     top_k_experts: Int = 8,
     num_layers: Int = 30,
-    vocab_size: Int = 262144,
+    vocab_size: Int = 32768,
     max_seq_len: Int = 512,
 ]:
     @always_inline
@@ -1050,7 +1050,7 @@ def main() raises:
 
     # 3. Load Q4 Token Embeddings
     print("Loading Q4 Token Embeddings...")
-    var embed = Q4Embedding("diffusiongemma_embed_q4.bin", CONFIG.vocab_size, CONFIG.embed_dim)
+    var embed = Q4Embedding("diffusiongemma_embed_q4_32k.bin", CONFIG.vocab_size, CONFIG.embed_dim)
 
     # 4. Allocate continuous KV Cache for 30 layers
     var kv_cache_offsets = List[Int]()
@@ -1216,7 +1216,10 @@ def main() raises:
         var encoded = tokenizer.encode(prompt_str, add_special_tokens=False)
         var prompt_tokens = List[Int]()
         for i in range(len(encoded)):
-            prompt_tokens.append(Int(py=encoded[i]))
+            var tok = Int(py=encoded[i])
+            if tok >= CONFIG.vocab_size:
+                tok = 3 # Map out-of-vocab tokens to <unk> (index 3) to prevent out-of-bounds errors
+            prompt_tokens.append(tok)
 
         var num_prompt_tokens = len(prompt_tokens)
         if num_prompt_tokens + CANVAS_LEN > CONFIG.max_seq_len:
