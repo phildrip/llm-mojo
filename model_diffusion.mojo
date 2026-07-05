@@ -1355,11 +1355,13 @@ def main() raises:
 
             # Compute canvas embeddings + self-conditioning
             for t in range(CANVAS_LEN):
-                embed.reconstruct(canvas_tokens[t], canvas_hidden + t * CONFIG.embed_dim)
-                for i in range(CONFIG.embed_dim):
-                    canvas_hidden[t * CONFIG.embed_dim + i] *= prompt_scale
+                var hidden_t = canvas_hidden + t * CONFIG.embed_dim
+                embed.reconstruct(canvas_tokens[t], hidden_t)
+                var p_scale_vec = SIMD[DType.float32, 8](prompt_scale)
+                for i in range(0, CONFIG.embed_dim, 8):
+                    hidden_t.store[8](i, hidden_t.load[8](i) * p_scale_vec)
                 sc_forward(
-                    canvas_hidden + t * CONFIG.embed_dim,
+                    hidden_t,
                     sc_embeds + t * CONFIG.embed_dim,
                     sc_gate_packed, sc_up_packed, sc_down_packed,
                     sc_gate_scales, sc_up_scales, sc_down_scales,
@@ -1368,8 +1370,8 @@ def main() raises:
                     sc_out_buf,
                     CONFIG.embed_dim, SC_SIZE, num_tasks,
                 )
-                for i in range(CONFIG.embed_dim):
-                    canvas_hidden[t * CONFIG.embed_dim + i] = sc_out_buf[i]
+                for i in range(0, CONFIG.embed_dim, 8):
+                    hidden_t.store[8](i, sc_out_buf.load[8](i))
 
             # Decoder forward: layer-first, batched projections, bidirectional attention
             for l in range(30):
@@ -1501,8 +1503,9 @@ def main() raises:
                     var routed_norm_t = canvas_routed_norm + t * CONFIG.embed_dim
 
                     rms_norm_noscale(hidden_inout, routed_norm_t, CONFIG.embed_dim)
-                    for j in range(CONFIG.embed_dim):
-                        scaled_norm_t[j] = routed_norm_t[j] * weights.router_scale[j] * r_scale_factor
+                    var r_scale_vec = SIMD[DType.float32, 8](r_scale_factor)
+                    for j in range(0, CONFIG.embed_dim, 8):
+                        scaled_norm_t.store[8](j, routed_norm_t.load[8](j) * weights.router_scale.load[8](j) * r_scale_vec)
                     q4_gemv_cpu(weights.w_router_packed, weights.w_router_scales, scaled_norm_t, scores_t, CONFIG.embed_dim, CONFIG.num_experts, 1)
                     softmax(scores_t, CONFIG.num_experts)
                     get_top_k[8](scores_t, top_idx_t, top_val_t, CONFIG.num_experts)
@@ -1644,12 +1647,12 @@ def main() raises:
                     var moe_n = canvas_moe_norm + t * CONFIG.embed_dim
                     var combined = canvas_combined + t * CONFIG.embed_dim
                     var ffn = canvas_ffn_out + t * CONFIG.embed_dim
-                    for i in range(CONFIG.embed_dim):
-                        combined[i] = shared_n[i] + moe_n[i]
+                    for i in range(0, CONFIG.embed_dim, 8):
+                        combined.store[8](i, shared_n.load[8](i) + moe_n.load[8](i))
                     rms_norm(combined, weights.post_feedforward_layernorm_weight, ffn, CONFIG.embed_dim)
-                    for i in range(CONFIG.embed_dim):
-                        hidden[i] += ffn[i]
-                        hidden[i] *= scalar
+                    var scalar_vec = SIMD[DType.float32, 8](scalar)
+                    for i in range(0, CONFIG.embed_dim, 8):
+                        hidden.store[8](i, (hidden.load[8](i) + ffn.load[8](i)) * scalar_vec)
 
                 if l == 0 or l == 15 or l == 29:
                     print("    layer ", l, " qkv=", String((tl_qkv_end - tl_qkv) * 1000), "ms",
