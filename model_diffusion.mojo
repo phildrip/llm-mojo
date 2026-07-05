@@ -9,6 +9,858 @@ from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
 import std.time
 
+# ==============================================================================
+# KFD IOCTL Arguments, structures, and GPU Memory helper structures
+# ==============================================================================
+
+struct kfd_ioctl_acquire_vm_args:
+    var drm_fd: UInt32
+    var gpu_id: UInt32
+
+    def __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
+        self.drm_fd = drm_fd
+        self.gpu_id = gpu_id
+
+struct kfd_ioctl_runtime_enable_args:
+    var r_debug: UInt64
+    var mode_mask: UInt32
+    var capabilities_mask: UInt32
+
+    def __init__(out self):
+        self.r_debug = 0
+        self.mode_mask = 0
+        self.capabilities_mask = 0
+
+struct kfd_ioctl_alloc_memory_of_gpu_args:
+    var va_addr: UInt64
+    var size: UInt64
+    var handle: UInt64
+    var mmap_offset: UInt64
+    var gpu_id: UInt32
+    var flags: UInt32
+
+    def __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
+        self.va_addr = va_addr
+        self.size = size
+        self.handle = 0
+        self.mmap_offset = 0
+        self.gpu_id = gpu_id
+        self.flags = flags
+
+struct kfd_ioctl_map_memory_to_gpu_args:
+    var handle: UInt64
+    var device_ids_array_ptr: UInt64
+    var n_devices: UInt32
+    var pad: UInt32
+
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+        self.handle = handle
+        self.device_ids_array_ptr = device_ids_array_ptr
+        self.n_devices = n_devices
+        self.pad = 0
+
+struct kfd_ioctl_unmap_memory_from_gpu_args:
+    var handle: UInt64
+    var device_ids_array_ptr: UInt64
+    var n_devices: UInt32
+    var pad: UInt32
+
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+        self.handle = handle
+        self.device_ids_array_ptr = device_ids_array_ptr
+        self.n_devices = n_devices
+        self.pad = 0
+
+struct kfd_ioctl_free_memory_of_gpu_args:
+    var handle: UInt64
+
+    def __init__(out self, handle: UInt64):
+        self.handle = handle
+
+struct kfd_ioctl_create_queue_args:
+    var ring_base_address: UInt64
+    var write_pointer_address: UInt64
+    var read_pointer_address: UInt64
+    var doorbell_offset: UInt64
+    var ring_size: UInt32
+    var gpu_id: UInt32
+    var queue_type: UInt32
+    var queue_percentage: UInt32
+    var queue_priority: UInt32
+    var queue_id: UInt32
+    var eop_buffer_address: UInt64
+    var eop_buffer_size: UInt64
+    var ctx_save_restore_address: UInt64
+    var ctx_save_restore_size: UInt32
+    var ctl_stack_size: UInt32
+    var sdma_engine_id: UInt32
+    var pad: UInt32
+
+    def __init__(
+        out self,
+        ring_base_address: UInt64,
+        write_pointer_address: UInt64,
+        read_pointer_address: UInt64,
+        ring_size: UInt32,
+        gpu_id: UInt32,
+        queue_type: UInt32,
+        queue_percentage: UInt32,
+        queue_priority: UInt32,
+        eop_buffer_address: UInt64 = 0,
+        eop_buffer_size: UInt64 = 0,
+        ctx_save_restore_address: UInt64 = 0,
+        ctx_save_restore_size: UInt32 = 0,
+        ctl_stack_size: UInt32 = 0,
+        sdma_engine_id: UInt32 = 0
+    ):
+        self.ring_base_address = ring_base_address
+        self.write_pointer_address = write_pointer_address
+        self.read_pointer_address = read_pointer_address
+        self.doorbell_offset = 0
+        self.ring_size = ring_size
+        self.gpu_id = gpu_id
+        self.queue_type = queue_type
+        self.queue_percentage = queue_percentage
+        self.queue_priority = queue_priority
+        self.queue_id = 0
+        self.eop_buffer_address = eop_buffer_address
+        self.eop_buffer_size = eop_buffer_size
+        self.ctx_save_restore_address = ctx_save_restore_address
+        self.ctx_save_restore_size = ctx_save_restore_size
+        self.ctl_stack_size = ctl_stack_size
+        self.sdma_engine_id = sdma_engine_id
+        self.pad = 0
+
+struct kfd_ioctl_destroy_queue_args:
+    var queue_id: UInt32
+    var pad: UInt32
+
+    def __init__(out self, queue_id: UInt32):
+        self.queue_id = queue_id
+        self.pad = 0
+
+struct GPUMemoryBuffer(Copyable, Movable):
+    var va_addr: Int
+    var size: Int
+    var handle: UInt64
+    var cpu_addr: Int
+
+    def __init__(out self):
+        self.va_addr = 0
+        self.size = 0
+        self.handle = 0
+        self.cpu_addr = 0
+
+    def __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
+        self.va_addr = va_addr
+        self.size = size
+        self.handle = handle
+        self.cpu_addr = cpu_addr
+
+    def __init__(out self, *, copy: Self):
+        self.va_addr = copy.va_addr
+        self.size = copy.size
+        self.handle = copy.handle
+        self.cpu_addr = copy.cpu_addr
+
+    def __init__(out self, *, deinit take: Self):
+        self.va_addr = take.va_addr
+        self.size = take.size
+        self.handle = take.handle
+        self.cpu_addr = take.cpu_addr
+
+struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
+    var header: UInt16
+    var setup: UInt16
+    var workgroup_size_x: UInt16
+    var workgroup_size_y: UInt16
+    var workgroup_size_z: UInt16
+    var reserved0: UInt16
+    var grid_size_x: UInt32
+    var grid_size_y: UInt32
+    var grid_size_z: UInt32
+    var private_segment_size: UInt32
+    var group_segment_size: UInt32
+    var kernel_object: UInt64
+    var kernarg_address: UInt64
+    var reserved2: UInt64
+    var completion_signal: UInt64
+
+    def __init__(
+        out self,
+        header: UInt16,
+        setup: UInt16,
+        workgroup_size_x: UInt16,
+        workgroup_size_y: UInt16,
+        workgroup_size_z: UInt16,
+        grid_size_x: UInt32,
+        grid_size_y: UInt32,
+        grid_size_z: UInt32,
+        private_segment_size: UInt32,
+        group_segment_size: UInt32,
+        kernel_object: UInt64,
+        kernarg_address: UInt64,
+        completion_signal: UInt64
+    ):
+        self.header = header
+        self.setup = setup
+        self.workgroup_size_x = workgroup_size_x
+        self.workgroup_size_y = workgroup_size_y
+        self.workgroup_size_z = workgroup_size_z
+        self.reserved0 = 0
+        self.grid_size_x = grid_size_x
+        self.grid_size_y = grid_size_y
+        self.grid_size_z = grid_size_z
+        self.private_segment_size = private_segment_size
+        self.group_segment_size = group_segment_size
+        self.kernel_object = kernel_object
+        self.kernarg_address = kernarg_address
+        self.reserved2 = 0
+        self.completion_signal = completion_signal
+
+struct GPUContext(Movable):
+    var libc: OwnedDLHandle
+    var cpu_fence_lib: OwnedDLHandle
+    var kfd_fd: Int32
+    var drm_fd: Int32
+    var gpu_id: UInt32
+    
+    # libc function pointers
+    var c_open: def(Int, Int32) thin abi("C") -> Int32
+    var c_close: def(Int32) thin abi("C") -> Int32
+    var c_ioctl: def(Int32, Int, Int) thin abi("C") -> Int32
+    var c_mmap: def(Int, Int, Int32, Int32, Int32, Int) thin abi("C") -> Int
+    var c_munmap: def(Int, Int) thin abi("C") -> Int32
+    var c_read: def(Int32, Int, Int) thin abi("C") -> Int
+    var c_errno_loc: def() thin abi("C") -> Int
+    var cpu_sfence: def(Int32) thin abi("C") -> Int32
+    var cpu_clflush: def(Int) thin abi("C") -> Int32
+    var usleep_fn: def(UInt32) thin abi("C") -> Int32
+
+    # Queue buffers and registers
+    var ring_buf: GPUMemoryBuffer
+    var gart_buf: GPUMemoryBuffer
+    var cwsr_buf: GPUMemoryBuffer
+    var eop_buf: GPUMemoryBuffer
+    var hsaco_buf: GPUMemoryBuffer
+    var kernarg_buf: GPUMemoryBuffer
+    var completion_buf: GPUMemoryBuffer
+    var packet_idx: UInt64
+    
+    var queue_id: UInt32
+    var doorbell_mmap_addr: Int
+    var doorbell_reg_addr: Int
+
+    # Constants
+    comptime AMDKFD_IOC_ACQUIRE_VM = 0x40084B15
+    comptime AMDKFD_IOC_RUNTIME_ENABLE = 0xC0104B25
+    comptime AMDKFD_IOC_ALLOC_MEMORY_OF_GPU = 0xC0284B16
+    comptime AMDKFD_IOC_FREE_MEMORY_OF_GPU = 0x40084B17
+    comptime AMDKFD_IOC_MAP_MEMORY_TO_GPU = 0xC0184B18
+    comptime AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU = 0xC0184B19
+    comptime AMDKFD_IOC_CREATE_QUEUE = 0xC0604B02
+    comptime AMDKFD_IOC_DESTROY_QUEUE = 0xC0084B03
+
+    comptime PROT_NONE = 0
+    comptime PROT_READ = 1
+    comptime PROT_WRITE = 2
+    comptime MAP_SHARED = 0x01
+    comptime MAP_PRIVATE = 0x02
+    comptime MAP_FIXED = 0x10
+    comptime MAP_ANONYMOUS = 0x20
+
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_VRAM = 1 << 0
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_GTT = 1 << 1
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE = 1 << 31
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE = 1 << 30
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC = 1 << 29
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE = 1 << 28
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_COHERENT = 1 << 26
+    comptime KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED = 1 << 25
+
+    def __init__(out self) raises:
+        self.libc = OwnedDLHandle("libc.so.6")
+        self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
+        
+        self.c_open = self.libc.get_function[def(Int, Int32) thin abi("C") -> Int32]("open")
+        self.c_close = self.libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+        self.c_ioctl = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
+        self.c_mmap = self.libc.get_function[def(Int, Int, Int32, Int32, Int32, Int) thin abi("C") -> Int]("mmap")
+        self.c_munmap = self.libc.get_function[def(Int, Int) thin abi("C") -> Int32]("munmap")
+        self.c_read = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
+        self.c_errno_loc = self.libc.get_function[def() thin abi("C") -> Int]("__errno_location")
+        self.cpu_sfence = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
+        self.cpu_clflush = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
+
+        var kfd_path = "/dev/kfd"
+        var kfd_path_bytes = kfd_path.as_bytes()
+        var kfd_path_ptr = alloc[UInt8](len(kfd_path_bytes) + 1)
+        for i in range(len(kfd_path_bytes)):
+            kfd_path_ptr[i] = kfd_path_bytes[i]
+        kfd_path_ptr[len(kfd_path_bytes)] = 0
+        self.kfd_fd = self.c_open(kfd_path_ptr.__int__(), 2) # O_RDWR
+        kfd_path_ptr.free()
+        
+        if self.kfd_fd < 0:
+            raise Error("Failed to open /dev/kfd")
+
+        var drm_path = "/dev/dri/renderD128"
+        var drm_path_bytes = drm_path.as_bytes()
+        var drm_path_ptr = alloc[UInt8](len(drm_path_bytes) + 1)
+        for i in range(len(drm_path_bytes)):
+            drm_path_ptr[i] = drm_path_bytes[i]
+        drm_path_ptr[len(drm_path_bytes)] = 0
+        self.drm_fd = self.c_open(drm_path_ptr.__int__(), 2) # O_RDWR
+        drm_path_ptr.free()
+
+        if self.drm_fd < 0:
+            _ = self.c_close(self.kfd_fd)
+            raise Error("Failed to open /dev/dri/renderD128")
+
+        # Discover GPU ID from topology
+        self.gpu_id = 0
+        for node_idx in range(1, 16):
+            var path = "/sys/class/kfd/kfd/topology/nodes/" + String(node_idx) + "/gpu_id"
+            var path_bytes = path.as_bytes()
+            var path_ptr = alloc[UInt8](len(path_bytes) + 1)
+            for i in range(len(path_bytes)):
+                path_ptr[i] = path_bytes[i]
+            path_ptr[len(path_bytes)] = 0
+            var fd = self.c_open(path_ptr.__int__(), 0)
+            path_ptr.free()
+            
+            if fd >= 0:
+                var buf = alloc[UInt8](64)
+                var bytes_read = self.c_read(fd, buf.__int__(), 63)
+                _ = self.c_close(fd)
+                if bytes_read > 0:
+                    buf[bytes_read] = 0
+                    var val: Int = 0
+                    for i in range(bytes_read):
+                        var char_code = buf[i]
+                        if char_code >= 48 and char_code <= 57:
+                            val = val * 10 + (Int(char_code) - 48)
+                    buf.free()
+                    if val > 0:
+                        self.gpu_id = UInt32(val)
+                        break
+                else:
+                    buf.free()
+
+        if self.gpu_id == 0:
+            self.gpu_id = 21148 # default fallback
+
+        # VM Acquisition
+        var acq_args_ptr = alloc[kfd_ioctl_acquire_vm_args](1)
+        acq_args_ptr[0] = kfd_ioctl_acquire_vm_args(drm_fd=UInt32(self.drm_fd), gpu_id=self.gpu_id)
+        var r = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_ACQUIRE_VM, acq_args_ptr.__int__())
+        acq_args_ptr.free()
+        if r < 0:
+            _ = self.c_close(self.kfd_fd)
+            _ = self.c_close(self.drm_fd)
+            raise Error("GPU VM Acquisition failed!")
+
+        # Enable Runtime
+        var runtime_enable_ptr = alloc[kfd_ioctl_runtime_enable_args](1)
+        runtime_enable_ptr[0] = kfd_ioctl_runtime_enable_args()
+        r = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_RUNTIME_ENABLE, runtime_enable_ptr.__int__())
+        runtime_enable_ptr.free()
+        if r < 0:
+            _ = self.c_close(self.kfd_fd)
+            _ = self.c_close(self.drm_fd)
+            raise Error("GPU Runtime enable failed!")
+
+        # Setup base flags
+        var base_flags = (Self.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+                          Self.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+                          Self.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE)
+
+        var gtt_uncached_flags = (base_flags |
+                                  Self.KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+                                  Self.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+                                  Self.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED |
+                                  Self.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC)
+
+        var vram_private_flags = (base_flags |
+                                  Self.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+
+        # Setup local references for nested function capture
+        var c_mmap = self.c_mmap
+        var c_ioctl = self.c_ioctl
+        var c_munmap = self.c_munmap
+        var kfd_fd = self.kfd_fd
+        var drm_fd = self.drm_fd
+        var gpu_id = self.gpu_id
+        
+        var PROT_NONE = Self.PROT_NONE
+        var PROT_READ = Self.PROT_READ
+        var PROT_WRITE = Self.PROT_WRITE
+        var MAP_SHARED = Self.MAP_SHARED
+        var MAP_PRIVATE = Self.MAP_PRIVATE
+        var MAP_FIXED = Self.MAP_FIXED
+        var MAP_ANONYMOUS = Self.MAP_ANONYMOUS
+        
+        var AMDKFD_IOC_ALLOC_MEMORY_OF_GPU = Self.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU
+        var AMDKFD_IOC_FREE_MEMORY_OF_GPU = Self.AMDKFD_IOC_FREE_MEMORY_OF_GPU
+        var AMDKFD_IOC_MAP_MEMORY_TO_GPU = Self.AMDKFD_IOC_MAP_MEMORY_TO_GPU
+        var AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU = Self.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU
+
+        def alloc_gpu_buf(size: Int, flags: UInt32, cpu_access: Bool) capturing raises -> GPUMemoryBuffer:
+            var va_addr = c_mmap(0, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+            if va_addr == -1 or va_addr == 0:
+                raise Error("mmap failed")
+            
+            var alloc_args_ptr = alloc[kfd_ioctl_alloc_memory_of_gpu_args](1)
+            alloc_args_ptr[0] = kfd_ioctl_alloc_memory_of_gpu_args(va_addr=UInt64(va_addr), size=UInt64(size), gpu_id=gpu_id, flags=flags)
+            var io_res = c_ioctl(kfd_fd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, alloc_args_ptr.__int__())
+            if io_res < 0:
+                alloc_args_ptr.free()
+                _ = c_munmap(va_addr, size)
+                raise Error("ALLOC_MEMORY failed")
+            var handle = alloc_args_ptr[0].handle
+            var mmap_offset = alloc_args_ptr[0].mmap_offset
+            alloc_args_ptr.free()
+
+            var cpu_addr = 0
+            if cpu_access:
+                cpu_addr = c_mmap(va_addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, drm_fd, Int(mmap_offset))
+                if cpu_addr == -1 or cpu_addr != va_addr:
+                    raise Error("CPU mmap failed")
+
+            var device_ids_ptr = alloc[UInt32](1)
+            device_ids_ptr[0] = gpu_id
+            var map_args_ptr = alloc[kfd_ioctl_map_memory_to_gpu_args](1)
+            map_args_ptr[0] = kfd_ioctl_map_memory_to_gpu_args(handle=handle, device_ids_array_ptr=UInt64(device_ids_ptr.__int__()), n_devices=1)
+            io_res = c_ioctl(kfd_fd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, map_args_ptr.__int__())
+            device_ids_ptr.free()
+            map_args_ptr.free()
+            if io_res < 0:
+                raise Error("MAP failed")
+
+            return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
+
+        def free_gpu_buf(buf: GPUMemoryBuffer) capturing raises:
+            var unmap_device_ids_ptr = alloc[UInt32](1)
+            unmap_device_ids_ptr[0] = gpu_id
+            var unmap_args_ptr = alloc[kfd_ioctl_unmap_memory_from_gpu_args](1)
+            unmap_args_ptr[0] = kfd_ioctl_unmap_memory_from_gpu_args(handle=buf.handle, device_ids_array_ptr=UInt64(unmap_device_ids_ptr.__int__()), n_devices=1)
+            _ = c_ioctl(kfd_fd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, unmap_args_ptr.__int__())
+            unmap_device_ids_ptr.free()
+            unmap_args_ptr.free()
+            
+            if buf.cpu_addr != 0:
+                _ = c_munmap(buf.cpu_addr, buf.size)
+            else:
+                _ = c_munmap(buf.va_addr, buf.size)
+
+            var free_args_ptr = alloc[kfd_ioctl_free_memory_of_gpu_args](1)
+            free_args_ptr[0] = kfd_ioctl_free_memory_of_gpu_args(handle=buf.handle)
+            _ = c_ioctl(kfd_fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, free_args_ptr.__int__())
+            free_args_ptr.free()
+
+        # Initialize ring, gart, cwsr, eop buffers
+        var ring_buf = alloc_gpu_buf(64 * 1024, UInt32(gtt_uncached_flags), cpu_access=True)
+        var gart_buf = alloc_gpu_buf(4096, UInt32(gtt_uncached_flags), cpu_access=True)
+        var cwsr_buf = alloc_gpu_buf(2801664, UInt32(vram_private_flags), cpu_access=False)
+        var eop_buf = alloc_gpu_buf(4096, UInt32(vram_private_flags), cpu_access=False)
+
+        # Initialize ring buffer
+        var ring_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=ring_buf.cpu_addr)
+        for i in range((64 * 1024) // 4):
+            ring_ptr[i] = 0
+
+        # Initialize GART buffer
+        var gart_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=gart_buf.cpu_addr)
+        for i in range(4096 // 4):
+            gart_u32_ptr[i] = 0
+
+        var sig_cpu_addr = gart_buf.cpu_addr + 512
+        var sig_va_addr = gart_buf.va_addr + 512
+
+        var sig_u64_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr)
+        for i in range(8):
+            sig_u64_ptr[i] = 0
+
+        UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(gart_buf.va_addr)
+
+        _ = self.cpu_clflush(sig_cpu_addr)
+        _ = self.cpu_sfence(0)
+
+        var q_base = gart_buf.cpu_addr
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 0)[0] = 2       # queue_type = AQL
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 4)[0] = 1       # features
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=q_base + 8)[0] = UInt64(ring_buf.va_addr)
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=q_base + 16)[0] = UInt64(sig_va_addr)
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 24)[0] = 1024   # size
+
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 72)[0] = 7
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 76)[0] = 39
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 136)[0] = 128
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 180)[0] = 10
+
+        _ = self.cpu_clflush(q_base)
+        _ = self.cpu_clflush(q_base + 64)
+        _ = self.cpu_clflush(q_base + 128)
+        _ = self.cpu_clflush(q_base + 180)
+        _ = self.cpu_sfence(0)
+
+        # Create AQL queue in KFD
+        var create_args_ptr = alloc[kfd_ioctl_create_queue_args](1)
+        create_args_ptr[0] = kfd_ioctl_create_queue_args(
+            ring_base_address=UInt64(ring_buf.va_addr),
+            write_pointer_address=UInt64(gart_buf.va_addr + 56),
+            read_pointer_address=UInt64(gart_buf.va_addr + 128),
+            ring_size=UInt32(64 * 1024),
+            gpu_id=self.gpu_id,
+            queue_type=2,
+            queue_percentage=100,
+            queue_priority=7,
+            eop_buffer_address=UInt64(eop_buf.va_addr),
+            eop_buffer_size=4096,
+            ctx_save_restore_address=UInt64(cwsr_buf.va_addr),
+            ctx_save_restore_size=2789376,
+            ctl_stack_size=4096,
+            sdma_engine_id=0
+        )
+        r = self.c_ioctl(self.kfd_fd, Self.AMDKFD_IOC_CREATE_QUEUE, create_args_ptr.__int__())
+        if r < 0:
+            var err = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=self.c_errno_loc())[0]
+            free_gpu_buf(eop_buf)
+            free_gpu_buf(cwsr_buf)
+            free_gpu_buf(gart_buf)
+            free_gpu_buf(ring_buf)
+            _ = self.c_close(self.kfd_fd)
+            _ = self.c_close(self.drm_fd)
+            create_args_ptr.free()
+            raise Error("KFD Queue creation failed with errno: " + String(err))
+
+        self.queue_id = create_args_ptr[0].queue_id
+        var doorbell_offset = create_args_ptr[0].doorbell_offset
+        create_args_ptr.free()
+
+        var doorbells_base = doorbell_offset & (~0x1fff)
+        var doorbell_page_size = 0x2000
+        self.doorbell_mmap_addr = self.c_mmap(0, doorbell_page_size, PROT_READ | PROT_WRITE, MAP_SHARED, self.kfd_fd, Int(doorbells_base))
+        if self.doorbell_mmap_addr == -1:
+            raise Error("Doorbell page mmap failed")
+        self.doorbell_reg_addr = self.doorbell_mmap_addr + (Int(doorbell_offset) - Int(doorbells_base))
+
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(self.doorbell_reg_addr)
+        _ = self.cpu_clflush(sig_cpu_addr)
+        _ = self.cpu_sfence(0)
+
+        # Successfully created queue, now transfer buffer ownership to self fields
+        self.ring_buf = ring_buf^
+        self.gart_buf = gart_buf^
+        self.cwsr_buf = cwsr_buf^
+        self.eop_buf = eop_buf^
+        self.completion_buf = alloc_gpu_buf(1024 * 64, UInt32(gtt_uncached_flags), cpu_access=True)
+        self.kernarg_buf = alloc_gpu_buf(1024 * 256, UInt32(gtt_uncached_flags), cpu_access=True)
+        self.packet_idx = 0
+        self.usleep_fn = self.libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
+
+        # Load GCN compiled ELF shader
+        var hsaco_buf = alloc_gpu_buf(16384, UInt32(gtt_uncached_flags), cpu_access=True)
+        self.hsaco_buf = hsaco_buf^
+        var hsaco_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr)
+        for i in range(16384 // 4):
+            hsaco_u32_ptr[i] = 0
+
+        var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul.hsaco"
+        var hsaco_file_bytes = hsaco_file.as_bytes()
+        var hsaco_file_ptr = alloc[UInt8](len(hsaco_file_bytes) + 1)
+        for i in range(len(hsaco_file_bytes)):
+            hsaco_file_ptr[i] = hsaco_file_bytes[i]
+        hsaco_file_ptr[len(hsaco_file_bytes)] = 0
+        var hsaco_fd = self.c_open(hsaco_file_ptr.__int__(), 0)
+        hsaco_file_ptr.free()
+        if hsaco_fd < 0:
+            raise Error("Failed to open q8_matmul.hsaco")
+
+        var temp_file_buf = alloc[UInt8](8192)
+        var bytes_read = self.c_read(hsaco_fd, temp_file_buf.__int__(), 8192)
+        _ = self.c_close(hsaco_fd)
+        if bytes_read <= 0:
+            temp_file_buf.free()
+            raise Error("Failed to read any bytes from q8_matmul.hsaco")
+
+        var segment1_src = temp_file_buf
+        var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
+        for i in range(0xa80):
+            segment1_dst[i] = segment1_src[i]
+
+        var segment2_src = temp_file_buf + 0xb00
+        var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
+        for i in range(0x414):
+            segment2_dst[i] = segment2_src[i]
+
+        var segment3_src = temp_file_buf + 0xf18
+        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f18)
+        for i in range(0x70):
+            segment3_dst[i] = segment3_src[i]
+
+        temp_file_buf.free()
+
+    def __init__(out self, *, deinit take: Self):
+        self.libc = take.libc^
+        self.cpu_fence_lib = take.cpu_fence_lib^
+        self.kfd_fd = take.kfd_fd
+        self.drm_fd = take.drm_fd
+        self.gpu_id = take.gpu_id
+        self.c_open = take.c_open
+        self.c_close = take.c_close
+        self.c_ioctl = take.c_ioctl
+        self.c_mmap = take.c_mmap
+        self.c_munmap = take.c_munmap
+        self.c_read = take.c_read
+        self.c_errno_loc = take.c_errno_loc
+        self.cpu_sfence = take.cpu_sfence
+        self.cpu_clflush = take.cpu_clflush
+        self.usleep_fn = take.usleep_fn
+        self.ring_buf = take.ring_buf^
+        self.gart_buf = take.gart_buf^
+        self.cwsr_buf = take.cwsr_buf^
+        self.eop_buf = take.eop_buf^
+        self.hsaco_buf = take.hsaco_buf^
+        self.kernarg_buf = take.kernarg_buf^
+        self.completion_buf = take.completion_buf^
+        self.packet_idx = take.packet_idx
+        self.queue_id = take.queue_id
+        self.doorbell_mmap_addr = take.doorbell_mmap_addr
+        self.doorbell_reg_addr = take.doorbell_reg_addr
+
+    def __del__(deinit self):
+        # Destroy queue first
+        var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
+        destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=self.queue_id)
+        _ = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
+        destroy_args_ptr.free()
+
+        _ = self.c_munmap(self.doorbell_mmap_addr, 0x2000)
+
+        # Free all queue buffers
+        try:
+            self.free_gpu_buffer(self.kernarg_buf)
+            self.free_gpu_buffer(self.completion_buf)
+            self.free_gpu_buffer(self.hsaco_buf)
+            self.free_gpu_buffer(self.eop_buf)
+            self.free_gpu_buffer(self.cwsr_buf)
+            self.free_gpu_buffer(self.gart_buf)
+            self.free_gpu_buffer(self.ring_buf)
+        except:
+            pass
+
+        _ = self.c_close(self.kfd_fd)
+        _ = self.c_close(self.drm_fd)
+
+    def alloc_gpu_buffer(self, size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
+        var va_addr = self.c_mmap(0, size, self.PROT_NONE, self.MAP_PRIVATE | self.MAP_ANONYMOUS, -1, 0)
+        if va_addr == -1 or va_addr == 0:
+            raise Error("mmap failed")
+        
+        var alloc_args_ptr = alloc[kfd_ioctl_alloc_memory_of_gpu_args](1)
+        alloc_args_ptr[0] = kfd_ioctl_alloc_memory_of_gpu_args(va_addr=UInt64(va_addr), size=UInt64(size), gpu_id=self.gpu_id, flags=flags)
+        var io_res = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, alloc_args_ptr.__int__())
+        if io_res < 0:
+            alloc_args_ptr.free()
+            _ = self.c_munmap(va_addr, size)
+            raise Error("ALLOC_MEMORY failed")
+        var handle = alloc_args_ptr[0].handle
+        var mmap_offset = alloc_args_ptr[0].mmap_offset
+        alloc_args_ptr.free()
+
+        var cpu_addr = 0
+        if cpu_access:
+            cpu_addr = self.c_mmap(va_addr, size, self.PROT_READ | self.PROT_WRITE, self.MAP_SHARED | self.MAP_FIXED, self.drm_fd, Int(mmap_offset))
+            if cpu_addr == -1 or cpu_addr != va_addr:
+                raise Error("CPU mmap failed")
+
+        var device_ids_ptr = alloc[UInt32](1)
+        device_ids_ptr[0] = self.gpu_id
+        var map_args_ptr = alloc[kfd_ioctl_map_memory_to_gpu_args](1)
+        map_args_ptr[0] = kfd_ioctl_map_memory_to_gpu_args(handle=handle, device_ids_array_ptr=UInt64(device_ids_ptr.__int__()), n_devices=1)
+        io_res = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_MAP_MEMORY_TO_GPU, map_args_ptr.__int__())
+        device_ids_ptr.free()
+        map_args_ptr.free()
+        if io_res < 0:
+            raise Error("MAP failed")
+
+        return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
+
+    def free_gpu_buffer(self, buf: GPUMemoryBuffer) raises:
+        var unmap_device_ids_ptr = alloc[UInt32](1)
+        unmap_device_ids_ptr[0] = self.gpu_id
+        var unmap_args_ptr = alloc[kfd_ioctl_unmap_memory_from_gpu_args](1)
+        unmap_args_ptr[0] = kfd_ioctl_unmap_memory_from_gpu_args(handle=buf.handle, device_ids_array_ptr=UInt64(unmap_device_ids_ptr.__int__()), n_devices=1)
+        _ = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, unmap_args_ptr.__int__())
+        unmap_device_ids_ptr.free()
+        unmap_args_ptr.free()
+        
+        if buf.cpu_addr != 0:
+            _ = self.c_munmap(buf.cpu_addr, buf.size)
+        else:
+            _ = self.c_munmap(buf.va_addr, buf.size)
+
+        var free_args_ptr = alloc[kfd_ioctl_free_memory_of_gpu_args](1)
+        free_args_ptr[0] = kfd_ioctl_free_memory_of_gpu_args(handle=buf.handle)
+        _ = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_FREE_MEMORY_OF_GPU, free_args_ptr.__int__())
+        free_args_ptr.free()
+
+    def get_gpu_va(self, cpu_addr: Int) -> UInt64:
+        return UInt64(cpu_addr)
+
+    def enqueue_matmul(
+        mut self,
+        W_packed_addr: Int,
+        scales_addr: Int,
+        x_addr: Int,
+        out_ptr_addr: Int,
+        c_in: Int,
+        c_out: Int,
+        flush_cache: Bool = True,
+    ) raises -> Int:
+        var cpu_sfence = self.cpu_sfence
+        var cpu_clflush = self.cpu_clflush
+
+        # Flush CPU cache lines for input vector x to ensure GPU reads current activations
+        if flush_cache:
+            var input_size_bytes = c_in * 4
+            var base_in = (x_addr // 64) * 64
+            var end_in = x_addr + input_size_bytes
+            while base_in < end_in:
+                _ = cpu_clflush(base_in)
+                base_in += 64
+            _ = cpu_sfence(0)
+
+        var slot = Int(self.packet_idx % 1024)
+
+        # 1. Reset completion flag to 0 and atomic counter to 0 for this slot
+        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
+        var completion_slot_va_addr = self.completion_buf.va_addr + slot * 64
+        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
+        completion_ptr[0] = 0
+        completion_ptr[1] = 0 # reset atomic counter to 0!
+        _ = cpu_sfence(0)
+        _ = cpu_clflush(completion_slot_cpu_addr)
+
+        # Translate CPU pointers to GPU Virtual Addresses
+        var gpu_W_packed_va = self.get_gpu_va(W_packed_addr)
+        var gpu_scales_va = self.get_gpu_va(scales_addr)
+        var gpu_x_va = self.get_gpu_va(x_addr)
+        var gpu_out_ptr_va = self.get_gpu_va(out_ptr_addr)
+
+        # 2. Pack kernel arguments into this slot's kernarg memory
+        var kernarg_slot_cpu_addr = self.kernarg_buf.cpu_addr + slot * 256
+        var kernarg_slot_va_addr = self.kernarg_buf.va_addr + slot * 256
+
+        var kernarg_p = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr)
+        kernarg_p[0] = gpu_W_packed_va
+        kernarg_p[1] = gpu_scales_va
+        kernarg_p[2] = gpu_x_va
+        kernarg_p[3] = gpu_out_ptr_va
+        kernarg_p[4] = UInt64(completion_slot_va_addr)
+
+        var num_workgroups = 32
+        var workgroup_size = 256
+        var grid_stride = num_workgroups * workgroup_size
+
+        var kernarg_u32_p = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr + 40)
+        kernarg_u32_p[0] = UInt32(c_in)
+        kernarg_u32_p[1] = UInt32(c_out)
+        kernarg_u32_p[2] = UInt32(grid_stride)
+        kernarg_u32_p[3] = UInt32(num_workgroups)
+        
+        _ = cpu_sfence(0)
+        _ = cpu_clflush(kernarg_slot_cpu_addr)
+
+        # 3. Format HSA AQL Dispatch Packet (64 bytes)
+        var packet = hsa_kernel_dispatch_packet_t(
+            header=5378,              # Type=2 (Kernel Dispatch), Barrier=1, Acquire=2 (System), Release=2 (System)
+            setup=1,                 # 1D dimensions
+            workgroup_size_x=256,    # 256 threads in workgroup
+            workgroup_size_y=1,
+            workgroup_size_z=1,
+            grid_size_x=UInt32(grid_stride), # Grid size = num_workgroups * 256
+            grid_size_y=1,
+            grid_size_z=1,
+            private_segment_size=0,
+            group_segment_size=0,
+            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa40), # KD address!
+            kernarg_address=UInt64(kernarg_slot_va_addr),
+            completion_signal=0
+        )
+
+        # 4. Write dispatch packet to circular ring buffer
+        var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutUntrackedOrigin](unsafe_from_address=self.ring_buf.cpu_addr)
+        ring_packet_ptr[slot] = packet^
+
+        # Update write pointer in GART memory
+        var wptr_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)
+        self.packet_idx += 1
+        wptr_ptr[0] = self.packet_idx
+
+        # Memory fences & Flush cache lines for written data
+        _ = cpu_sfence(0)
+        _ = cpu_clflush(self.ring_buf.cpu_addr + slot * 64)
+        _ = cpu_clflush(self.gart_buf.cpu_addr + 56)
+        _ = cpu_sfence(0) # Ensure GART writes settle before ringing doorbell
+
+        # Ring doorbell! Write 0-based packet_idx value to mapped doorbell register
+        var doorbell_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.doorbell_reg_addr)
+        doorbell_ptr[0] = self.packet_idx - 1
+        _ = cpu_sfence(0) # Flush doorbell write through PCIe WC buffers
+
+        return slot
+
+    def wait_matmul(
+        self,
+        slot: Int,
+        out_ptr_addr: Int,
+        c_out: Int,
+        flush_cache: Bool = True,
+    ) raises:
+        var cpu_sfence = self.cpu_sfence
+        var cpu_clflush = self.cpu_clflush
+        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
+        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
+
+        # Wait for GPU completion flag with adaptive back-off
+        var completed = False
+        var attempts = 0
+        var c_usleep = self.usleep_fn
+        while not completed:
+            if completion_ptr[0] == 1:
+                completed = True
+                break
+            attempts += 1
+            if attempts > 500000: # Wait longer (approx 2-3ms) before sleeping to avoid OS scheduling latency
+                _ = cpu_clflush(completion_slot_cpu_addr)
+                _ = cpu_sfence(0)
+                _ = c_usleep(5) # 5 microseconds sleep to prevent memory controller / bus starvation
+            elif attempts % 5000 == 0:
+                _ = cpu_clflush(completion_slot_cpu_addr)
+                _ = cpu_sfence(0)
+            if attempts > 10000000: # Failsafe timeout
+                var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)[0]
+                var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 128)[0]
+                print("GPU Execution Timeout details:")
+                print("  Attempts reached:", attempts)
+                print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
+                print("  Completion flag in memory:", completion_ptr[0])
+                print("  Atomic counter in memory:", completion_ptr[1])
+                raise Error("GPU execution timed out in wait_matmul!")
+
+        # Flush/invalidate CPU cache lines for output vector out to ensure CPU reads the GPU's results
+        if flush_cache:
+            var output_size_bytes = c_out * 4
+            var base_out = (out_ptr_addr // 64) * 64
+            var end_out = out_ptr_addr + output_size_bytes
+            while base_out < end_out:
+                _ = cpu_clflush(base_out)
+                base_out += 64
+
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets
 # -----------------------------------------------------------------------------
@@ -906,6 +1758,22 @@ def main() raises:
 
     var CONFIG = MoEConfig[]()
 
+    # Initialize AMD direct GPU userspace queue
+    print("Initializing direct AMD GPU userspace queue...")
+    var gpu_ctx = GPUContext()
+    print("Direct AMD GPU userspace queue initialized successfully! (GPU ID: " + String(gpu_ctx.gpu_id) + ")")
+
+    # Setup SVM Flags
+    var base_flags = (GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+                      GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+                      GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE)
+
+    var gtt_uncached_flags = (base_flags |
+                              GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+                              GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+                              GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED |
+                              GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC)
+
     # Initialize FFI and libc functions
     var libc = OwnedDLHandle("libc.so.6")
     var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
@@ -929,15 +1797,8 @@ def main() raises:
         return
 
     var weights_file_size: Int = 15311790080
-    var memptr_weights = alloc[Int](1)
-    var err_weights = posix_memalign(memptr_weights.__int__(), 4096, weights_file_size)
-    if err_weights != 0:
-        print("CRITICAL: Failed to allocate aligned memory for DiffusionGemma weights (14.3 GB)!")
-        _ = c_close(weights_fd)
-        memptr_weights.free()
-        return
-    var base_addr = memptr_weights[0]
-    memptr_weights.free()
+    var weights_gpu_buf = gpu_ctx.alloc_gpu_buffer(weights_file_size, UInt32(gtt_uncached_flags), cpu_access=True)
+    var base_addr = weights_gpu_buf.cpu_addr
     var base_ptr = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=base_addr)
 
     print("Loading DiffusionGemma weights into RAM (14.26 GB) in chunks...")
@@ -1113,19 +1974,29 @@ def main() raises:
     comptime MAX_Q_SIZE = 16 * 512  # 8192 (global layer Q size; sliding = 16*256=4096)
     comptime MAX_KV_SIZE = 8 * 512  # 4096 (max KV stride: sliding 8*256=2048, global 2*512=1024)
 
+
+
+    var canvas_hidden_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.embed_dim * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_q_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_Q_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_k_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_v_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_attn_out_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_Q_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_proj_attn_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.embed_dim * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+
     # Canvas hidden states [CANVAS_LEN, embed_dim] — flows through layers
-    var canvas_hidden = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_hidden = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_hidden_buf.cpu_addr)
     # Canvas Q storage [CANVAS_LEN, MAX_Q_SIZE] — stored in phase 1, consumed in phase 2
-    var canvas_q = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    var canvas_q = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_q_buf.cpu_addr)
     # Canvas K/V storage [CANVAS_LEN, MAX_KV_SIZE] — for batched QKV proj
-    var canvas_k = alloc[Float32](CANVAS_LEN * MAX_KV_SIZE)
-    var canvas_v = alloc[Float32](CANVAS_LEN * MAX_KV_SIZE)
+    var canvas_k = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_k_buf.cpu_addr)
+    var canvas_v = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_v_buf.cpu_addr)
     # Batched attention output [CANVAS_LEN, MAX_Q_SIZE]
-    var canvas_attn_out = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    var canvas_attn_out = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_attn_out_buf.cpu_addr)
     # Batched Wo output [CANVAS_LEN, embed_dim]
-    var canvas_proj_attn = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_proj_attn = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_proj_attn_buf.cpu_addr)
     # Batched norm output [CANVAS_LEN, embed_dim]
-    var canvas_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_norm_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.embed_dim * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var canvas_norm = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_norm_buf.cpu_addr)
     # Batched FFN intermediates
     var canvas_ffn_gate = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
     var canvas_ffn_up = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
@@ -1513,8 +2384,57 @@ def main() raises:
                 var tl_qkv = std.time.perf_counter()
                 # Phase 1a: Batched attention input norm + QKV projections
                 rms_norm_batch(canvas_hidden, weights.input_layernorm_weight, canvas_norm, CANVAS_LEN, CONFIG.embed_dim)
-                q4_gemv_tiled[8](weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, CANVAS_LEN, CONFIG.embed_dim, q_size, num_tasks, CONFIG.embed_dim, MAX_Q_SIZE)
-                q4_gemv_tiled[8](weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
+                
+                # Contiguous CPU cache flush on canvas_norm before enqueuing matmuls
+                var clflush = gpu_ctx.cpu_clflush
+                var sfence = gpu_ctx.cpu_sfence
+                var base_norm = (canvas_norm.__int__() // 64) * 64
+                var end_norm = canvas_norm.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
+                while base_norm < end_norm:
+                    _ = clflush(base_norm)
+                    base_norm += 64
+                _ = sfence(0)
+
+                # Asynchronously enqueue Q, K, and V projections for all tokens on GPU
+                var slots_q = InlineArray[Int, 256](uninitialized=True)
+                var slots_k = InlineArray[Int, 256](uninitialized=True)
+                var slots_v = InlineArray[Int, 256](uninitialized=True)
+                
+                for t in range(CANVAS_LEN):
+                    slots_q[t] = gpu_ctx.enqueue_matmul(
+                        weights.wq_packed.__int__(),
+                        weights.wq_scales.__int__(),
+                        canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
+                        canvas_q.__int__() + t * MAX_Q_SIZE * 4,
+                        CONFIG.embed_dim,
+                        q_size,
+                        flush_cache=False
+                    )
+                    slots_k[t] = gpu_ctx.enqueue_matmul(
+                        weights.wk_packed.__int__(),
+                        weights.wk_scales.__int__(),
+                        canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
+                        canvas_k.__int__() + t * MAX_KV_SIZE * 4,
+                        CONFIG.embed_dim,
+                        kv_stride,
+                        flush_cache=False
+                    )
+                    if not is_global:
+                        slots_v[t] = gpu_ctx.enqueue_matmul(
+                            weights.wv_packed.__int__(),
+                            weights.wv_scales.__int__(),
+                            canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
+                            canvas_v.__int__() + t * MAX_KV_SIZE * 4,
+                            CONFIG.embed_dim,
+                            kv_stride,
+                            flush_cache=False
+                        )
+                
+                # Wait for GPU completion of Q and K projections
+                for t in range(CANVAS_LEN):
+                    gpu_ctx.wait_matmul(slots_q[t], canvas_q.__int__() + t * MAX_Q_SIZE * 4, q_size, flush_cache=False)
+                    gpu_ctx.wait_matmul(slots_k[t], canvas_k.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
+                
                 if is_global:
                     for t in range(CANVAS_LEN):
                         var v_ptr = canvas_v + t * MAX_KV_SIZE
@@ -1522,7 +2442,29 @@ def main() raises:
                         for i in range(0, kv_stride, 8):
                             v_ptr.store[8](i, k_ptr.load[8](i))
                 else:
-                    q4_gemv_tiled[8](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, CONFIG.embed_dim, MAX_KV_SIZE)
+                    for t in range(CANVAS_LEN):
+                        gpu_ctx.wait_matmul(slots_v[t], canvas_v.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
+
+                # Contiguous CPU cache invalidate on canvas_q, canvas_k, and canvas_v
+                var base_q = (canvas_q.__int__() // 64) * 64
+                var end_q = canvas_q.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
+                while base_q < end_q:
+                    _ = clflush(base_q)
+                    base_q += 64
+
+                var base_k = (canvas_k.__int__() // 64) * 64
+                var end_k = canvas_k.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
+                while base_k < end_k:
+                    _ = clflush(base_k)
+                    base_k += 64
+
+                if not is_global:
+                    var base_v = (canvas_v.__int__() // 64) * 64
+                    var end_v = canvas_v.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
+                    while base_v < end_v:
+                        _ = clflush(base_v)
+                        base_v += 64
+                _ = sfence(0)
                 var tl_qkv_end = std.time.perf_counter()
 
                 # Phase 1b: Head norms + RoPE + KV cache write (per-token, element-wise)
@@ -1595,8 +2537,36 @@ def main() raises:
 
                 var tl_attn_end = std.time.perf_counter()
 
+                # Contiguous CPU cache flush on canvas_attn_out before Wo projection
+                var base_attn_out = (canvas_attn_out.__int__() // 64) * 64
+                var end_attn_out = canvas_attn_out.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
+                while base_attn_out < end_attn_out:
+                    _ = clflush(base_attn_out)
+                    base_attn_out += 64
+                _ = sfence(0)
+
                 # Phase 2b: Batched Wo projection + post-attn norm + residual
-                q4_gemv_tiled[8](weights.wo_packed, weights.wo_scales, canvas_attn_out, canvas_proj_attn, CANVAS_LEN, q_size, CONFIG.embed_dim, num_tasks, MAX_Q_SIZE, CONFIG.embed_dim)
+                var slots_o = InlineArray[Int, 256](uninitialized=True)
+                for t in range(CANVAS_LEN):
+                    slots_o[t] = gpu_ctx.enqueue_matmul(
+                        weights.wo_packed.__int__(),
+                        weights.wo_scales.__int__(),
+                        canvas_attn_out.__int__() + t * MAX_Q_SIZE * 4,
+                        canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4,
+                        q_size,
+                        CONFIG.embed_dim,
+                        flush_cache=False
+                    )
+                for t in range(CANVAS_LEN):
+                    gpu_ctx.wait_matmul(slots_o[t], canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4, CONFIG.embed_dim, flush_cache=False)
+
+                # Contiguous CPU cache invalidate on canvas_proj_attn
+                var base_proj = (canvas_proj_attn.__int__() // 64) * 64
+                var end_proj = canvas_proj_attn.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
+                while base_proj < end_proj:
+                    _ = clflush(base_proj)
+                    base_proj += 64
+                _ = sfence(0)
                 rms_norm_batch(canvas_proj_attn, weights.post_attention_layernorm_weight, canvas_proj_attn, CANVAS_LEN, CONFIG.embed_dim)
                 for t in range(CANVAS_LEN):
                     var hidden = canvas_hidden + t * CONFIG.embed_dim
@@ -1980,7 +2950,7 @@ def main() raises:
         print("---------------------------------------------------------")
 
     # Cleanup memory
-    free_c(base_addr)
+    gpu_ctx.free_gpu_buffer(weights_gpu_buf)
     final_norm_weight.free()
     k_cache.free()
     v_cache.free()
@@ -2013,13 +2983,13 @@ def main() raises:
     target_final_norm_x.free()
     local_max_logits.free()
     local_next_tokens.free()
-    canvas_hidden.free()
-    canvas_q.free()
-    canvas_k.free()
-    canvas_v.free()
-    canvas_attn_out.free()
-    canvas_proj_attn.free()
-    canvas_norm.free()
+    gpu_ctx.free_gpu_buffer(canvas_hidden_buf)
+    gpu_ctx.free_gpu_buffer(canvas_q_buf)
+    gpu_ctx.free_gpu_buffer(canvas_k_buf)
+    gpu_ctx.free_gpu_buffer(canvas_v_buf)
+    gpu_ctx.free_gpu_buffer(canvas_attn_out_buf)
+    gpu_ctx.free_gpu_buffer(canvas_proj_attn_buf)
+    gpu_ctx.free_gpu_buffer(canvas_norm_buf)
     canvas_ffn_gate.free()
     canvas_ffn_up.free()
     canvas_ffn_gated.free()
