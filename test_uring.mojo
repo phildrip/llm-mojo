@@ -19,9 +19,9 @@ def main() raises:
     # 2. Load libc to get raw file descriptor open and close functions
     var libc = OwnedDLHandle("libc.so.6")
     # int open(const char* pathname, int flags)
-    var c_open = libc.get_function[def(Int, Int32) -> Int32]("open")
+    var c_open = libc.get_function[def(Int, Int32) thin abi("C") -> Int32]("open")
     # int close(int fd)
-    var c_close = libc.get_function[def(Int32) -> Int32]("close")
+    var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
 
     # Open our file using O_RDONLY (0)
     var path_bytes = test_file_path.as_bytes()

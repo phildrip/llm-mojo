@@ -11,7 +11,7 @@ from std.sys.info import num_physical_cores
 # Kernels to Test (exactly matching model.mojo)
 # -----------------------------------------------------------------------------
 @always_inline
-def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
         var v = x.load[8](i)
@@ -24,7 +24,7 @@ def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr
         out_ptr.store[8](i, v * inv_rms * weight)
 
 @always_inline
-def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
         var v = x.load[8](i)
@@ -45,7 +45,7 @@ def fast_tanh(x: Float32) -> Float32:
     return (e2x - 1.0) / (e2x + 1.0)
 
 @always_inline
-def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     for i in range(0, size, 8):
         var v1 = h1.load[8](i)
         var v2 = h2.load[8](i)
@@ -57,7 +57,7 @@ def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], o
             out_ptr[i + lane] = gelu * x2
 
 @always_inline
-def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
+def apply_rope(vec: UnsafePointer[Float32, MutUntrackedOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
     var half_dim = head_dim // 2
     var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
     var rope_dim = 512 if is_global else 256
@@ -79,7 +79,7 @@ def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, h
             vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
 
 @always_inline
-def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def softmax(scores: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var max_val = scores[0]
     for i in range(1, size):
         if scores[i] > max_val:
@@ -94,7 +94,7 @@ def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
         scores[i] /= sum_exp
 
 @always_inline
-def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], c_in: Int, c_out: Int):
+def matmul_vec(W: UnsafePointer[Float32, _], x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], c_in: Int, c_out: Int):
     var num_tasks = num_physical_cores()
     var chunk_size = c_out // num_tasks
     
@@ -135,7 +135,7 @@ def ternary_matmul_vec(
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
     x: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
     c_in: Int,
     c_out: Int,
 ):
@@ -200,7 +200,7 @@ def q4_matmul_vec(
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
     x: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
@@ -246,12 +246,12 @@ def q4_matmul_vec(
 def q8_matmul_w2_block_column(
     W_packed: UnsafePointer[Int8, _],
     x: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
-    c_memcpy: fn(Int, Int, Int) -> Int,
-    w2_scratch: UnsafePointer[Int8, MutExternalOrigin],
+    c_memcpy: def(Int, Int, Int) thin abi("C") -> Int,
+    w2_scratch: UnsafePointer[Int8, MutUntrackedOrigin],
     threshold: Float32 = 1e-4,
 ):
     var c_in_blocks = c_in // 32
@@ -893,7 +893,7 @@ def test_q8_matmul_w2_block_column() raises:
     print("Running test_q8_matmul_w2_block_column...")
     var np = Python.import_module("numpy")
     var libc = OwnedDLHandle("libc.so.6")
-    var c_memcpy = libc.get_function[fn(Int, Int, Int) -> Int]("memcpy")
+    var c_memcpy = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int]("memcpy")
     
     var c_in = 3840
     var c_out = 3840
@@ -973,7 +973,7 @@ def test_block_sparsity_regression() raises:
     print("Running test_block_sparsity_regression (Verify all active blocks above threshold are computed)...")
     var np = Python.import_module("numpy")
     var libc = OwnedDLHandle("libc.so.6")
-    var c_memcpy = libc.get_function[fn(Int, Int, Int) -> Int]("memcpy")
+    var c_memcpy = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int]("memcpy")
     
     var c_in = 320
     var c_out = 320
@@ -1060,7 +1060,7 @@ struct kfd_ioctl_acquire_vm_args:
     var drm_fd: UInt32
     var gpu_id: UInt32
 
-    fn __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
+    def __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
         self.drm_fd = drm_fd
         self.gpu_id = gpu_id
 
@@ -1069,7 +1069,7 @@ struct kfd_ioctl_runtime_enable_args:
     var mode_mask: UInt32
     var capabilities_mask: UInt32
 
-    fn __init__(out self):
+    def __init__(out self):
         self.r_debug = 0
         self.mode_mask = 0
         self.capabilities_mask = 0
@@ -1082,7 +1082,7 @@ struct kfd_ioctl_alloc_memory_of_gpu_args:
     var gpu_id: UInt32
     var flags: UInt32
 
-    fn __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
+    def __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
         self.va_addr = va_addr
         self.size = size
         self.handle = 0
@@ -1096,7 +1096,7 @@ struct kfd_ioctl_map_memory_to_gpu_args:
     var n_devices: UInt32
     var pad: UInt32
 
-    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
         self.handle = handle
         self.device_ids_array_ptr = device_ids_array_ptr
         self.n_devices = n_devices
@@ -1108,7 +1108,7 @@ struct kfd_ioctl_unmap_memory_from_gpu_args:
     var n_devices: UInt32
     var pad: UInt32
 
-    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
         self.handle = handle
         self.device_ids_array_ptr = device_ids_array_ptr
         self.n_devices = n_devices
@@ -1117,7 +1117,7 @@ struct kfd_ioctl_unmap_memory_from_gpu_args:
 struct kfd_ioctl_free_memory_of_gpu_args:
     var handle: UInt64
 
-    fn __init__(out self, handle: UInt64):
+    def __init__(out self, handle: UInt64):
         self.handle = handle
 
 struct kfd_ioctl_create_queue_args:
@@ -1139,7 +1139,7 @@ struct kfd_ioctl_create_queue_args:
     var sdma_engine_id: UInt32
     var pad: UInt32
 
-    fn __init__(
+    def __init__(
         out self,
         ring_base_address: UInt64,
         write_pointer_address: UInt64,
@@ -1178,7 +1178,7 @@ struct kfd_ioctl_destroy_queue_args:
     var queue_id: UInt32
     var pad: UInt32
 
-    fn __init__(out self, queue_id: UInt32):
+    def __init__(out self, queue_id: UInt32):
         self.queue_id = queue_id
         self.pad = 0
 
@@ -1188,7 +1188,7 @@ struct GPUMemoryBuffer:
     var handle: UInt64
     var cpu_addr: Int
 
-    fn __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
+    def __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
         self.va_addr = va_addr
         self.size = size
         self.handle = handle
@@ -1211,7 +1211,7 @@ struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
     var reserved2: UInt64
     var completion_signal: UInt64
 
-    fn __init__(
+    def __init__(
         out self,
         header: UInt16,
         setup: UInt16,
@@ -1417,7 +1417,7 @@ def test_gpu_integration() raises:
     
     # Check if AMD KFD device nodes are present and accessible
     var libc = OwnedDLHandle("libc.so.6")
-    var c_open = libc.get_function[fn(Int, Int32) -> Int32]("open")
+    var c_open = libc.get_function[def(Int, Int32) thin abi("C") -> Int32]("open")
     
     var kfd_path = "/dev/kfd"
     var kfd_path_bytes = kfd_path.as_bytes()
@@ -1444,22 +1444,22 @@ def test_gpu_integration() raises:
     
     if drm_fd < 0:
         print(" -> SKIP: /dev/dri/renderD128 not accessible.")
-        var c_close = libc.get_function[fn(Int32) -> Int32]("close")
+        var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
         _ = c_close(kfd_fd)
         _ = libc
         return
 
-    var c_ioctl = libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
-    var c_close = libc.get_function[fn(Int32) -> Int32]("close")
-    var c_mmap = libc.get_function[fn(Int, Int, Int32, Int32, Int32, Int) -> Int]("mmap")
-    var c_munmap = libc.get_function[fn(Int, Int) -> Int32]("munmap")
-    var c_read = libc.get_function[fn(Int32, Int, Int) -> Int]("read")
-    var c_errno_loc = libc.get_function[fn() -> Int]("__errno_location")
+    var c_ioctl = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
+    var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+    var c_mmap = libc.get_function[def(Int, Int, Int32, Int32, Int32, Int) thin abi("C") -> Int]("mmap")
+    var c_munmap = libc.get_function[def(Int, Int) thin abi("C") -> Int32]("munmap")
+    var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
+    var c_errno_loc = libc.get_function[def() thin abi("C") -> Int]("__errno_location")
 
     # Load CPU fence helper library
     var cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
-    var cpu_sfence = cpu_fence_lib.get_function[fn(Int32) -> Int32]("cpu_sfence")
-    var cpu_clflush = cpu_fence_lib.get_function[fn(Int) -> Int32]("cpu_clflush")
+    var cpu_sfence = cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
+    var cpu_clflush = cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
 
     # Define KFD constants
     comptime AMDKFD_IOC_ACQUIRE_VM = 0x40084B15
@@ -1553,7 +1553,7 @@ def test_gpu_integration() raises:
         _ = c_close(drm_fd)
         raise Error("GPU Runtime enable failed!")
 
-    def alloc_gpu_buffer(size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
+    def alloc_gpu_buffer(size: Int, flags: UInt32, cpu_access: Bool) capturing raises -> GPUMemoryBuffer:
         var va_addr = c_mmap(0, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
         if va_addr == -1 or va_addr == 0:
             raise Error("mmap failed")
@@ -1587,7 +1587,7 @@ def test_gpu_integration() raises:
 
         return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
 
-    def free_gpu_buffer(buf: GPUMemoryBuffer) raises:
+    def free_gpu_buffer(buf: GPUMemoryBuffer) capturing raises:
         var unmap_device_ids_ptr = alloc[UInt32](1)
         unmap_device_ids_ptr[0] = gpu_id
         var unmap_args_ptr = alloc[kfd_ioctl_unmap_memory_from_gpu_args](1)
@@ -1613,39 +1613,39 @@ def test_gpu_integration() raises:
     var cwsr_buf = alloc_gpu_buffer(2801664, UInt32(vram_private_flags), cpu_access=False)
     var eop_buf = alloc_gpu_buffer(4096, UInt32(vram_private_flags), cpu_access=False)
 
-    var ring_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=ring_buf.cpu_addr)
+    var ring_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=ring_buf.cpu_addr)
     for i in range(ring_size // 4):
         ring_ptr[i] = 0
 
-    var gart_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr)
+    var gart_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=gart_buf.cpu_addr)
     for i in range(4096 // 4):
         gart_u32_ptr[i] = 0
 
     var sig_cpu_addr = gart_buf.cpu_addr + 512
     var sig_va_addr = gart_buf.va_addr + 512
 
-    var sig_u64_ptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr)
+    var sig_u64_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr)
     for i in range(8):
         sig_u64_ptr[i] = 0
 
-    UnsafePointer[Int64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(gart_buf.va_addr)
+    UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(gart_buf.va_addr)
 
     _ = cpu_clflush(sig_cpu_addr)
     _ = cpu_sfence(0)
 
     var q_base = gart_buf.cpu_addr
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 0)[0] = 2       # queue_type = AQL
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 4)[0] = 1       # features
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=q_base + 8)[0] = UInt64(ring_buf.va_addr)
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=q_base + 16)[0] = UInt64(sig_va_addr)
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 24)[0] = 1024   # size
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 0)[0] = 2       # queue_type = AQL
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 4)[0] = 1       # features
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=q_base + 8)[0] = UInt64(ring_buf.va_addr)
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=q_base + 16)[0] = UInt64(sig_va_addr)
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 24)[0] = 1024   # size
 
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 72)[0] = 7
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 76)[0] = 39
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 136)[0] = 128
-    UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=q_base + 180)[0] = 10
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 72)[0] = 7
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 76)[0] = 39
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 136)[0] = 128
+    UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=q_base + 180)[0] = 10
 
     _ = cpu_clflush(q_base)
     _ = cpu_clflush(q_base + 64)
@@ -1672,7 +1672,7 @@ def test_gpu_integration() raises:
     )
     r = c_ioctl(kfd_fd, AMDKFD_IOC_CREATE_QUEUE, create_args_ptr.__int__())
     if r < 0:
-        var err = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=c_errno_loc())[0]
+        var err = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=c_errno_loc())[0]
         free_gpu_buffer(eop_buf)
         free_gpu_buffer(cwsr_buf)
         free_gpu_buffer(gart_buf)
@@ -1692,13 +1692,13 @@ def test_gpu_integration() raises:
         raise Error("Doorbell page mmap failed")
     var doorbell_reg_addr = doorbell_mmap_addr + (Int(doorbell_offset) - Int(doorbells_base))
 
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(doorbell_reg_addr)
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(doorbell_reg_addr)
     _ = cpu_clflush(sig_cpu_addr)
     _ = cpu_sfence(0)
 
     # Load GCN compiled ELF shader
     var hsaco_buf = alloc_gpu_buffer(16384, UInt32(gtt_uncached_flags), cpu_access=True)
-    var hsaco_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr)
+    var hsaco_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr)
     for i in range(16384 // 4):
         hsaco_u32_ptr[i] = 0
 
@@ -1719,17 +1719,17 @@ def test_gpu_integration() raises:
     assert_true(bytes_read > 0, "Failed to read any bytes from q8_matmul.hsaco")
 
     var segment1_src = temp_file_buf
-    var segment1_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0)
+    var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0)
     for i in range(0xa80):
         segment1_dst[i] = segment1_src[i]
 
     var segment2_src = temp_file_buf + 0xb00
-    var segment2_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x1b00)
+    var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x1b00)
     for i in range(0x414):
         segment2_dst[i] = segment2_src[i]
 
     var segment3_src = temp_file_buf + 0xf18
-    var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f18)
+    var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f18)
     for i in range(0x70):
         segment3_dst[i] = segment3_src[i]
 
@@ -1757,11 +1757,11 @@ def test_gpu_integration() raises:
     var completion_buf = alloc_gpu_buffer(4096, UInt32(gtt_uncached_flags), cpu_access=True)
     var kernarg_buf = alloc_gpu_buffer(4096, UInt32(gtt_uncached_flags), cpu_access=True)
 
-    var W_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=W_buf.cpu_addr)
-    var scales_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=scales_buf.cpu_addr)
-    var x_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=x_buf.cpu_addr)
-    var out_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=out_buf.cpu_addr)
-    var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_buf.cpu_addr)
+    var W_ptr = UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=W_buf.cpu_addr)
+    var scales_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=scales_buf.cpu_addr)
+    var x_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=x_buf.cpu_addr)
+    var out_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=out_buf.cpu_addr)
+    var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_buf.cpu_addr)
 
     for i in range(test_c_out * test_c_in):
         W_ptr[i] = Int8((i % 7) - 3)
@@ -1796,14 +1796,14 @@ def test_gpu_integration() raises:
         expected_out[r_idx] = sum_ref
 
     # Dispatch Kernarg packing
-    var kernarg_p = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=kernarg_buf.cpu_addr)
+    var kernarg_p = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=kernarg_buf.cpu_addr)
     kernarg_p[0] = UInt64(W_buf.va_addr)
     kernarg_p[1] = UInt64(scales_buf.va_addr)
     kernarg_p[2] = UInt64(x_buf.va_addr)
     kernarg_p[3] = UInt64(out_buf.va_addr)
     kernarg_p[4] = UInt64(completion_buf.va_addr)
 
-    var kernarg_u32_p = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=kernarg_buf.cpu_addr + 40)
+    var kernarg_u32_p = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=kernarg_buf.cpu_addr + 40)
     kernarg_u32_p[0] = UInt32(test_c_in)
     kernarg_u32_p[1] = UInt32(test_c_out)
     kernarg_u32_p[2] = UInt32(256)
@@ -1829,10 +1829,10 @@ def test_gpu_integration() raises:
         completion_signal=0
     )
 
-    var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutExternalOrigin](unsafe_from_address=ring_buf.cpu_addr)
+    var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutUntrackedOrigin](unsafe_from_address=ring_buf.cpu_addr)
     ring_packet_ptr[0] = packet^
 
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0] = 1
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0] = 1
 
     _ = cpu_sfence(0)
     _ = cpu_clflush(gart_buf.cpu_addr + 56)
@@ -1840,7 +1840,7 @@ def test_gpu_integration() raises:
     _ = cpu_sfence(0)
 
     # Direct doorbell write
-    UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=doorbell_reg_addr)[0] = 0
+    UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=doorbell_reg_addr)[0] = 0
     _ = cpu_sfence(0)
 
     # Wait for completion
@@ -1852,8 +1852,8 @@ def test_gpu_integration() raises:
             break
         polled += 1
         if polled % 10000000 == 0:
-            var wptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0]
-            var rptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=gart_buf.cpu_addr + 128)[0]
+            var wptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=gart_buf.cpu_addr + 56)[0]
+            var rptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=gart_buf.cpu_addr + 128)[0]
             print("    -> Polling status... (iter", polled, "| flag =", completion_ptr[0], "| wptr =", wptr, "| rptr =", rptr, ")")
 
     assert_true(gpu_success, "GPU execution timed out")

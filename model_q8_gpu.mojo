@@ -15,7 +15,7 @@ struct kfd_ioctl_acquire_vm_args:
     var drm_fd: UInt32
     var gpu_id: UInt32
 
-    fn __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
+    def __init__(out self, drm_fd: UInt32, gpu_id: UInt32):
         self.drm_fd = drm_fd
         self.gpu_id = gpu_id
 
@@ -24,7 +24,7 @@ struct kfd_ioctl_runtime_enable_args:
     var mode_mask: UInt32
     var capabilities_mask: UInt32
 
-    fn __init__(out self):
+    def __init__(out self):
         self.r_debug = 0
         self.mode_mask = 0
         self.capabilities_mask = 0
@@ -37,7 +37,7 @@ struct kfd_ioctl_alloc_memory_of_gpu_args:
     var gpu_id: UInt32
     var flags: UInt32
 
-    fn __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
+    def __init__(out self, va_addr: UInt64, size: UInt64, gpu_id: UInt32, flags: UInt32):
         self.va_addr = va_addr
         self.size = size
         self.handle = 0
@@ -51,7 +51,7 @@ struct kfd_ioctl_map_memory_to_gpu_args:
     var n_devices: UInt32
     var pad: UInt32
 
-    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
         self.handle = handle
         self.device_ids_array_ptr = device_ids_array_ptr
         self.n_devices = n_devices
@@ -63,7 +63,7 @@ struct kfd_ioctl_unmap_memory_from_gpu_args:
     var n_devices: UInt32
     var pad: UInt32
 
-    fn __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
+    def __init__(out self, handle: UInt64, device_ids_array_ptr: UInt64, n_devices: UInt32):
         self.handle = handle
         self.device_ids_array_ptr = device_ids_array_ptr
         self.n_devices = n_devices
@@ -72,7 +72,7 @@ struct kfd_ioctl_unmap_memory_from_gpu_args:
 struct kfd_ioctl_free_memory_of_gpu_args:
     var handle: UInt64
 
-    fn __init__(out self, handle: UInt64):
+    def __init__(out self, handle: UInt64):
         self.handle = handle
 
 struct kfd_ioctl_create_queue_args:
@@ -94,7 +94,7 @@ struct kfd_ioctl_create_queue_args:
     var sdma_engine_id: UInt32
     var pad: UInt32
 
-    fn __init__(
+    def __init__(
         out self,
         ring_base_address: UInt64,
         write_pointer_address: UInt64,
@@ -135,25 +135,25 @@ struct GPUMemoryBuffer(Copyable, Movable):
     var handle: UInt64
     var cpu_addr: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.va_addr = 0
         self.size = 0
         self.handle = 0
         self.cpu_addr = 0
 
-    fn __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
+    def __init__(out self, va_addr: Int, size: Int, handle: UInt64, cpu_addr: Int):
         self.va_addr = va_addr
         self.size = size
         self.handle = handle
         self.cpu_addr = cpu_addr
 
-    fn __init__(out self, *, copy: Self):
+    def __init__(out self, *, copy: Self):
         self.va_addr = copy.va_addr
         self.size = copy.size
         self.handle = copy.handle
         self.cpu_addr = copy.cpu_addr
 
-    fn __init__(out self, *, deinit take: Self):
+    def __init__(out self, *, deinit take: Self):
         self.va_addr = take.va_addr
         self.size = take.size
         self.handle = take.handle
@@ -180,7 +180,7 @@ struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
     var reserved2: UInt64
     var completion_signal: UInt64
 
-    fn __init__(
+    def __init__(
         out self,
         header: UInt16,
         setup: UInt16,
@@ -247,11 +247,11 @@ struct GPUContext:
     var proj_attn_out_buf: GPUMemoryBuffer
     var h1_buf: GPUMemoryBuffer
     var h2_buf: GPUMemoryBuffer
-    var cpu_sfence_fn: fn(Int32) -> Int32
-    var cpu_clflush_fn: fn(Int) -> Int32
-    var usleep_fn: fn(UInt32) -> Int32
+    var cpu_sfence_fn: def(Int32) thin abi("C") -> Int32
+    var cpu_clflush_fn: def(Int) thin abi("C") -> Int32
+    var usleep_fn: def(UInt32) thin abi("C") -> Int32
 
-    fn __init__(
+    def __init__(
         out self,
         kfd_fd: Int32,
         drm_fd: Int32,
@@ -262,9 +262,9 @@ struct GPUContext:
         self.gpu_id = gpu_id
         self.libc = OwnedDLHandle("libc.so.6")
         self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
-        self.cpu_sfence_fn = self.cpu_fence_lib.get_function[fn(Int32) -> Int32]("cpu_sfence")
-        self.cpu_clflush_fn = self.cpu_fence_lib.get_function[fn(Int) -> Int32]("cpu_clflush")
-        self.usleep_fn = self.libc.get_function[fn(UInt32) -> Int32]("usleep")
+        self.cpu_sfence_fn = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
+        self.cpu_clflush_fn = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
+        self.usleep_fn = self.libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
         self.packet_idx = 0
         self.ring_buf = GPUMemoryBuffer()
         self.gart_buf = GPUMemoryBuffer()
@@ -304,33 +304,33 @@ struct GPUContext:
         self.kernarg_buf = self.alloc_gpu_buffer(1024 * 256, gtt_uncached_flags, cpu_access=True)
 
         # Zero ring and gart descriptor
-        var ring_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=self.ring_buf.cpu_addr)
+        var ring_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=self.ring_buf.cpu_addr)
         for i in range(ring_size // 4):
             ring_ptr[i] = 0
 
-        var gart_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr)
+        var gart_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr)
         for i in range(4096 // 4):
             gart_u32_ptr[i] = 0
 
         # Load CPU fence functions
-        var cpu_sfence = self.cpu_fence_lib.get_function[fn(Int32) -> Int32]("cpu_sfence")
-        var cpu_clflush = self.cpu_fence_lib.get_function[fn(Int) -> Int32]("cpu_clflush")
+        var cpu_sfence = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
+        var cpu_clflush = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
 
         # Structure a proper 64-byte aligned amd_signal_t block at self.gart_buf.cpu_addr + 512
         var sig_cpu_addr = self.gart_buf.cpu_addr + 512
         var sig_va_addr = self.gart_buf.va_addr + 512
 
         # Zero out the 64-byte signal area first
-        var sig_u64_ptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr)
+        var sig_u64_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr)
         for i in range(8):
             sig_u64_ptr[i] = 0
 
         # Offset 0: kind (Int64) = -1 (AMD_SIGNAL_KIND_DOORBELL)
-        UnsafePointer[Int64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
+        UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 0)[0] = -1
         # Offset 8: hardware_doorbell_ptr (UInt64) = 0 initially (mapped and filled after queue creation)
-        UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = 0
         # Offset 48: queue_ptr (UInt64) = base_address (gart_buf.va_addr)
-        UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(self.gart_buf.va_addr)
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 48)[0] = UInt64(self.gart_buf.va_addr)
 
         # Flush the signal descriptor cache line before queue creation
         _ = cpu_clflush(sig_cpu_addr)
@@ -338,16 +338,16 @@ struct GPUContext:
 
         # Configure amd_queue_t / hsa_queue_t
         var base = self.gart_buf.cpu_addr
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 0)[0] = 2       # queue_type = AQL
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 4)[0] = 1       # features (HSA_QUEUE_FEATURE_KERNEL_DISPATCH = 1)
-        UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=base + 8)[0] = UInt64(self.ring_buf.va_addr) # base_address
-        UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=base + 16)[0] = UInt64(sig_va_addr) # doorbell_signal mapped BEFORE queue creation!
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 24)[0] = 1024   # size (64KB / 64 bytes/packet = 1024)
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 0)[0] = 2       # queue_type = AQL
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 4)[0] = 1       # features (HSA_QUEUE_FEATURE_KERNEL_DISPATCH = 1)
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=base + 8)[0] = UInt64(self.ring_buf.va_addr) # base_address
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=base + 16)[0] = UInt64(sig_va_addr) # doorbell_signal mapped BEFORE queue creation!
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 24)[0] = 1024   # size (64KB / 64 bytes/packet = 1024)
 
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 72)[0] = 7
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 76)[0] = 39
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 136)[0] = 128   # read_dispatch_id_field_base_byte_offset
-        UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=base + 180)[0] = 10
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 72)[0] = 7
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 76)[0] = 39
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 136)[0] = 128   # read_dispatch_id_field_base_byte_offset
+        UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=base + 180)[0] = 10
 
         # Flush the entire queue descriptor cache lines
         _ = cpu_clflush(base)
@@ -357,7 +357,7 @@ struct GPUContext:
         _ = cpu_sfence(0)
 
         # Create hardware queue
-        var c_ioctl = self.libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
+        var c_ioctl = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
         var create_args_ptr = alloc[kfd_ioctl_create_queue_args](1)
         create_args_ptr[0] = kfd_ioctl_create_queue_args(
             ring_base_address=UInt64(self.ring_buf.va_addr),
@@ -386,27 +386,27 @@ struct GPUContext:
         # Map doorbell page
         var doorbells_base = doorbell_offset & (~0x1fff)
         var doorbell_page_size = 0x2000
-        var c_mmap = self.libc.get_function[fn(Int, Int, Int32, Int32, Int32, Int) -> Int]("mmap")
+        var c_mmap = self.libc.get_function[def(Int, Int, Int32, Int32, Int32, Int) thin abi("C") -> Int]("mmap")
         var doorbell_mmap_addr = c_mmap(0, doorbell_page_size, 1 | 2, 0x01, self.kfd_fd, Int(doorbells_base)) # PROT_READ | PROT_WRITE, MAP_SHARED
         if doorbell_mmap_addr == -1:
             raise Error("Failed to mmap doorbell page!")
         self.doorbell_reg_addr = doorbell_mmap_addr + (Int(doorbell_offset) - Int(doorbells_base))
 
         # Update signal doorbell pointer
-        UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(self.doorbell_reg_addr)
+        UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=sig_cpu_addr + 8)[0] = UInt64(self.doorbell_reg_addr)
         _ = cpu_clflush(sig_cpu_addr)
         _ = cpu_sfence(0)
 
         # Load Compiled GCN Shader into GPU unified memory
         self.hsaco_buf = self.alloc_gpu_buffer(16384, gtt_uncached_flags, cpu_access=True)
-        var hsaco_u32_ptr = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr)
+        var hsaco_u32_ptr = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr)
         for i in range(16384 // 4):
             hsaco_u32_ptr[i] = 0
 
         # Read file into temporary flat buffer
-        var c_open = self.libc.get_function[fn(Int, Int32) -> Int32]("open")
-        var c_read = self.libc.get_function[fn(Int32, Int, Int) -> Int]("read")
-        var c_close = self.libc.get_function[fn(Int32) -> Int32]("close")
+        var c_open = self.libc.get_function[def(Int, Int32) thin abi("C") -> Int32]("open")
+        var c_read = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
+        var c_close = self.libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
 
         var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul.hsaco"
         var hsaco_file_bytes = hsaco_file.as_bytes()
@@ -426,28 +426,28 @@ struct GPUContext:
         # Map ELF segments to virtual memory layout (do not copy flat):
         # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xa80 (covering KD descriptor)
         var segment1_src = temp_file_buf
-        var segment1_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
+        var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
         for i in range(0xa80):
             segment1_dst[i] = segment1_src[i]
 
         # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x414 (full instructions payload)
         var segment2_src = temp_file_buf + 0xb00
-        var segment2_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
+        var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
         for i in range(0x414):
             segment2_dst[i] = segment2_src[i]
 
         # Segment 3 (RW): offset 0xf18, virt_addr 0x2f18, size 0x70
         var segment3_src = temp_file_buf + 0xf18
-        var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f18)
+        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f18)
         for i in range(0x70):
             segment3_dst[i] = segment3_src[i]
 
         temp_file_buf.free()
 
-    fn alloc_gpu_buffer(self, size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
-        var c_mmap = self.libc.get_function[fn(Int, Int, Int32, Int32, Int32, Int) -> Int]("mmap")
-        var c_ioctl = self.libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
-        var c_munmap = self.libc.get_function[fn(Int, Int) -> Int32]("munmap")
+    def alloc_gpu_buffer(self, size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
+        var c_mmap = self.libc.get_function[def(Int, Int, Int32, Int32, Int32, Int) thin abi("C") -> Int]("mmap")
+        var c_ioctl = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
+        var c_munmap = self.libc.get_function[def(Int, Int) thin abi("C") -> Int32]("munmap")
         
         var va_addr = c_mmap(0, size, 0, 0x02 | 0x20, -1, 0) # PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS
         if va_addr == -1 or va_addr == 0:
@@ -483,9 +483,9 @@ struct GPUContext:
         print("  [GPU Alloc] size =", size, "va =", va_addr, "cpu =", cpu_addr, "handle =", handle)
         return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
 
-    fn free_gpu_buffer(self, buf: GPUMemoryBuffer) raises:
-        var c_ioctl = self.libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
-        var c_munmap = self.libc.get_function[fn(Int, Int) -> Int32]("munmap")
+    def free_gpu_buffer(self, buf: GPUMemoryBuffer) raises:
+        var c_ioctl = self.libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
+        var c_munmap = self.libc.get_function[def(Int, Int) thin abi("C") -> Int32]("munmap")
         
         var unmap_device_ids_ptr = alloc[UInt32](1)
         unmap_device_ids_ptr[0] = self.gpu_id
@@ -505,7 +505,7 @@ struct GPUContext:
         _ = c_ioctl(self.kfd_fd, 0x40084B17, free_args_ptr.__int__()) # AMDKFD_IOC_FREE_MEMORY_OF_GPU
         free_args_ptr.free()
 
-    fn get_gpu_va(self, cpu_addr: Int) -> UInt64:
+    def get_gpu_va(self, cpu_addr: Int) -> UInt64:
         if cpu_addr == 0:
             return 0
         if self.weights_gpu_buf.size > 0 and cpu_addr >= self.weights_gpu_buf.cpu_addr and cpu_addr < self.weights_gpu_buf.cpu_addr + self.weights_gpu_buf.size:
@@ -543,7 +543,7 @@ struct GPUContext:
         print("WARNING: get_gpu_va did not match address", cpu_addr, "falling back to raw va_addr!")
         return UInt64(cpu_addr)
 
-    fn enqueue_matmul(
+    def enqueue_matmul(
         mut self,
         W_packed_addr: Int,
         scales_addr: Int,
@@ -569,7 +569,7 @@ struct GPUContext:
         # 1. Reset completion flag to 0 and atomic counter to 0 for this slot
         var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
         var completion_slot_va_addr = self.completion_buf.va_addr + slot * 64
-        var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_slot_cpu_addr)
+        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
         completion_ptr[0] = 0
         completion_ptr[1] = 0 # reset atomic counter to 0!
         _ = cpu_sfence(0)
@@ -585,7 +585,7 @@ struct GPUContext:
         var kernarg_slot_cpu_addr = self.kernarg_buf.cpu_addr + slot * 256
         var kernarg_slot_va_addr = self.kernarg_buf.va_addr + slot * 256
 
-        var kernarg_p = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=kernarg_slot_cpu_addr)
+        var kernarg_p = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr)
         kernarg_p[0] = gpu_W_packed_va
         kernarg_p[1] = gpu_scales_va
         kernarg_p[2] = gpu_x_va
@@ -596,7 +596,7 @@ struct GPUContext:
         var workgroup_size = 256
         var grid_stride = num_workgroups * workgroup_size
 
-        var kernarg_u32_p = UnsafePointer[UInt32, MutExternalOrigin](unsafe_from_address=kernarg_slot_cpu_addr + 40)
+        var kernarg_u32_p = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr + 40)
         kernarg_u32_p[0] = UInt32(c_in)
         kernarg_u32_p[1] = UInt32(c_out)
         kernarg_u32_p[2] = UInt32(grid_stride)
@@ -623,11 +623,11 @@ struct GPUContext:
         )
 
         # 4. Write dispatch packet to circular ring buffer
-        var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutExternalOrigin](unsafe_from_address=self.ring_buf.cpu_addr)
+        var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutUntrackedOrigin](unsafe_from_address=self.ring_buf.cpu_addr)
         ring_packet_ptr[slot] = packet^
 
         # Update write pointer in GART memory
-        var wptr_ptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)
+        var wptr_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)
         self.packet_idx += 1
         wptr_ptr[0] = self.packet_idx
 
@@ -638,13 +638,13 @@ struct GPUContext:
         _ = cpu_sfence(0) # Ensure GART writes settle before ringing doorbell
 
         # Ring doorbell! Write 0-based packet_idx value to mapped doorbell register
-        var doorbell_ptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.doorbell_reg_addr)
+        var doorbell_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.doorbell_reg_addr)
         doorbell_ptr[0] = self.packet_idx - 1
         _ = cpu_sfence(0) # Flush doorbell write through PCIe WC buffers
 
         return slot
 
-    fn wait_matmul(
+    def wait_matmul(
         self,
         slot: Int,
         out_ptr_addr: Int,
@@ -653,7 +653,7 @@ struct GPUContext:
         var cpu_sfence = self.cpu_sfence_fn
         var cpu_clflush = self.cpu_clflush_fn
         var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
-        var completion_ptr = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=completion_slot_cpu_addr)
+        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
 
         # Wait for GPU completion flag with adaptive back-off
         var completed = False
@@ -672,8 +672,8 @@ struct GPUContext:
                 _ = cpu_clflush(completion_slot_cpu_addr)
                 _ = cpu_sfence(0)
             if attempts > 10000000: # Failsafe timeout
-                var current_wptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)[0]
-                var current_rptr = UnsafePointer[UInt64, MutExternalOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 128)[0]
+                var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 56)[0]
+                var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 128)[0]
                 print("GPU Execution Timeout details:")
                 print("  Attempts reached:", attempts)
                 print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
@@ -690,7 +690,7 @@ struct GPUContext:
             base_out += 64
         _ = cpu_sfence(0)
 
-    fn launch_matmul(
+    def launch_matmul(
         mut self,
         W_packed_addr: Int,
         scales_addr: Int,
@@ -837,27 +837,27 @@ struct TransformerConfig[
         var w2_scales = (w2_packed + 122880).bitcast[Float32]()
         
         return Q8LayerWeights(
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=wq_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=wk_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=wv_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=wo_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w1_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w2_packed.__int__()),
-            UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=w3_packed.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wq_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wk_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wv_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=wo_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w1_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w2_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=w3_scales.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=input_layernorm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=post_attention_layernorm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pre_feedforward_layernorm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=post_feedforward_layernorm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_norm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_norm.__int__()),
-            UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=layer_scalar.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=wq_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=wk_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=wv_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=wo_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=w1_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=w2_packed.__int__()),
+            UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=w3_packed.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wq_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wk_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wv_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wo_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w1_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w2_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w3_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=input_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_attention_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=pre_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=q_norm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=k_norm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=layer_scalar.__int__()),
         )
 
     def __init__(out self):
@@ -867,53 +867,53 @@ struct TransformerConfig[
 # 2. Structural Layer Weights Representation
 # -----------------------------------------------------------------------------
 struct Q8LayerWeights:
-    var wq_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var wk_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var wv_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var wo_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var w1_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var w2_packed: UnsafePointer[Int8, MutExternalOrigin]
-    var w3_packed: UnsafePointer[Int8, MutExternalOrigin]
+    var wq_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var wk_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var wv_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var wo_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var w1_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var w2_packed: UnsafePointer[Int8, MutUntrackedOrigin]
+    var w3_packed: UnsafePointer[Int8, MutUntrackedOrigin]
 
-    var wq_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var wk_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var wv_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var wo_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var w1_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var w2_scales: UnsafePointer[Float32, MutExternalOrigin]
-    var w3_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var wq_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wk_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wv_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wo_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w1_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w2_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w3_scales: UnsafePointer[Float32, MutUntrackedOrigin]
 
-    var input_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var post_attention_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var pre_feedforward_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var post_feedforward_layernorm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var q_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var k_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var layer_scalar: UnsafePointer[Float32, MutExternalOrigin]
+    var input_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_attention_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var pre_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var q_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var k_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var layer_scalar: UnsafePointer[Float32, MutUntrackedOrigin]
 
     def __init__(
         out self,
-        wq_packed: UnsafePointer[Int8, MutExternalOrigin],
-        wk_packed: UnsafePointer[Int8, MutExternalOrigin],
-        wv_packed: UnsafePointer[Int8, MutExternalOrigin],
-        wo_packed: UnsafePointer[Int8, MutExternalOrigin],
-        w1_packed: UnsafePointer[Int8, MutExternalOrigin],
-        w2_packed: UnsafePointer[Int8, MutExternalOrigin],
-        w3_packed: UnsafePointer[Int8, MutExternalOrigin],
-        wq_scales: UnsafePointer[Float32, MutExternalOrigin],
-        wk_scales: UnsafePointer[Float32, MutExternalOrigin],
-        wv_scales: UnsafePointer[Float32, MutExternalOrigin],
-        wo_scales: UnsafePointer[Float32, MutExternalOrigin],
-        w1_scales: UnsafePointer[Float32, MutExternalOrigin],
-        w2_scales: UnsafePointer[Float32, MutExternalOrigin],
-        w3_scales: UnsafePointer[Float32, MutExternalOrigin],
-        input_layernorm: UnsafePointer[Float32, MutExternalOrigin],
-        post_attention_layernorm: UnsafePointer[Float32, MutExternalOrigin],
-        pre_feedforward_layernorm: UnsafePointer[Float32, MutExternalOrigin],
-        post_feedforward_layernorm: UnsafePointer[Float32, MutExternalOrigin],
-        q_norm: UnsafePointer[Float32, MutExternalOrigin],
-        k_norm: UnsafePointer[Float32, MutExternalOrigin],
-        layer_scalar: UnsafePointer[Float32, MutExternalOrigin],
+        wq_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        wk_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        wv_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        wo_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        w1_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        w2_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        w3_packed: UnsafePointer[Int8, MutUntrackedOrigin],
+        wq_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wk_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wv_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wo_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w1_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w2_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w3_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        input_layernorm: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_attention_layernorm: UnsafePointer[Float32, MutUntrackedOrigin],
+        pre_feedforward_layernorm: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_feedforward_layernorm: UnsafePointer[Float32, MutUntrackedOrigin],
+        q_norm: UnsafePointer[Float32, MutUntrackedOrigin],
+        k_norm: UnsafePointer[Float32, MutUntrackedOrigin],
+        layer_scalar: UnsafePointer[Float32, MutUntrackedOrigin],
     ):
         self.wq_packed = wq_packed
         self.wk_packed = wk_packed
@@ -941,7 +941,7 @@ struct Q8LayerWeights:
 # 3. High-Performance Vectorized Math Kernels
 # -----------------------------------------------------------------------------
 @always_inline
-def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
         var v = x.load[8](i)
@@ -954,7 +954,7 @@ def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr
         out_ptr.store[8](i, v * inv_rms * weight)
 
 @always_inline
-def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
         var v = x.load[8](i)
@@ -969,12 +969,12 @@ def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float3
 def q8_matmul_w2_block_column(
     W_packed: UnsafePointer[Int8, _],
     x: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
-    c_memcpy: fn(Int, Int, Int) -> Int,
-    w2_scratch: UnsafePointer[Int8, MutExternalOrigin],
+    c_memcpy: def(Int, Int, Int) thin abi("C") -> Int,
+    w2_scratch: UnsafePointer[Int8, MutUntrackedOrigin],
     threshold: Float32 = 1e-4,
 ):
     var c_in_blocks = c_in // 32
@@ -1044,7 +1044,7 @@ def fast_tanh(x: Float32) -> Float32:
     return (e2x - 1.0) / (e2x + 1.0)
 
 @always_inline
-def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     for i in range(0, size, 8):
         var v1 = h1.load[8](i)
         var v2 = h2.load[8](i)
@@ -1056,7 +1056,7 @@ def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], o
             out_ptr[i + lane] = gelu * x2
 
 @always_inline
-def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
+def apply_rope(vec: UnsafePointer[Float32, MutUntrackedOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
     var half_dim = head_dim // 2
     var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
     var rope_dim = 512 if is_global else 256
@@ -1078,7 +1078,7 @@ def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, h
             vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
 
 @always_inline
-def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def softmax(scores: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     var max_val = scores[0]
     for i in range(1, size):
         if scores[i] > max_val:
@@ -1093,10 +1093,10 @@ def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
         scores[i] /= sum_exp
 
 # Helper to wait for io_uring tags
-def wait_for_tag(ring: IoUring, expected_tag: UInt64, out_tag_ptr: UnsafePointer[UInt64, MutExternalOrigin]) raises:
+def wait_for_tag(ring: IoUring, expected_tag: UInt64, out_tag_ptr: UnsafePointer[UInt64, MutUntrackedOrigin]) raises:
     print(" [io_uring] wait_for_tag: waiting for expected_tag =", expected_tag)
     var libc = OwnedDLHandle("libc.so.6")
-    var c_usleep = libc.get_function[fn(UInt32) -> Int32]("usleep")
+    var c_usleep = libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
     var attempts = 0
     while True:
         var res = ring.poll_completion(out_tag_ptr.__int__())
@@ -1144,13 +1144,13 @@ def main() raises:
     print("Scanning topology for AMD GPU...")
     var gpu_id: UInt32 = 0
     var libc = OwnedDLHandle("libc.so.6")
-    var c_open = libc.get_function[fn(Int, Int32, Int32) -> Int32]("open")
-    var c_close = libc.get_function[fn(Int32) -> Int32]("close")
-    var c_read = libc.get_function[fn(Int32, Int, Int) -> Int]("read")
-    var c_ioctl = libc.get_function[fn(Int32, Int, Int) -> Int32]("ioctl")
-    var posix_memalign = libc.get_function[fn(Int, Int, Int) -> Int32]("posix_memalign")
-    var free_c = libc.get_function[fn(Int) -> NoneType]("free")
-    var c_memcpy = libc.get_function[fn(Int, Int, Int) -> Int]("memcpy")
+    var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
+    var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+    var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
+    var c_ioctl = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int32]("ioctl")
+    var posix_memalign = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int32]("posix_memalign")
+    var free_c = libc.get_function[def(Int) thin abi("C") -> NoneType]("free")
+    var c_memcpy = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int]("memcpy")
 
     for node_idx in range(1, 16):
         var path = "/sys/class/kfd/kfd/topology/nodes/" + String(node_idx) + "/gpu_id"
@@ -1247,7 +1247,7 @@ def main() raises:
     print(" -> Allocating GTT weight buffer for the entire 12.29 GB of weights...")
     var weights_gpu_buf = gpu_ctx.alloc_gpu_buffer(total_weights_size, gtt_cached_flags, cpu_access=True)
     gpu_ctx.weights_gpu_buf = weights_gpu_buf.copy()
-    var weights_gpu_ptr = UnsafePointer[Int8, MutExternalOrigin](unsafe_from_address=weights_gpu_buf.cpu_addr)
+    var weights_gpu_ptr = UnsafePointer[Int8, MutUntrackedOrigin](unsafe_from_address=weights_gpu_buf.cpu_addr)
 
     var weights_file = "gemma4_weights_q8_sorted.bin"
     print("Opening weights file 'gemma4_weights_q8_sorted.bin'...")
@@ -1296,7 +1296,7 @@ def main() raises:
     var memptr_embed = alloc[Int](1)
     _ = posix_memalign(memptr_embed.__int__(), 4096, embed_size_bytes)
     var embed_addr = memptr_embed[0]
-    var embed_ptr = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=embed_addr)
+    var embed_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=embed_addr)
 
     var total_read = 0
     while total_read < embed_size_bytes:
@@ -1370,23 +1370,23 @@ def main() raises:
     gpu_ctx.h1_buf = h1_buf.copy()
     gpu_ctx.h2_buf = h2_buf.copy()
 
-    var x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=x_buf.cpu_addr)
-    var norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=norm_x_buf.cpu_addr)
-    var norm_x_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=norm_x_buf_1.cpu_addr)
-    var final_norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=final_norm_x_buf.cpu_addr)
-    var q = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_buf.cpu_addr)
-    var q_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=q_buf_1.cpu_addr)
-    var k_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_vec_buf.cpu_addr)
-    var k_vec_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=k_vec_buf_1.cpu_addr)
-    var v_vec = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=v_vec_buf.cpu_addr)
-    var v_vec_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=v_vec_buf_1.cpu_addr)
+    var x = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=x_buf.cpu_addr)
+    var norm_x = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=norm_x_buf.cpu_addr)
+    var norm_x_1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=norm_x_buf_1.cpu_addr)
+    var final_norm_x = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=final_norm_x_buf.cpu_addr)
+    var q = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=q_buf.cpu_addr)
+    var q_1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=q_buf_1.cpu_addr)
+    var k_vec = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=k_vec_buf.cpu_addr)
+    var k_vec_1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=k_vec_buf_1.cpu_addr)
+    var v_vec = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=v_vec_buf.cpu_addr)
+    var v_vec_1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=v_vec_buf_1.cpu_addr)
     
     var attn_scores = alloc[Float32](CONFIG.num_heads * CONFIG.max_seq_len)
-    var attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=attn_out_buf.cpu_addr)
-    var attn_out_1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=attn_out_buf_1.cpu_addr)
-    var proj_attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=proj_attn_out_buf.cpu_addr)
-    var h1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=h1_buf.cpu_addr)
-    var h2 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=h2_buf.cpu_addr)
+    var attn_out = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=attn_out_buf.cpu_addr)
+    var attn_out_1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=attn_out_buf_1.cpu_addr)
+    var proj_attn_out = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=proj_attn_out_buf.cpu_addr)
+    var h1 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=h1_buf.cpu_addr)
+    var h2 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=h2_buf.cpu_addr)
     
     var ffn_out_gate = alloc[Float32](CONFIG.intermediate_dim)
     var ffn_out = alloc[Float32](CONFIG.embed_dim)

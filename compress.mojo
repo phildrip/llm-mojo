@@ -16,7 +16,7 @@ struct Float32BlockCompressor:
     # - Uncompressed: 1 + 8 + 1 + 23 = 33 bytes
     
     @staticmethod
-    def compress(src: UnsafePointer[Float32, _], dest: UnsafePointer[UInt8, MutExternalOrigin], length: Int) -> Int:
+    def compress(src: UnsafePointer[Float32, _], dest: UnsafePointer[UInt8, MutUntrackedOrigin], length: Int) -> Int:
         # Length must be a multiple of 8 for SIMD block execution
         var num_blocks = length // 8
         var write_ptr = dest
@@ -145,7 +145,7 @@ struct Float32BlockCompressor:
         return write_ptr.__int__() - dest.__int__()
 
     @staticmethod
-    def decompress(src: UnsafePointer[UInt8, _], dest: UnsafePointer[Float32, MutExternalOrigin], length: Int):
+    def decompress(src: UnsafePointer[UInt8, _], dest: UnsafePointer[Float32, MutUntrackedOrigin], length: Int):
         var num_blocks = length // 8
         var read_ptr = src
         
