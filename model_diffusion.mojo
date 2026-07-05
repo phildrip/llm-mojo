@@ -1427,26 +1427,42 @@ def main() raises:
                     var attn_out_ptr = canvas_attn_out + t * MAX_Q_SIZE
                     var scores_t = canvas_attn_scores + t * CONFIG.max_seq_len
 
+                    var q_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+                    var acc_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+
                     for h in range(layer_heads):
                         var h_offset = h * layer_head_dim
                         var g = h // ratio
                         var g_offset = g * layer_head_dim
+                        var num_simd_lanes = layer_head_dim // 8
+
+                        # Cache query head into thread-local stack registers
+                        for d in range(num_simd_lanes):
+                            q_regs[d] = q_load.load[8](h_offset + d * 8)
+
                         for tt in range(seq_len):
                             var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
                             var score_vec = SIMD[DType.float32, 8](0.0)
-                            for d in range(0, layer_head_dim, 8):
-                                score_vec += q_load.load[8](h_offset + d) * k_cache.load[8](t_cache_offset + d)
+                            for d in range(num_simd_lanes):
+                                score_vec += q_regs[d] * k_cache.load[8](t_cache_offset + d * 8)
                             scores_t[tt] = score_vec.reduce_add()
+
                         softmax(scores_t, seq_len)
-                        for d in range(0, layer_head_dim, 8):
-                            attn_out_ptr.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+
+                        # Accumulate value vectors directly in registers
+                        for d in range(num_simd_lanes):
+                            acc_regs[d] = SIMD[DType.float32, 8](0.0)
+
                         for tt in range(seq_len):
                             var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
                             var s_vec = SIMD[DType.float32, 8](scores_t[tt])
-                            for d in range(0, layer_head_dim, 8):
-                                var v_vec = v_cache.load[8](t_cache_offset + d)
-                                var acc = attn_out_ptr.load[8](h_offset + d)
-                                attn_out_ptr.store[8](h_offset + d, acc + s_vec * v_vec)
+                            for d in range(num_simd_lanes):
+                                var v_vec = v_cache.load[8](t_cache_offset + d * 8)
+                                acc_regs[d] += s_vec * v_vec
+
+                        # Write back the final compiled attention heads once
+                        for d in range(num_simd_lanes):
+                            attn_out_ptr.store[8](h_offset + d * 8, acc_regs[d])
 
                 parallelize[attn_worker](CANVAS_LEN)
 
