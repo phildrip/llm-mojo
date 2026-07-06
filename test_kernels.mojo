@@ -2143,11 +2143,11 @@ def test_gpu_integration() raises:
 
     var segment2_src = temp_file_buf + 0xb00
     var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x1b00)
-    for i in range(0x414):
+    for i in range(0x430):
         segment2_dst[i] = segment2_src[i]
 
-    var segment3_src = temp_file_buf + 0xf18
-    var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f18)
+    var segment3_src = temp_file_buf + 0xf30
+    var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f30)
     for i in range(0x70):
         segment3_dst[i] = segment3_src[i]
 

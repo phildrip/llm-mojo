@@ -87,8 +87,8 @@ def test_hsaco_segments():
         raise ValueError(f"Segment 2 offset must be 0xb00, found {hex(seg2['offset'])}")
     if seg2['vaddr'] != 0x1b00:
         raise ValueError(f"Segment 2 vaddr must be 0x1b00, found {hex(seg2['vaddr'])}")
-    if seg2['filesz'] < 0x414:
-        raise ValueError(f"Segment 2 filesz must be at least 0x414, found {hex(seg2['filesz'])}")
+    if seg2['filesz'] < 0x430:
+        raise ValueError(f"Segment 2 filesz must be at least 0x430, found {hex(seg2['filesz'])}")
     print("-> Segment 2 is VALID!")
     
     # -------------------------------------------------------------------------
@@ -96,10 +96,10 @@ def test_hsaco_segments():
     # -------------------------------------------------------------------------
     print("\n--- Verifying Segment 3 (RW Segment) ---")
     print(f"Found Segment 3: offset={hex(seg3['offset'])}, vaddr={hex(seg3['vaddr'])}, filesz={hex(seg3['filesz'])}")
-    if seg3['offset'] != 0xf18:
-        raise ValueError(f"Segment 3 offset must be 0xf18, found {hex(seg3['offset'])}")
-    if seg3['vaddr'] != 0x2f18:
-        raise ValueError(f"Segment 3 vaddr must be 0x2f18, found {hex(seg3['vaddr'])}")
+    if seg3['offset'] != 0xf30:
+        raise ValueError(f"Segment 3 offset must be 0xf30, found {hex(seg3['offset'])}")
+    if seg3['vaddr'] != 0x2f30:
+        raise ValueError(f"Segment 3 vaddr must be 0x2f30, found {hex(seg3['vaddr'])}")
     if seg3['filesz'] < 0x70:
         raise ValueError(f"Segment 3 filesz must be at least 0x70, found {hex(seg3['filesz'])}")
     print("-> Segment 3 is VALID!")

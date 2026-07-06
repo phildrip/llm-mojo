@@ -432,15 +432,15 @@ struct GPUContext(Movable):
         for i in range(0xa80):
             segment1_dst[i] = segment1_src[i]
 
-        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x414 (full instructions payload)
+        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x430 (full instructions payload)
         var segment2_src = temp_file_buf + 0xb00
         var segment2_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
-        for i in range(0x414):
+        for i in range(0x430):
             segment2_dst[i] = segment2_src[i]
 
-        # Segment 3 (RW): offset 0xf18, virt_addr 0x2f18, size 0x70
-        var segment3_src = temp_file_buf + 0xf18
-        var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f18)
+        # Segment 3 (RW): offset 0xf30, virt_addr 0x2f30, size 0x70
+        var segment3_src = temp_file_buf + 0xf30
+        var segment3_dst = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f30)
         for i in range(0x70):
             segment3_dst[i] = segment3_src[i]
         temp_file_buf.free()
