@@ -6,6 +6,8 @@ from std.ffi import OwnedDLHandle
 from std.python import Python
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
+from std.collections import InlineArray
+
 
 # -----------------------------------------------------------------------------
 # Kernels to Test (exactly matching model.mojo)
@@ -172,6 +174,14 @@ def ternary_matmul_vec(
             out_ptr[r] = row_sum * scales[r]
             
     parallelize[worker](num_tasks)
+
+@always_inline
+def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
+    var chunk = SIMD[DType.uint8, 8](b0, b1, b2, b3, 0, 0, 0, 0)
+    var repeated = chunk.shuffle[0, 0, 1, 1, 2, 2, 3, 3]()
+    var shifted = repeated >> SIMD[DType.uint8, 8](0, 4, 0, 4, 0, 4, 0, 4)
+    var masked = shifted & 15
+    return (masked.cast[DType.int8]() - 8).cast[DType.float32]()
 
 @always_inline
 def unpack_16bytes(
@@ -1243,6 +1253,414 @@ struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
         self.reserved2 = 0
         self.completion_signal = completion_signal
 
+struct MoELayerWeights:
+    var wq_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var wk_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var wv_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var wo_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var w_gate_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var w_up_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var w_down_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var w_router_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var experts_gate_up_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+    var experts_down_packed: UnsafePointer[UInt8, MutUntrackedOrigin]
+
+    var wq_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wk_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wv_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var wo_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w_gate_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w_up_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w_down_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var w_router_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var experts_gate_up_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+    var experts_down_scales: UnsafePointer[Float32, MutUntrackedOrigin]
+
+    var input_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_attention_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var pre_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var pre_feedforward_layernorm_2_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_feedforward_layernorm_1_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var post_feedforward_layernorm_2_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var q_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var k_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin]
+    var router_scale: UnsafePointer[Float32, MutUntrackedOrigin]
+    var router_per_expert_scale: UnsafePointer[Float32, MutUntrackedOrigin]
+    var layer_scalar: UnsafePointer[Float32, MutUntrackedOrigin]
+
+    def __init__(
+        out self,
+        wq_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        wk_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        wv_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        wo_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        w_gate_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        w_up_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        w_down_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        w_router_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        experts_gate_up_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        experts_down_packed: UnsafePointer[UInt8, MutUntrackedOrigin],
+        wq_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wk_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wv_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        wo_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w_gate_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w_up_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w_down_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        w_router_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        experts_gate_up_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        experts_down_scales: UnsafePointer[Float32, MutUntrackedOrigin],
+        input_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_attention_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        pre_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        pre_feedforward_layernorm_2_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_feedforward_layernorm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_feedforward_layernorm_1_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        post_feedforward_layernorm_2_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        q_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        k_norm_weight: UnsafePointer[Float32, MutUntrackedOrigin],
+        router_scale: UnsafePointer[Float32, MutUntrackedOrigin],
+        router_per_expert_scale: UnsafePointer[Float32, MutUntrackedOrigin],
+        layer_scalar: UnsafePointer[Float32, MutUntrackedOrigin],
+    ):
+        self.wq_packed = wq_packed
+        self.wk_packed = wk_packed
+        self.wv_packed = wv_packed
+        self.wo_packed = wo_packed
+        self.w_gate_packed = w_gate_packed
+        self.w_up_packed = w_up_packed
+        self.w_down_packed = w_down_packed
+        self.w_router_packed = w_router_packed
+        self.experts_gate_up_packed = experts_gate_up_packed
+        self.experts_down_packed = experts_down_packed
+        self.wq_scales = wq_scales
+        self.wk_scales = wk_scales
+        self.wv_scales = wv_scales
+        self.wo_scales = wo_scales
+        self.w_gate_scales = w_gate_scales
+        self.w_up_scales = w_up_scales
+        self.w_down_scales = w_down_scales
+        self.w_router_scales = w_router_scales
+        self.experts_gate_up_scales = experts_gate_up_scales
+        self.experts_down_scales = experts_down_scales
+        self.input_layernorm_weight = input_layernorm_weight
+        self.post_attention_layernorm_weight = post_attention_layernorm_weight
+        self.pre_feedforward_layernorm_weight = pre_feedforward_layernorm_weight
+        self.pre_feedforward_layernorm_2_weight = pre_feedforward_layernorm_2_weight
+        self.post_feedforward_layernorm_weight = post_feedforward_layernorm_weight
+        self.post_feedforward_layernorm_1_weight = post_feedforward_layernorm_1_weight
+        self.post_feedforward_layernorm_2_weight = post_feedforward_layernorm_2_weight
+        self.q_norm_weight = q_norm_weight
+        self.k_norm_weight = k_norm_weight
+        self.router_scale = router_scale
+        self.router_per_expert_scale = router_per_expert_scale
+        self.layer_scalar = layer_scalar
+
+struct MoEConfig[
+    embed_dim: Int = 2816,
+    standard_mlp_dim: Int = 2112,
+    expert_mlp_dim: Int = 704,
+    num_experts: Int = 128,
+    top_k_experts: Int = 8,
+    num_layers: Int = 30,
+    vocab_size: Int = 32768,
+    max_seq_len: Int = 512,
+]:
+    def __init__(out self):
+        pass
+
+    @always_inline
+    def is_global_layer(self, layer_idx: Int) -> Bool:
+        return layer_idx % 6 == 5
+
+    @always_inline
+    def get_layer_aligned_size(self, layer_idx: Int) -> Int:
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 2 if is_global else 8
+        
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
+        var w_gate_size = Self.standard_mlp_dim * Self.embed_dim
+        var w_up_size = Self.standard_mlp_dim * Self.embed_dim
+        var w_down_size = Self.embed_dim * Self.standard_mlp_dim
+        var w_router_size = Self.num_experts * Self.embed_dim
+        var experts_gate_up_size = Self.num_experts * (Self.expert_mlp_dim * 2) * Self.embed_dim
+        var experts_down_size = Self.num_experts * Self.embed_dim * Self.expert_mlp_dim
+        
+        var packed_weights_size = (
+            wq_size + wk_size + wv_size + wo_size +
+            w_gate_size + w_up_size + w_down_size +
+            w_router_size + experts_gate_up_size + experts_down_size
+        ) // 2
+        
+        var scales_count = (
+            wq_size + wk_size + wv_size + wo_size +
+            w_gate_size + w_up_size + w_down_size +
+            w_router_size + experts_gate_up_size + experts_down_size
+        ) // 32
+        var scales_size_bytes = scales_count * 4
+        
+        var input_layernorm_size = Self.embed_dim
+        var post_attention_layernorm_size = Self.embed_dim
+        var pre_feedforward_layernorm_size = Self.embed_dim
+        var pre_feedforward_layernorm_2_size = Self.embed_dim
+        var post_feedforward_layernorm_size = Self.embed_dim
+        var post_feedforward_layernorm_1_size = Self.embed_dim
+        var post_feedforward_layernorm_2_size = Self.embed_dim
+        
+        var q_norm_size = layer_head_dim
+        var k_norm_size = layer_head_dim
+        var router_scale_size = Self.embed_dim
+        var router_per_expert_scale_size = 128
+        var layer_scalar_size = 1
+        
+        var unchanged_size_bytes = (
+            input_layernorm_size + post_attention_layernorm_size +
+            pre_feedforward_layernorm_size + pre_feedforward_layernorm_2_size +
+            post_feedforward_layernorm_size + post_feedforward_layernorm_1_size +
+            post_feedforward_layernorm_2_size +
+            q_norm_size + k_norm_size +
+            router_scale_size + router_per_expert_scale_size + layer_scalar_size
+        ) * 4
+        
+        var raw_bytes_size = packed_weights_size + scales_size_bytes + unchanged_size_bytes
+        return ((raw_bytes_size + 4095) // 4096) * 4096
+
+    def get_layer_offset(self, layer_idx: Int) -> Int:
+        var offset = 0
+        for i in range(layer_idx):
+            offset += self.get_layer_aligned_size(i)
+        return offset
+
+    @always_inline
+    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[UInt8, _]) -> MoELayerWeights:
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 2 if is_global else 8
+        
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
+        var w_gate_size = Self.standard_mlp_dim * Self.embed_dim
+        var w_up_size = Self.standard_mlp_dim * Self.embed_dim
+        var w_down_size = Self.embed_dim * Self.standard_mlp_dim
+        var w_router_size = Self.num_experts * Self.embed_dim
+        var experts_gate_up_size = Self.num_experts * (Self.expert_mlp_dim * 2) * Self.embed_dim
+        var experts_down_size = Self.num_experts * Self.embed_dim * Self.expert_mlp_dim
+        
+        var wq_size_bytes = wq_size // 2
+        var wk_size_bytes = wk_size // 2
+        var wv_size_bytes = wv_size // 2
+        var wo_size_bytes = wo_size // 2
+        var w_gate_size_bytes = w_gate_size // 2
+        var w_up_size_bytes = w_up_size // 2
+        var w_down_size_bytes = w_down_size // 2
+        var w_router_size_bytes = w_router_size // 2
+        var experts_gate_up_size_bytes = experts_gate_up_size // 2
+        var experts_down_size_bytes = experts_down_size // 2
+        
+        var wq_packed = base_ptr
+        var wk_packed = wq_packed + wq_size_bytes
+        var wv_packed = wk_packed + wk_size_bytes
+        var wo_packed = wv_packed + wv_size_bytes
+        var w_gate_packed = wo_packed + wo_size_bytes
+        var w_up_packed = w_gate_packed + w_gate_size_bytes
+        var w_down_packed = w_up_packed + w_up_size_bytes
+        var w_router_packed = w_down_packed + w_down_size_bytes
+        var experts_gate_up_packed = w_router_packed + w_router_size_bytes
+        var experts_down_packed = experts_gate_up_packed + experts_gate_up_size_bytes
+        
+        var scales_base = (experts_down_packed + experts_down_size_bytes).bitcast[Float32]()
+        
+        var c_blocks_q = wq_size // 32
+        var c_blocks_k = wk_size // 32
+        var c_blocks_v = wv_size // 32
+        var c_blocks_o = wo_size // 32
+        var c_blocks_w_gate = w_gate_size // 32
+        var c_blocks_w_up = w_up_size // 32
+        var c_blocks_w_down = w_down_size // 32
+        var c_blocks_w_router = w_router_size // 32
+        var c_blocks_experts_gate_up = experts_gate_up_size // 32
+        var c_blocks_experts_down = experts_down_size // 32
+        
+        var wq_scales = scales_base
+        var wk_scales = wq_scales + c_blocks_q
+        var wv_scales = wk_scales + c_blocks_k
+        var wo_scales = wv_scales + c_blocks_v
+        var w_gate_scales = wo_scales + c_blocks_o
+        var w_up_scales = w_gate_scales + c_blocks_w_gate
+        var w_down_scales = w_up_scales + c_blocks_w_up
+        var w_router_scales = w_down_scales + c_blocks_w_down
+        var experts_gate_up_scales = w_router_scales + c_blocks_w_router
+        var experts_down_scales = experts_gate_up_scales + c_blocks_experts_gate_up
+        
+        var unchanged_base = experts_down_scales + c_blocks_experts_down
+        
+        var input_layernorm = unchanged_base
+        var post_attention_layernorm = input_layernorm + Self.embed_dim
+        var pre_feedforward_layernorm = post_attention_layernorm + Self.embed_dim
+        var pre_feedforward_layernorm_2 = pre_feedforward_layernorm + Self.embed_dim
+        var post_feedforward_layernorm = pre_feedforward_layernorm_2 + Self.embed_dim
+        var post_feedforward_layernorm_1 = post_feedforward_layernorm + Self.embed_dim
+        var post_feedforward_layernorm_2 = post_feedforward_layernorm_1 + Self.embed_dim
+        var q_norm = post_feedforward_layernorm_2 + Self.embed_dim
+        var k_norm = q_norm + layer_head_dim
+        var router_scale = k_norm + layer_head_dim
+        var router_per_expert_scale = router_scale + Self.embed_dim
+        var layer_scalar = router_per_expert_scale + 128
+        
+        return MoELayerWeights(
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wq_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wk_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wv_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wo_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=w_gate_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=w_up_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=w_down_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=w_router_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=experts_gate_up_packed.__int__()),
+            UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=experts_down_packed.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wq_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wk_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wv_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=wo_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w_gate_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w_up_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w_down_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=w_router_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=experts_gate_up_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=experts_down_scales.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=input_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_attention_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=pre_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=pre_feedforward_layernorm_2.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_feedforward_layernorm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_feedforward_layernorm_1.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=post_feedforward_layernorm_2.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=q_norm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=k_norm.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=router_scale.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=router_per_expert_scale.__int__()),
+            UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=layer_scalar.__int__())
+        )
+
+def pad_right(s: String, width: Int) -> String:
+    var res = s
+    while res.byte_length() < width:
+        res += " "
+    return res
+
+def pad_left(s: String, width: Int) -> String:
+    var res = s
+    while res.byte_length() < width:
+        res = " " + res
+    return res
+
+def test_moe_config() raises:
+    print("Running test_moe_config...")
+    var config = MoEConfig[]()
+    
+    # Test is_global_layer
+    assert_false(config.is_global_layer(0))
+    assert_false(config.is_global_layer(4))
+    assert_true(config.is_global_layer(5)) # Layer index 5 is global (5 % 6 == 5)
+    assert_false(config.is_global_layer(6))
+    assert_true(config.is_global_layer(11)) # Layer index 11 is global (11 % 6 == 5)
+    assert_true(config.is_global_layer(29)) # Layer index 29 is global (29 % 6 == 5)
+    
+    # Test get_layer_aligned_size
+    var size_l0 = config.get_layer_aligned_size(0) # standard layer
+    var size_l5 = config.get_layer_aligned_size(5) # global layer
+    assert_true(size_l0 > 0)
+    assert_true(size_l5 > 0)
+    assert_true(size_l0 % 4096 == 0) # must be page-aligned
+    assert_true(size_l5 % 4096 == 0)
+    
+    # Test get_layer_offset
+    var offset_l0 = config.get_layer_offset(0)
+    assert_equal(offset_l0, 0)
+    var offset_l1 = config.get_layer_offset(1)
+    assert_equal(offset_l1, size_l0)
+    var offset_l2 = config.get_layer_offset(2)
+    assert_equal(offset_l2, size_l0 + config.get_layer_aligned_size(1))
+    
+    # Test get_layer_weights with a mock memory pointer
+    var mock_size = config.get_layer_aligned_size(0)
+    var mock_memory = alloc[UInt8](mock_size)
+    var weights = config.get_layer_weights(0, mock_memory)
+    
+    var base_addr = mock_memory.__int__()
+    assert_equal(weights.wq_packed.__int__(), base_addr)
+    assert_true(weights.wk_packed.__int__() > base_addr)
+    assert_true(weights.wv_packed.__int__() > weights.wk_packed.__int__())
+    mock_memory.free()
+    
+    print("test_moe_config passed!")
+
+def test_unpack() raises:
+    print("Running test_unpack...")
+    var unpacked_4 = unpack_4bytes(0x12, 0x34, 0x56, 0x78)
+    assert_equal(unpacked_4[0], -6.0)
+    assert_equal(unpacked_4[1], -7.0)
+    assert_equal(unpacked_4[2], -4.0)
+    assert_equal(unpacked_4[3], -5.0)
+    assert_equal(unpacked_4[4], -2.0)
+    assert_equal(unpacked_4[5], -3.0)
+    assert_equal(unpacked_4[6], 0.0)
+    assert_equal(unpacked_4[7], -1.0)
+
+    # Test unpack_16bytes
+    var bytes = SIMD[DType.uint8, 16](
+        0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+        0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0
+    )
+    var w0 = SIMD[DType.float32, 8]()
+    var w1 = SIMD[DType.float32, 8]()
+    var w2 = SIMD[DType.float32, 8]()
+    var w3 = SIMD[DType.float32, 8]()
+    unpack_16bytes(bytes, w0, w1, w2, w3)
+    
+    # w0 is lower 4 bytes of bytes (0x12, 0x34, 0x56, 0x78)
+    assert_equal(w0[0], -6.0)
+    assert_equal(w0[1], -7.0)
+    assert_equal(w0[2], -4.0)
+    assert_equal(w0[3], -5.0)
+    assert_equal(w0[4], -2.0)
+    assert_equal(w0[5], -3.0)
+    assert_equal(w0[6], 0.0)
+    assert_equal(w0[7], -1.0)
+    
+    # w1 is next 4 bytes of bytes (0x9A, 0xBC, 0xDE, 0xF0)
+    # 0x9A: low = 10 (2), high = 9 (1) -> w1[0] = 2, w1[1] = 1
+    # 0xBC: low = 12 (4), high = 11 (3) -> w1[2] = 4, w1[3] = 3
+    # 0xDE: low = 14 (6), high = 13 (5) -> w1[4] = 6, w1[5] = 5
+    # 0xF0: low = 0 (-8), high = 15 (7) -> w1[6] = -8, w1[7] = 7
+    assert_equal(w1[0], 2.0)
+    assert_equal(w1[1], 1.0)
+    assert_equal(w1[2], 4.0)
+    assert_equal(w1[3], 3.0)
+    assert_equal(w1[4], 6.0)
+    assert_equal(w1[5], 5.0)
+    assert_equal(w1[6], -8.0)
+    assert_equal(w1[7], 7.0)
+
+    print("test_unpack passed!")
+
+def test_string_padding() raises:
+    print("Running test_string_padding...")
+    assert_equal(pad_right("hello", 10), "hello     ")
+    assert_equal(pad_right("hello", 3), "hello")
+    assert_equal(pad_left("world", 10), "     world")
+    assert_equal(pad_left("world", 3), "world")
+    print("test_string_padding passed!")
+
 def test_early_exit() raises:
     print("Running test_early_exit...")
     
@@ -1894,6 +2312,853 @@ def test_gpu_integration() raises:
     _ = cpu_fence_lib
     print("test_gpu_integration passed successfully!")
 
+# -----------------------------------------------------------------------------
+# DiffusionGemma-specific Kernels (from model_diffusion.mojo)
+# -----------------------------------------------------------------------------
+@always_inline
+def gelu_and_mul_diffusion(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
+    for i in range(0, size, 8):
+        var x1 = h1.load[8](i)
+        var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
+        var gelu = x1 * sig
+        out_ptr.store[8](i, gelu * h2.load[8](i))
+
+@always_inline
+def gelu_and_mul_batch_diffusion(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], B: Int, dim: Int):
+    for b in range(B):
+        var base = b * dim
+        for i in range(0, dim, 8):
+            var x1 = h1.load[8](base + i)
+            var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
+            out_ptr.store[8](base + i, x1 * sig * h2.load[8](base + i))
+
+@always_inline
+def rms_norm_batch_diffusion(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], B: Int, dim: Int):
+    for b in range(B):
+        rms_norm(x + b * dim, w, out_ptr + b * dim, dim)
+
+@always_inline
+def rms_norm_noscale_batch_diffusion(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutUntrackedOrigin], B: Int, dim: Int):
+    for b in range(B):
+        rms_norm_noscale(x + b * dim, out_ptr + b * dim, dim)
+
+@always_inline
+def q4_gemv_cpu_diffusion(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+        
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        
+        for r in range(start_r, end_r):
+            var acc = SIMD[DType.float32, 8](0.0)
+            
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+            
+            for b in range(c_in_blocks):
+                var scale = scales[r_offset_scales + b]
+                var block_p = r_offset_packed + b * 16
+                var x_offset = b * 32
+
+                var bytes = W_packed.load[16](block_p)
+
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                acc = acc + (w0 * x.load[8](x_offset)) * scale
+                acc = acc + (w1 * x.load[8](x_offset + 8)) * scale
+                acc = acc + (w2 * x.load[8](x_offset + 16)) * scale
+                acc = acc + (w3 * x.load[8](x_offset + 24)) * scale
+                
+            out_ptr[r] = acc.reduce_add()
+            
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+def q4_gemv_batch_diffusion(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        var acc = alloc[Float32](B)
+
+        for r in range(start_r, end_r):
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+
+            for b in range(B):
+                acc[b] = 0.0
+
+            for blk in range(c_in_blocks):
+                var scale = scales[r_offset_scales + blk]
+                var block_p = r_offset_packed + blk * 16
+                var x_offset_base = blk * 32
+
+                var bytes = W_packed.load[16](block_p)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                for b in range(B):
+                    var x_base = b * x_stride + x_offset_base
+                    var p = (w0 * X.load[8](x_base)).reduce_add() * scale
+                    p += (w1 * X.load[8](x_base + 8)).reduce_add() * scale
+                    p += (w2 * X.load[8](x_base + 16)).reduce_add() * scale
+                    p += (w3 * X.load[8](x_base + 24)).reduce_add() * scale
+                    acc[b] += p
+
+            for b in range(B):
+                out_ptr[b * o_stride + r] = acc[b]
+
+        acc.free()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+@always_inline
+def q4_gemv_small_b_diffusion[MAX_B: Int](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        var acc = InlineArray[SIMD[DType.float32, 8], MAX_B](uninitialized=True)
+
+        for r in range(start_r, end_r):
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+
+            comptime for i in range(MAX_B):
+                acc[i] = SIMD[DType.float32, 8](0.0)
+
+            for blk in range(c_in_blocks):
+                var scale = scales[r_offset_scales + blk]
+                var block_p = r_offset_packed + blk * 16
+                var x_offset_base = blk * 32
+
+                var bytes = W_packed.load[16](block_p)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                w0 = w0 * scale
+                w1 = w1 * scale
+                w2 = w2 * scale
+                w3 = w3 * scale
+
+                comptime for i in range(MAX_B):
+                    if i < B:
+                        var x_base = i * x_stride + x_offset_base
+                        acc[i] = acc[i] + w0 * X.load[8](x_base)
+                        acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
+                        acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
+                        acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
+
+            comptime for i in range(MAX_B):
+                if i < B:
+                    out_ptr[i * o_stride + r] = acc[i].reduce_add()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+def q4_gemv_moe_dispatch_diffusion(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    if B <= 1:
+        q4_gemv_small_b_diffusion[1](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 2:
+        q4_gemv_small_b_diffusion[2](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 4:
+        q4_gemv_small_b_diffusion[4](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 8:
+        q4_gemv_small_b_diffusion[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 12:
+        q4_gemv_small_b_diffusion[12](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 16:
+        q4_gemv_small_b_diffusion[16](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 24:
+        q4_gemv_small_b_diffusion[24](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    elif B <= 32:
+        q4_gemv_small_b_diffusion[32](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+    else:
+        q4_gemv_tiled_diffusion[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+
+@always_inline
+def q4_gemv_tiled_diffusion[TILE_B: Int](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        var acc = InlineArray[SIMD[DType.float32, 8], TILE_B](uninitialized=True)
+
+        for r in range(start_r, end_r):
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+
+            for b_outer in range(0, B, TILE_B):
+                var b_end = b_outer + TILE_B if b_outer + TILE_B < B else B
+                var b_count = b_end - b_outer
+
+                comptime for i in range(TILE_B):
+                    acc[i] = SIMD[DType.float32, 8](0.0)
+
+                for blk in range(c_in_blocks):
+                    var scale = scales[r_offset_scales + blk]
+                    var block_p = r_offset_packed + blk * 16
+                    var x_offset_base = blk * 32
+
+                    var bytes = W_packed.load[16](block_p)
+                    var w0 = SIMD[DType.float32, 8]()
+                    var w1 = SIMD[DType.float32, 8]()
+                    var w2 = SIMD[DType.float32, 8]()
+                    var w3 = SIMD[DType.float32, 8]()
+                    unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                    w0 = w0 * scale
+                    w1 = w1 * scale
+                    w2 = w2 * scale
+                    w3 = w3 * scale
+
+                    comptime for i in range(TILE_B):
+                        if i < b_count:
+                            var x_base = (b_outer + i) * x_stride + x_offset_base
+                            acc[i] = acc[i] + w0 * X.load[8](x_base)
+                            acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
+                            acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
+                            acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
+
+                comptime for i in range(TILE_B):
+                    if i < b_count:
+                        out_ptr[(b_outer + i) * o_stride + r] = acc[i].reduce_add()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+@always_inline
+def get_top_k_diffusion[k: Int](probs: UnsafePointer[Float32, _], top_idx: UnsafePointer[Int, MutUntrackedOrigin], top_val: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
+    for i in range(k):
+        top_idx[i] = -1
+        top_val[i] = -999999.0
+        
+    for i in range(size):
+        var val = probs[i]
+        var curr_val = val
+        var curr_idx = i
+        
+        for j in range(k):
+            if curr_val > top_val[j]:
+                var temp_val = top_val[j]
+                var temp_idx = top_idx[j]
+                top_val[j] = curr_val
+                top_idx[j] = curr_idx
+                curr_val = temp_val
+                curr_idx = temp_idx
+
+def sc_forward_diffusion(
+    inputs_embeds: UnsafePointer[Float32, _],
+    soft_embeds: UnsafePointer[Float32, _],
+    sc_gate_packed: UnsafePointer[UInt8, _],
+    sc_up_packed: UnsafePointer[UInt8, _],
+    sc_down_packed: UnsafePointer[UInt8, _],
+    sc_gate_scales: UnsafePointer[Float32, _],
+    sc_up_scales: UnsafePointer[Float32, _],
+    sc_down_scales: UnsafePointer[Float32, _],
+    sc_pre_norm: UnsafePointer[Float32, _],
+    buf_normed: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_gate: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_up: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_gated: UnsafePointer[Float32, MutUntrackedOrigin],
+    buf_down: UnsafePointer[Float32, MutUntrackedOrigin],
+    sc_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    embed_dim: Int,
+    sc_size: Int,
+    num_tasks: Int,
+):
+    rms_norm(soft_embeds, sc_pre_norm, buf_normed, embed_dim)
+    q4_gemv_cpu_diffusion(sc_gate_packed, sc_gate_scales, buf_normed, buf_gate, embed_dim, sc_size, num_tasks)
+    q4_gemv_cpu_diffusion(sc_up_packed, sc_up_scales, buf_normed, buf_up, embed_dim, sc_size, num_tasks)
+    gelu_and_mul_diffusion(buf_gate, buf_up, buf_gated, sc_size)
+    q4_gemv_cpu_diffusion(sc_down_packed, sc_down_scales, buf_gated, buf_down, sc_size, embed_dim, num_tasks)
+    for i in range(0, embed_dim, 8):
+        sc_out.store[8](i, inputs_embeds.load[8](i) + buf_down.load[8](i))
+    rms_norm_noscale(sc_out, sc_out, embed_dim)
+
+def probs_to_soft_embed_diffusion(
+    probs: UnsafePointer[Float32, _],
+    embed_packed: UnsafePointer[UInt8, _],
+    embed_scales: UnsafePointer[Float32, _],
+    sc_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    vocab_size: Int,
+    embed_dim: Int,
+    num_tasks: Int,
+):
+    for d in range(0, embed_dim, 8):
+        sc_out.store[8](d, SIMD[DType.float32, 8](0.0))
+    var num_blocks = embed_dim // 32
+    var chunk_size = vocab_size // num_tasks
+
+    def sc_worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else vocab_size
+        for r in range(start_r, end_r):
+            var p = probs[r]
+            if p < 1e-8:
+                continue
+            var row_packed_offset = r * (embed_dim // 2)
+            var row_scales_offset = r * (embed_dim // 32)
+            for b in range(num_blocks):
+                var scale = embed_scales[row_scales_offset + b]
+                var block_packed_offset = row_packed_offset + b * 16
+                var block_out_offset = b * 32
+
+                var bytes = embed_packed.load[16](block_packed_offset)
+                var w0 = SIMD[DType.float32, 8]()
+                var w1 = SIMD[DType.float32, 8]()
+                var w2 = SIMD[DType.float32, 8]()
+                var w3 = SIMD[DType.float32, 8]()
+                unpack_16bytes(bytes, w0, w1, w2, w3)
+
+                var p_scale_vec = SIMD[DType.float32, 8](p * scale)
+                sc_out.store[8](block_out_offset, sc_out.load[8](block_out_offset) + w0 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 8, sc_out.load[8](block_out_offset + 8) + w1 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 16, sc_out.load[8](block_out_offset + 16) + w2 * p_scale_vec)
+                sc_out.store[8](block_out_offset + 24, sc_out.load[8](block_out_offset + 24) + w3 * p_scale_vec)
+
+    if num_tasks == 1:
+        sc_worker(0)
+    else:
+        parallelize[sc_worker](num_tasks)
+
+# -----------------------------------------------------------------------------
+# DiffusionGemma Unit Tests
+# -----------------------------------------------------------------------------
+def test_rms_norm_batch() raises:
+    print("Running test_rms_norm_batch...")
+    var B = 4
+    var dim = 128
+    var size = B * dim
+    
+    var x = alloc[Float32](size)
+    var w = alloc[Float32](dim)
+    var out_batch = alloc[Float32](size)
+    var out_single = alloc[Float32](size)
+    
+    for i in range(size):
+        x[i] = Float32(0.1 * (i % 7) - 0.3)
+    for i in range(dim):
+        w[i] = Float32(0.5 + 0.1 * (i % 3))
+        
+    rms_norm_batch_diffusion(x, w, out_batch, B, dim)
+    
+    for b in range(B):
+        rms_norm(x + b * dim, w, out_single + b * dim, dim)
+        
+    for i in range(size):
+        assert_equal(out_batch[i], out_single[i])
+        
+    x.free()
+    w.free()
+    out_batch.free()
+    out_single.free()
+    print("test_rms_norm_batch passed!")
+
+def test_rms_norm_noscale_batch() raises:
+    print("Running test_rms_norm_noscale_batch...")
+    var B = 4
+    var dim = 128
+    var size = B * dim
+    
+    var x = alloc[Float32](size)
+    var out_batch = alloc[Float32](size)
+    var out_single = alloc[Float32](size)
+    
+    for i in range(size):
+        x[i] = Float32(0.1 * (i % 7) - 0.3)
+        
+    rms_norm_noscale_batch_diffusion(x, out_batch, B, dim)
+    
+    for b in range(B):
+        rms_norm_noscale(x + b * dim, out_single + b * dim, dim)
+        
+    for i in range(size):
+        assert_equal(out_batch[i], out_single[i])
+        
+    x.free()
+    out_batch.free()
+    out_single.free()
+    print("test_rms_norm_noscale_batch passed!")
+
+def test_gelu_and_mul_batch() raises:
+    print("Running test_gelu_and_mul_batch...")
+    var B = 4
+    var dim = 128
+    var size = B * dim
+    
+    var h1 = alloc[Float32](size)
+    var h2 = alloc[Float32](size)
+    var out_batch = alloc[Float32](size)
+    var out_single = alloc[Float32](size)
+    
+    for i in range(size):
+        h1[i] = Float32(0.05 * (i % 11) - 0.2)
+        h2[i] = Float32(0.1 * (i % 5) + 0.1)
+        
+    gelu_and_mul_batch_diffusion(h1, h2, out_batch, B, dim)
+    
+    for b in range(B):
+        gelu_and_mul_diffusion(h1 + b * dim, h2 + b * dim, out_single + b * dim, dim)
+        
+    for i in range(size):
+        var diff = abs(out_batch[i] - out_single[i])
+        assert_true(diff <= 1e-6, "gelu_and_mul_batch mismatch")
+        
+    h1.free()
+    h2.free()
+    out_batch.free()
+    out_single.free()
+    print("test_gelu_and_mul_batch passed!")
+
+def test_q4_gemv_cpu() raises:
+    print("Running test_q4_gemv_cpu...")
+    var c_in = 256
+    var c_out = 64
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    var W_packed = alloc[UInt8](c_out * c_in_packed)
+    var scales = alloc[Float32](c_out * c_in_blocks)
+    var x = alloc[Float32](c_in)
+    var out_cpu = alloc[Float32](c_out)
+    var out_ref = alloc[Float32](c_out)
+    
+    for i in range(c_out * c_in_packed):
+        W_packed[i] = UInt8(i % 256)
+    for i in range(c_out * c_in_blocks):
+        scales[i] = Float32(0.05 * (i % 5) + 0.1)
+    for i in range(c_in):
+        x[i] = Float32(0.1 * (i % 9) - 0.4)
+        
+    q4_gemv_cpu_diffusion(W_packed, scales, x, out_cpu, c_in, c_out, 4)
+    q4_matmul_vec(W_packed, scales, x, out_ref, c_in, c_out, 4)
+    
+    for i in range(c_out):
+        var diff = abs(out_cpu[i] - out_ref[i])
+        assert_true(diff <= 1e-4, "q4_gemv_cpu mismatch vs q4_matmul_vec")
+        
+    W_packed.free()
+    scales.free()
+    x.free()
+    out_cpu.free()
+    out_ref.free()
+    print("test_q4_gemv_cpu passed!")
+
+def test_q4_gemv_batch() raises:
+    print("Running test_q4_gemv_batch...")
+    var B = 4
+    var c_in = 256
+    var c_out = 64
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    var W_packed = alloc[UInt8](c_out * c_in_packed)
+    var scales = alloc[Float32](c_out * c_in_blocks)
+    var x = alloc[Float32](B * c_in)
+    var out_batch = alloc[Float32](B * c_out)
+    var out_ref = alloc[Float32](B * c_out)
+    
+    for i in range(c_out * c_in_packed):
+        W_packed[i] = UInt8(i % 256)
+    for i in range(c_out * c_in_blocks):
+        scales[i] = Float32(0.05 * (i % 5) + 0.1)
+    for i in range(B * c_in):
+        x[i] = Float32(0.1 * (i % 9) - 0.4)
+        
+    q4_gemv_batch_diffusion(W_packed, scales, x, out_batch, B, c_in, c_out, 4)
+    
+    for b in range(B):
+        var x_b = x + b * c_in
+        var out_b_ref = out_ref + b * c_out
+        q4_gemv_cpu_diffusion(W_packed, scales, x_b, out_b_ref, c_in, c_out, 4)
+        
+    for i in range(B * c_out):
+        var diff = abs(out_batch[i] - out_ref[i])
+        assert_true(diff <= 1e-4, "q4_gemv_batch mismatch")
+        
+    W_packed.free()
+    scales.free()
+    x.free()
+    out_batch.free()
+    out_ref.free()
+    print("test_q4_gemv_batch passed!")
+
+def test_q4_gemv_small_b() raises:
+    print("Running test_q4_gemv_small_b...")
+    var B = 4
+    var c_in = 256
+    var c_out = 64
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    var W_packed = alloc[UInt8](c_out * c_in_packed)
+    var scales = alloc[Float32](c_out * c_in_blocks)
+    var x = alloc[Float32](B * c_in)
+    var out_small = alloc[Float32](B * c_out)
+    var out_ref = alloc[Float32](B * c_out)
+    
+    for i in range(c_out * c_in_packed):
+        W_packed[i] = UInt8(i % 256)
+    for i in range(c_out * c_in_blocks):
+        scales[i] = Float32(0.05 * (i % 5) + 0.1)
+    for i in range(B * c_in):
+        x[i] = Float32(0.1 * (i % 9) - 0.4)
+        
+    q4_gemv_small_b_diffusion[4](W_packed, scales, x, out_small, B, c_in, c_out, 4)
+    q4_gemv_batch_diffusion(W_packed, scales, x, out_ref, B, c_in, c_out, 4)
+    
+    for i in range(B * c_out):
+        var diff = abs(out_small[i] - out_ref[i])
+        assert_true(diff <= 1e-4, "q4_gemv_small_b mismatch vs q4_gemv_batch")
+        
+    W_packed.free()
+    scales.free()
+    x.free()
+    out_small.free()
+    out_ref.free()
+    print("test_q4_gemv_small_b passed!")
+
+def test_q4_gemv_tiled() raises:
+    print("Running test_q4_gemv_tiled...")
+    var B = 6
+    var c_in = 256
+    var c_out = 64
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    var W_packed = alloc[UInt8](c_out * c_in_packed)
+    var scales = alloc[Float32](c_out * c_in_blocks)
+    var x = alloc[Float32](B * c_in)
+    var out_tiled = alloc[Float32](B * c_out)
+    var out_ref = alloc[Float32](B * c_out)
+    
+    for i in range(c_out * c_in_packed):
+        W_packed[i] = UInt8(i % 256)
+    for i in range(c_out * c_in_blocks):
+        scales[i] = Float32(0.05 * (i % 5) + 0.1)
+    for i in range(B * c_in):
+        x[i] = Float32(0.1 * (i % 9) - 0.4)
+        
+    q4_gemv_tiled_diffusion[4](W_packed, scales, x, out_tiled, B, c_in, c_out, 4)
+    q4_gemv_batch_diffusion(W_packed, scales, x, out_ref, B, c_in, c_out, 4)
+    
+    for i in range(B * c_out):
+        var diff = abs(out_tiled[i] - out_ref[i])
+        assert_true(diff <= 1e-4, "q4_gemv_tiled mismatch vs q4_gemv_batch")
+        
+    W_packed.free()
+    scales.free()
+    x.free()
+    out_tiled.free()
+    out_ref.free()
+    print("test_q4_gemv_tiled passed!")
+
+def test_q4_gemv_moe_dispatch() raises:
+    print("Running test_q4_gemv_moe_dispatch...")
+    var c_in = 256
+    var c_out = 64
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    
+    var W_packed = alloc[UInt8](c_out * c_in_packed)
+    var scales = alloc[Float32](c_out * c_in_blocks)
+    
+    for i in range(c_out * c_in_packed):
+        W_packed[i] = UInt8(i % 256)
+    for i in range(c_out * c_in_blocks):
+        scales[i] = Float32(0.05 * (i % 5) + 0.1)
+        
+    var test_Bs = InlineArray[Int, 6](uninitialized=True)
+    test_Bs[0] = 1
+    test_Bs[1] = 2
+    test_Bs[2] = 8
+    test_Bs[3] = 12
+    test_Bs[4] = 24
+    test_Bs[5] = 48
+    
+    comptime for idx in range(6):
+        var B = test_Bs[idx]
+        var x = alloc[Float32](B * c_in)
+        var out_disp = alloc[Float32](B * c_out)
+        var out_ref = alloc[Float32](B * c_out)
+        
+        for i in range(B * c_in):
+            x[i] = Float32(0.1 * (i % 9) - 0.4)
+            
+        q4_gemv_moe_dispatch_diffusion(W_packed, scales, x, out_disp, B, c_in, c_out, 4)
+        q4_gemv_batch_diffusion(W_packed, scales, x, out_ref, B, c_in, c_out, 4)
+        
+        for i in range(B * c_out):
+            var diff = abs(out_disp[i] - out_ref[i])
+            assert_true(diff <= 1e-4, "q4_gemv_moe_dispatch mismatch at B=" + String(B))
+            
+        x.free()
+        out_disp.free()
+        out_ref.free()
+        
+    W_packed.free()
+    scales.free()
+    print("test_q4_gemv_moe_dispatch passed!")
+
+def test_get_top_k() raises:
+    print("Running test_get_top_k...")
+    var size = 16
+    var probs = alloc[Float32](size)
+    var top_idx = alloc[Int](8)
+    var top_val = alloc[Float32](8)
+    
+    var vals: List[Float32] = [1.0, 5.0, 2.0, 9.0, 0.5, 12.0, -1.0, 4.0, 3.0, 15.0, 6.0, 8.0, 0.1, 7.0, 11.0, 10.0]
+    for i in range(size):
+        probs[i] = vals[i]
+        
+    get_top_k_diffusion[8](probs, top_idx, top_val, size)
+    
+    assert_equal(top_idx[0], 9)
+    assert_equal(top_idx[1], 5)
+    assert_equal(top_idx[2], 14)
+    assert_equal(top_idx[3], 15)
+    assert_equal(top_idx[4], 3)
+    assert_equal(top_idx[5], 11)
+    assert_equal(top_idx[6], 13)
+    assert_equal(top_idx[7], 10)
+    
+    assert_equal(top_val[0], Float32(15.0))
+    assert_equal(top_val[1], Float32(12.0))
+    assert_equal(top_val[2], Float32(11.0))
+    assert_equal(top_val[3], Float32(10.0))
+    assert_equal(top_val[4], Float32(9.0))
+    assert_equal(top_val[5], Float32(8.0))
+    assert_equal(top_val[6], Float32(7.0))
+    assert_equal(top_val[7], Float32(6.0))
+    
+    probs.free()
+    top_idx.free()
+    top_val.free()
+    print("test_get_top_k passed!")
+
+def test_sc_forward() raises:
+    print("Running test_sc_forward...")
+    var embed_dim = 256
+    var sc_size = 512
+    
+    var inputs_embeds = alloc[Float32](embed_dim)
+    var soft_embeds = alloc[Float32](embed_dim)
+    var sc_gate_packed = alloc[UInt8](sc_size * (embed_dim // 2))
+    var sc_up_packed = alloc[UInt8](sc_size * (embed_dim // 2))
+    var sc_down_packed = alloc[UInt8](embed_dim * (sc_size // 2))
+    var sc_gate_scales = alloc[Float32](sc_size * (embed_dim // 32))
+    var sc_up_scales = alloc[Float32](sc_size * (embed_dim // 32))
+    var sc_down_scales = alloc[Float32](embed_dim * (sc_size // 32))
+    var sc_pre_norm = alloc[Float32](embed_dim)
+    
+    var buf_normed = alloc[Float32](embed_dim)
+    var buf_gate = alloc[Float32](sc_size)
+    var buf_up = alloc[Float32](sc_size)
+    var buf_gated = alloc[Float32](sc_size)
+    var buf_down = alloc[Float32](embed_dim)
+    var sc_out = alloc[Float32](embed_dim)
+    
+    for i in range(embed_dim):
+        inputs_embeds[i] = Float32(0.01 * (i % 3))
+        soft_embeds[i] = Float32(0.02 * (i % 5))
+        sc_pre_norm[i] = Float32(1.0)
+    for i in range(sc_size * (embed_dim // 2)):
+        sc_gate_packed[i] = UInt8(128)
+        sc_up_packed[i] = UInt8(128)
+    for i in range(embed_dim * (sc_size // 2)):
+        sc_down_packed[i] = UInt8(128)
+    for i in range(sc_size * (embed_dim // 32)):
+        sc_gate_scales[i] = Float32(0.1)
+        sc_up_scales[i] = Float32(0.1)
+    for i in range(embed_dim * (sc_size // 32)):
+        sc_down_scales[i] = Float32(0.1)
+        
+    sc_forward_diffusion(
+        inputs_embeds, soft_embeds,
+        sc_gate_packed, sc_up_packed, sc_down_packed,
+        sc_gate_scales, sc_up_scales, sc_down_scales,
+        sc_pre_norm,
+        buf_normed, buf_gate, buf_up, buf_gated, buf_down,
+        sc_out,
+        embed_dim, sc_size, 4
+    )
+    
+    var acc: Float32 = 0.0
+    for i in range(embed_dim):
+        acc += sc_out[i] * sc_out[i]
+    var rms = sqrt(acc / Float32(embed_dim) + 1e-6)
+    var diff = abs(rms - 1.0)
+    print("test_sc_forward debug: rms =", rms, "diff =", diff)
+    assert_true(diff <= 5e-3, "sc_out post-norm not unit variance")
+    
+    inputs_embeds.free()
+    soft_embeds.free()
+    sc_gate_packed.free()
+    sc_up_packed.free()
+    sc_down_packed.free()
+    sc_gate_scales.free()
+    sc_up_scales.free()
+    sc_down_scales.free()
+    sc_pre_norm.free()
+    buf_normed.free()
+    buf_gate.free()
+    buf_up.free()
+    buf_gated.free()
+    buf_down.free()
+    sc_out.free()
+    print("test_sc_forward passed!")
+
+def test_probs_to_soft_embed() raises:
+    print("Running test_probs_to_soft_embed...")
+    var vocab_size = 128
+    var embed_dim = 256
+    
+    var probs = alloc[Float32](vocab_size)
+    var embed_packed = alloc[UInt8](vocab_size * (embed_dim // 2))
+    var embed_scales = alloc[Float32](vocab_size * (embed_dim // 32))
+    var sc_out = alloc[Float32](embed_dim)
+    
+    for i in range(vocab_size):
+        probs[i] = 0.0
+    probs[5] = 1.0
+    
+    for i in range(vocab_size * (embed_dim // 2)):
+        embed_packed[i] = UInt8(136)
+    var row5_start = 5 * (embed_dim // 2)
+    for i in range(16):
+        embed_packed[row5_start + i] = UInt8(137)
+        
+    for i in range(vocab_size * (embed_dim // 32)):
+        embed_scales[i] = Float32(0.5)
+        
+    probs_to_soft_embed_diffusion(probs, embed_packed, embed_scales, sc_out, vocab_size, embed_dim, 1)
+    
+    for i in range(32):
+        if i % 2 == 0:
+            assert_equal(sc_out[i], Float32(0.5))
+        else:
+            assert_equal(sc_out[i], Float32(0.0))
+            
+    probs.free()
+    embed_packed.free()
+    embed_scales.free()
+    sc_out.free()
+    print("test_probs_to_soft_embed passed!")
+
 def main() raises:
     print("=========================================================")
     print("               GEMMA 4 KERNEL TEST SUITE                 ")
@@ -1914,6 +3179,25 @@ def main() raises:
     test_block_sparsity_regression()
     test_early_exit()
     test_gpu_integration()
+    
+    print("---------------------------------------------------------")
+    print("              DIFFUSION GEMMA KERNEL TESTS               ")
+    print("---------------------------------------------------------")
+    test_rms_norm_batch()
+    test_rms_norm_noscale_batch()
+    test_gelu_and_mul_batch()
+    test_q4_gemv_cpu()
+    test_q4_gemv_batch()
+    test_q4_gemv_small_b()
+    test_q4_gemv_tiled()
+    test_q4_gemv_moe_dispatch()
+    test_get_top_k()
+    test_sc_forward()
+    test_probs_to_soft_embed()
+    test_unpack()
+    test_moe_config()
+    test_string_padding()
     print("=========================================================")
     print("        ALL KERNEL MATH TESTS PASSED SUCCESSFULLY!       ")
     print("=========================================================")
+
