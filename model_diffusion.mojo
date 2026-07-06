@@ -1744,6 +1744,12 @@ def pad_left(s: String, width: Int) -> String:
     return res
 
 def main() raises:
+    var use_gpu = True
+    var cmd_args = std.sys.argv()
+    for idx in range(1, len(cmd_args)):
+        if cmd_args[idx] == "--cpu":
+            use_gpu = False
+
     var num_tasks = num_physical_cores()
     print("=========================================================")
     print("   DIFFUSIONGEMMA 26B-A4B-IT  CANVAS DIFFUSION ENGINE   ")
@@ -1754,6 +1760,10 @@ def main() raises:
     print("Number of Experts:   128 Experts (Top-8 Router routing)")
     print("Canvas Mode:         256-token canvas, 48 max denoise steps")
     print("Self-Conditioning:  2112-dim gated MLP, RAM-resident Q4_0")
+    if use_gpu:
+        print("Execution Mode:      Hybrid CPU-iGPU (Attention on iGPU via AMD KFD)")
+    else:
+        print("Execution Mode:      CPU fallbacks (Multi-threaded tiled kernels)")
     print("---------------------------------------------------------")
 
     var CONFIG = MoEConfig[]()
@@ -2380,91 +2390,104 @@ def main() raises:
                 var layer_cache_offset = kv_cache_offsets[l]
                 var seq_len = num_prompt_tokens + CANVAS_LEN
                 var q_size = layer_heads * layer_head_dim
+                var clflush = gpu_ctx.cpu_clflush
+                var sfence = gpu_ctx.cpu_sfence
 
                 var tl_qkv = std.time.perf_counter()
                 # Phase 1a: Batched attention input norm + QKV projections
                 rms_norm_batch(canvas_hidden, weights.input_layernorm_weight, canvas_norm, CANVAS_LEN, CONFIG.embed_dim)
                 
-                # Contiguous CPU cache flush on canvas_norm before enqueuing matmuls
-                var clflush = gpu_ctx.cpu_clflush
-                var sfence = gpu_ctx.cpu_sfence
-                var base_norm = (canvas_norm.__int__() // 64) * 64
-                var end_norm = canvas_norm.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
-                while base_norm < end_norm:
-                    _ = clflush(base_norm)
-                    base_norm += 64
-                _ = sfence(0)
+                if use_gpu:
+                    # Contiguous CPU cache flush on canvas_norm before enqueuing matmuls
+                    var base_norm = (canvas_norm.__int__() // 64) * 64
+                    var end_norm = canvas_norm.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
+                    while base_norm < end_norm:
+                        _ = clflush(base_norm)
+                        base_norm += 64
+                    _ = sfence(0)
 
-                # Asynchronously enqueue Q, K, and V projections for all tokens on GPU
-                var slots_q = InlineArray[Int, 256](uninitialized=True)
-                var slots_k = InlineArray[Int, 256](uninitialized=True)
-                var slots_v = InlineArray[Int, 256](uninitialized=True)
-                
-                for t in range(CANVAS_LEN):
-                    slots_q[t] = gpu_ctx.enqueue_matmul(
-                        weights.wq_packed.__int__(),
-                        weights.wq_scales.__int__(),
-                        canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                        canvas_q.__int__() + t * MAX_Q_SIZE * 4,
-                        CONFIG.embed_dim,
-                        q_size,
-                        flush_cache=False
-                    )
-                    slots_k[t] = gpu_ctx.enqueue_matmul(
-                        weights.wk_packed.__int__(),
-                        weights.wk_scales.__int__(),
-                        canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                        canvas_k.__int__() + t * MAX_KV_SIZE * 4,
-                        CONFIG.embed_dim,
-                        kv_stride,
-                        flush_cache=False
-                    )
-                    if not is_global:
-                        slots_v[t] = gpu_ctx.enqueue_matmul(
-                            weights.wv_packed.__int__(),
-                            weights.wv_scales.__int__(),
+                    # Asynchronously enqueue Q, K, and V projections for all tokens on GPU
+                    var slots_q = InlineArray[Int, 256](uninitialized=True)
+                    var slots_k = InlineArray[Int, 256](uninitialized=True)
+                    var slots_v = InlineArray[Int, 256](uninitialized=True)
+                    
+                    for t in range(CANVAS_LEN):
+                        slots_q[t] = gpu_ctx.enqueue_matmul(
+                            weights.wq_packed.__int__(),
+                            weights.wq_scales.__int__(),
                             canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                            canvas_v.__int__() + t * MAX_KV_SIZE * 4,
+                            canvas_q.__int__() + t * MAX_Q_SIZE * 4,
+                            CONFIG.embed_dim,
+                            q_size,
+                            flush_cache=False
+                        )
+                        slots_k[t] = gpu_ctx.enqueue_matmul(
+                            weights.wk_packed.__int__(),
+                            weights.wk_scales.__int__(),
+                            canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
+                            canvas_k.__int__() + t * MAX_KV_SIZE * 4,
                             CONFIG.embed_dim,
                             kv_stride,
                             flush_cache=False
                         )
-                
-                # Wait for GPU completion of Q and K projections
-                for t in range(CANVAS_LEN):
-                    gpu_ctx.wait_matmul(slots_q[t], canvas_q.__int__() + t * MAX_Q_SIZE * 4, q_size, flush_cache=False)
-                    gpu_ctx.wait_matmul(slots_k[t], canvas_k.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
-                
-                if is_global:
+                        if not is_global:
+                            slots_v[t] = gpu_ctx.enqueue_matmul(
+                                weights.wv_packed.__int__(),
+                                weights.wv_scales.__int__(),
+                                canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
+                                canvas_v.__int__() + t * MAX_KV_SIZE * 4,
+                                CONFIG.embed_dim,
+                                kv_stride,
+                                flush_cache=False
+                            )
+                    
+                    # Wait for GPU completion of Q and K projections
                     for t in range(CANVAS_LEN):
-                        var v_ptr = canvas_v + t * MAX_KV_SIZE
-                        var k_ptr = canvas_k + t * MAX_KV_SIZE
-                        for i in range(0, kv_stride, 8):
-                            v_ptr.store[8](i, k_ptr.load[8](i))
+                        gpu_ctx.wait_matmul(slots_q[t], canvas_q.__int__() + t * MAX_Q_SIZE * 4, q_size, flush_cache=False)
+                        gpu_ctx.wait_matmul(slots_k[t], canvas_k.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
+                    
+                    if is_global:
+                        for t in range(CANVAS_LEN):
+                            var v_ptr = canvas_v + t * MAX_KV_SIZE
+                            var k_ptr = canvas_k + t * MAX_KV_SIZE
+                            for i in range(0, kv_stride, 8):
+                                v_ptr.store[8](i, k_ptr.load[8](i))
+                    else:
+                        for t in range(CANVAS_LEN):
+                            gpu_ctx.wait_matmul(slots_v[t], canvas_v.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
+
+                    # Contiguous CPU cache invalidate on canvas_q, canvas_k, and canvas_v
+                    var base_q = (canvas_q.__int__() // 64) * 64
+                    var end_q = canvas_q.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
+                    while base_q < end_q:
+                        _ = clflush(base_q)
+                        base_q += 64
+
+                    var base_k = (canvas_k.__int__() // 64) * 64
+                    var end_k = canvas_k.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
+                    while base_k < end_k:
+                        _ = clflush(base_k)
+                        base_k += 64
+
+                    if not is_global:
+                        var base_v = (canvas_v.__int__() // 64) * 64
+                        var end_v = canvas_v.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
+                        while base_v < end_v:
+                            _ = clflush(base_v)
+                            base_v += 64
+                    _ = sfence(0)
                 else:
-                    for t in range(CANVAS_LEN):
-                        gpu_ctx.wait_matmul(slots_v[t], canvas_v.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
-
-                # Contiguous CPU cache invalidate on canvas_q, canvas_k, and canvas_v
-                var base_q = (canvas_q.__int__() // 64) * 64
-                var end_q = canvas_q.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
-                while base_q < end_q:
-                    _ = clflush(base_q)
-                    base_q += 64
-
-                var base_k = (canvas_k.__int__() // 64) * 64
-                var end_k = canvas_k.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
-                while base_k < end_k:
-                    _ = clflush(base_k)
-                    base_k += 64
-
-                if not is_global:
-                    var base_v = (canvas_v.__int__() // 64) * 64
-                    var end_v = canvas_v.__int__() + (CANVAS_LEN * MAX_KV_SIZE * 4)
-                    while base_v < end_v:
-                        _ = clflush(base_v)
-                        base_v += 64
-                _ = sfence(0)
+                    # CPU Fallback using General Tiled batched q4 GEMV
+                    q4_gemv_tiled[8](weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, CANVAS_LEN, CONFIG.embed_dim, q_size, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE)
+                    q4_gemv_tiled[8](weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE)
+                    if is_global:
+                        for t in range(CANVAS_LEN):
+                            var v_ptr = canvas_v + t * MAX_KV_SIZE
+                            var k_ptr = canvas_k + t * MAX_KV_SIZE
+                            for i in range(0, kv_stride, 8):
+                                v_ptr.store[8](i, k_ptr.load[8](i))
+                    else:
+                        q4_gemv_tiled[8](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, CANVAS_LEN, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE)
                 var tl_qkv_end = std.time.perf_counter()
 
                 # Phase 1b: Head norms + RoPE + KV cache write (per-token, element-wise)
@@ -2537,36 +2560,40 @@ def main() raises:
 
                 var tl_attn_end = std.time.perf_counter()
 
-                # Contiguous CPU cache flush on canvas_attn_out before Wo projection
-                var base_attn_out = (canvas_attn_out.__int__() // 64) * 64
-                var end_attn_out = canvas_attn_out.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
-                while base_attn_out < end_attn_out:
-                    _ = clflush(base_attn_out)
-                    base_attn_out += 64
-                _ = sfence(0)
+                if use_gpu:
+                    # Contiguous CPU cache flush on canvas_attn_out before Wo projection
+                    var base_attn_out = (canvas_attn_out.__int__() // 64) * 64
+                    var end_attn_out = canvas_attn_out.__int__() + (CANVAS_LEN * MAX_Q_SIZE * 4)
+                    while base_attn_out < end_attn_out:
+                        _ = clflush(base_attn_out)
+                        base_attn_out += 64
+                    _ = sfence(0)
 
-                # Phase 2b: Batched Wo projection + post-attn norm + residual
-                var slots_o = InlineArray[Int, 256](uninitialized=True)
-                for t in range(CANVAS_LEN):
-                    slots_o[t] = gpu_ctx.enqueue_matmul(
-                        weights.wo_packed.__int__(),
-                        weights.wo_scales.__int__(),
-                        canvas_attn_out.__int__() + t * MAX_Q_SIZE * 4,
-                        canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4,
-                        q_size,
-                        CONFIG.embed_dim,
-                        flush_cache=False
-                    )
-                for t in range(CANVAS_LEN):
-                    gpu_ctx.wait_matmul(slots_o[t], canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4, CONFIG.embed_dim, flush_cache=False)
+                    # Phase 2b: Batched Wo projection + post-attn norm + residual
+                    var slots_o = InlineArray[Int, 256](uninitialized=True)
+                    for t in range(CANVAS_LEN):
+                        slots_o[t] = gpu_ctx.enqueue_matmul(
+                            weights.wo_packed.__int__(),
+                            weights.wo_scales.__int__(),
+                            canvas_attn_out.__int__() + t * MAX_Q_SIZE * 4,
+                            canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4,
+                            q_size,
+                            CONFIG.embed_dim,
+                            flush_cache=False
+                        )
+                    for t in range(CANVAS_LEN):
+                        gpu_ctx.wait_matmul(slots_o[t], canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4, CONFIG.embed_dim, flush_cache=False)
 
-                # Contiguous CPU cache invalidate on canvas_proj_attn
-                var base_proj = (canvas_proj_attn.__int__() // 64) * 64
-                var end_proj = canvas_proj_attn.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
-                while base_proj < end_proj:
-                    _ = clflush(base_proj)
-                    base_proj += 64
-                _ = sfence(0)
+                    # Contiguous CPU cache invalidate on canvas_proj_attn
+                    var base_proj = (canvas_proj_attn.__int__() // 64) * 64
+                    var end_proj = canvas_proj_attn.__int__() + (CANVAS_LEN * CONFIG.embed_dim * 4)
+                    while base_proj < end_proj:
+                        _ = clflush(base_proj)
+                        base_proj += 64
+                    _ = sfence(0)
+                else:
+                    # Phase 2b: CPU Fallback using General Tiled batched q4 GEMV
+                    q4_gemv_tiled[8](weights.wo_packed, weights.wo_scales, canvas_attn_out, canvas_proj_attn, CANVAS_LEN, q_size, CONFIG.embed_dim, num_tasks, in_stride=MAX_Q_SIZE, out_stride=CONFIG.embed_dim)
                 rms_norm_batch(canvas_proj_attn, weights.post_attention_layernorm_weight, canvas_proj_attn, CANVAS_LEN, CONFIG.embed_dim)
                 for t in range(CANVAS_LEN):
                     var hidden = canvas_hidden + t * CONFIG.embed_dim
