@@ -1228,29 +1228,44 @@ struct MoELayerWeights:
 # -----------------------------------------------------------------------------
 
 @always_inline
-def rms_norm(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32
+](
+    x: UnsafePointer[Scalar[in_type], _],
+    w: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
+    size: Int,
+):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
-        var v = x.load[8](i)
+        var v = x.load[8](i).cast[DType.float32]()
         acc = acc + v * v
     var sum_sq = acc.reduce_add()
     var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
     for i in range(0, size, 8):
-        var v = x.load[8](i)
+        var v = x.load[8](i).cast[DType.float32]()
         var weight = w.load[8](i)
-        out_ptr.store[8](i, v * inv_rms * weight)
+        out_ptr.store[8](i, (v * inv_rms * weight).cast[out_type]())
 
 @always_inline
-def rms_norm_noscale(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
+def rms_norm_noscale[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32
+](
+    x: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
+    size: Int,
+):
     var acc = SIMD[DType.float32, 8](0.0)
     for i in range(0, size, 8):
-        var v = x.load[8](i)
+        var v = x.load[8](i).cast[DType.float32]()
         acc = acc + v * v
     var sum_sq = acc.reduce_add()
     var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
     for i in range(0, size, 8):
-        var v = x.load[8](i)
-        out_ptr.store[8](i, v * inv_rms)
+        var v = x.load[8](i).cast[DType.float32]()
+        out_ptr.store[8](i, (v * inv_rms).cast[out_type]())
 
 @always_inline
 def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
@@ -1444,11 +1459,16 @@ def q4_gemv_batch(
 # against all B active token vectors in registers, and does a single
 # horizontal reduction per row at the end of the row loop.
 @always_inline
-def q4_gemv_small_b[MAX_B: Int](
+@always_inline
+def q4_gemv_small_b[
+    MAX_B: Int,
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
-    X: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    X: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
     B: Int,
     c_in: Int,
     c_out: Int,
@@ -1501,14 +1521,14 @@ def q4_gemv_small_b[MAX_B: Int](
                 comptime for i in range(MAX_B):
                     if i < B:
                         var x_base = i * x_stride + x_offset_base
-                        acc[i] = acc[i] + w0 * X.load[8](x_base)
-                        acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
-                        acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
-                        acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
+                        acc[i] = acc[i] + w0 * X.load[8](x_base).cast[DType.float32]()
+                        acc[i] = acc[i] + w1 * X.load[8](x_base + 8).cast[DType.float32]()
+                        acc[i] = acc[i] + w2 * X.load[8](x_base + 16).cast[DType.float32]()
+                        acc[i] = acc[i] + w3 * X.load[8](x_base + 24).cast[DType.float32]()
 
             comptime for i in range(MAX_B):
                 if i < B:
-                    out_ptr[i * o_stride + r] = acc[i].reduce_add()
+                    out_ptr[i * o_stride + r] = acc[i].reduce_add().cast[out_type]()
 
     if tasks == 1:
         worker(0)
@@ -1518,11 +1538,14 @@ def q4_gemv_small_b[MAX_B: Int](
 # Dynamically dispatches to the most narrow specialized small-batch kernel,
 # avoiding weight reload over-fetch loops by keeping weight loading to exactly once.
 @always_inline
-def q4_gemv_moe_dispatch(
+def q4_gemv_moe_dispatch[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
-    X: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    X: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
     B: Int,
     c_in: Int,
     c_out: Int,
@@ -1531,24 +1554,24 @@ def q4_gemv_moe_dispatch(
     out_stride: Int = -1,
 ):
     if B <= 1:
-        q4_gemv_small_b[1](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[1, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 2:
-        q4_gemv_small_b[2](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[2, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 4:
-        q4_gemv_small_b[4](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[4, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 8:
-        q4_gemv_small_b[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[8, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 12:
-        q4_gemv_small_b[12](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[12, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 16:
-        q4_gemv_small_b[16](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[16, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 24:
-        q4_gemv_small_b[24](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[24, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     elif B <= 32:
-        q4_gemv_small_b[32](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_small_b[32, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
     else:
         # Fallback to general tiled version
-        q4_gemv_tiled[8](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
+        q4_gemv_tiled[8, in_type, out_type](W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride)
 
 # Tiled batched q4 GEMV. Per output row, processes B in tiles of TILE_B,
 # keeping TILE_B SIMD8 accumulators in registers. Each weight block is
@@ -1557,11 +1580,15 @@ def q4_gemv_moe_dispatch(
 # per (row, b) at the end. Contrast with q4_gemv_batch, which does
 # B * c_in_blocks * 4 reduce_adds per row — dominant cost at small B.
 @always_inline
-def q4_gemv_tiled[TILE_B: Int](
+def q4_gemv_tiled[
+    TILE_B: Int,
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
     W_packed: UnsafePointer[UInt8, _],
     scales: UnsafePointer[Float32, _],
-    X: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
+    X: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
     B: Int,
     c_in: Int,
     c_out: Int,
@@ -1618,14 +1645,14 @@ def q4_gemv_tiled[TILE_B: Int](
                     comptime for i in range(TILE_B):
                         if i < b_count:
                             var x_base = (b_outer + i) * x_stride + x_offset_base
-                            acc[i] = acc[i] + w0 * X.load[8](x_base)
-                            acc[i] = acc[i] + w1 * X.load[8](x_base + 8)
-                            acc[i] = acc[i] + w2 * X.load[8](x_base + 16)
-                            acc[i] = acc[i] + w3 * X.load[8](x_base + 24)
+                            acc[i] = acc[i] + w0 * X.load[8](x_base).cast[DType.float32]()
+                            acc[i] = acc[i] + w1 * X.load[8](x_base + 8).cast[DType.float32]()
+                            acc[i] = acc[i] + w2 * X.load[8](x_base + 16).cast[DType.float32]()
+                            acc[i] = acc[i] + w3 * X.load[8](x_base + 24).cast[DType.float32]()
 
                 comptime for i in range(TILE_B):
                     if i < b_count:
-                        out_ptr[(b_outer + i) * o_stride + r] = acc[i].reduce_add()
+                        out_ptr[(b_outer + i) * o_stride + r] = acc[i].reduce_add().cast[out_type]()
 
     if tasks == 1:
         worker(0)
@@ -1633,31 +1660,67 @@ def q4_gemv_tiled[TILE_B: Int](
         parallelize[worker](tasks)
 
 @always_inline
-def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
-    for i in range(0, size, 8):
-        var x1 = h1.load[8](i)
-        var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
+def gelu_and_mul[
+    type: DType = DType.float32
+](
+    h1: UnsafePointer[Scalar[type], _],
+    h2: UnsafePointer[Scalar[type], _],
+    out_ptr: UnsafePointer[Scalar[type], MutExternalOrigin],
+    size: Int,
+):
+    comptime width = 16 if type == DType.float16 else 8
+    for i in range(0, size, width):
+        var x1 = h1.load[width](i).cast[DType.float32]()
+        var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, width](-1.702) * x1))
         var gelu = x1 * sig
-        out_ptr.store[8](i, gelu * h2.load[8](i))
+        var h2_val = h2.load[width](i).cast[DType.float32]()
+        out_ptr.store[width](i, (gelu * h2_val).cast[type]())
 
 @always_inline
-def gelu_and_mul_batch(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+def gelu_and_mul_batch[
+    type: DType = DType.float32
+](
+    h1: UnsafePointer[Scalar[type], _],
+    h2: UnsafePointer[Scalar[type], _],
+    out_ptr: UnsafePointer[Scalar[type], MutExternalOrigin],
+    B: Int,
+    dim: Int,
+):
+    comptime width = 16 if type == DType.float16 else 8
     for b in range(B):
         var base = b * dim
-        for i in range(0, dim, 8):
-            var x1 = h1.load[8](base + i)
-            var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * x1))
-            out_ptr.store[8](base + i, x1 * sig * h2.load[8](base + i))
+        for i in range(0, dim, width):
+            var x1 = h1.load[width](base + i).cast[DType.float32]()
+            var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, width](-1.702) * x1))
+            var h2_val = h2.load[width](base + i).cast[DType.float32]()
+            out_ptr.store[width](base + i, (x1 * sig * h2_val).cast[type]())
 
 @always_inline
-def rms_norm_batch(x: UnsafePointer[Float32, _], w: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+def rms_norm_batch[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
+    x: UnsafePointer[Scalar[in_type], _],
+    w: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
+    B: Int,
+    dim: Int,
+):
     for b in range(B):
-        rms_norm(x + b * dim, w, out_ptr + b * dim, dim)
+        rms_norm[in_type, out_type](x + b * dim, w, out_ptr + b * dim, dim)
 
 @always_inline
-def rms_norm_noscale_batch(x: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], B: Int, dim: Int):
+def rms_norm_noscale_batch[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
+    x: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutExternalOrigin],
+    B: Int,
+    dim: Int,
+):
     for b in range(B):
-        rms_norm_noscale(x + b * dim, out_ptr + b * dim, dim)
+        rms_norm_noscale[in_type, out_type](x + b * dim, out_ptr + b * dim, dim)
 
 @always_inline
 def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
@@ -2149,23 +2212,23 @@ def main() raises:
     var temp_packed_k = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_k_buf.cpu_addr)
     var temp_packed_v = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_v_buf.cpu_addr)
     # Batched FFN intermediates
-    var canvas_ffn_gate = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
-    var canvas_ffn_up = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
-    var canvas_ffn_gated = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
-    var canvas_ffn_down = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_shared_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_moe_in = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_moe_out = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_moe_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_combined = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var canvas_ffn_out = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_ffn_gate = alloc[Float16](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_up = alloc[Float16](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_gated = alloc[Float16](CANVAS_LEN * CONFIG.standard_mlp_dim)
+    var canvas_ffn_down = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_shared_norm = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_in = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_out = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_moe_norm = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_combined = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var canvas_ffn_out = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
     # Per-token attention scores buffer for parallelized attention
     var canvas_attn_scores = alloc[Float32](CANVAS_LEN * CONFIG.max_seq_len)
     # MoE Batched Expert scratch buffers
-    var temp_x = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    var temp_gate_up = alloc[Float32](CANVAS_LEN * CONFIG.expert_mlp_dim * 2)
-    var temp_act = alloc[Float32](CANVAS_LEN * CONFIG.expert_mlp_dim)
-    var temp_down = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var temp_x = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var temp_gate_up = alloc[Float16](CANVAS_LEN * CONFIG.expert_mlp_dim * 2)
+    var temp_act = alloc[Float16](CANVAS_LEN * CONFIG.expert_mlp_dim)
+    var temp_down = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
     var canvas_router_scores = alloc[Float32](CANVAS_LEN * CONFIG.num_experts)
     var canvas_top_idx = alloc[Int](CANVAS_LEN * CONFIG.top_k_experts)
     var canvas_top_val = alloc[Float32](CANVAS_LEN * CONFIG.top_k_experts)
@@ -2865,7 +2928,7 @@ def main() raises:
                 for t in range(CANVAS_LEN):
                     var dst = canvas_moe_out + t * CONFIG.embed_dim
                     for j in range(0, CONFIG.embed_dim, 8):
-                        dst.store[8](j, SIMD[DType.float32, 8](0.0))
+                        dst.store[8](j, SIMD[DType.float16, 8](0.0))
 
                 # 6. Sequential expert loop (no closures here!)
                 for e in range(128):
@@ -2931,7 +2994,8 @@ def main() raises:
                         var src = temp_down + i * CONFIG.embed_dim
                         var dst = canvas_moe_out + t * CONFIG.embed_dim
                         for j in range(0, CONFIG.embed_dim, 8):
-                            dst.store[8](j, dst.load[8](j) + src.load[8](j) * SIMD[DType.float32, 8](w_e))
+                            var val = dst.load[8](j).cast[DType.float32]() + src.load[8](j).cast[DType.float32]() * w_e
+                            dst.store[8](j, val.cast[DType.float16]())
 
                 # Phase 2e: Batched combine + final norm + residual + scalar
                 var tl_moe_end = std.time.perf_counter()
@@ -2948,7 +3012,7 @@ def main() raises:
                     rms_norm(combined, weights.post_feedforward_layernorm_weight, ffn, CONFIG.embed_dim)
                     var scalar_vec = SIMD[DType.float32, 8](scalar)
                     for i in range(0, CONFIG.embed_dim, 8):
-                        hidden.store[8](i, (hidden.load[8](i) + ffn.load[8](i)) * scalar_vec)
+                        hidden.store[8](i, (hidden.load[8](i) + ffn.load[8](i).cast[DType.float32]()) * scalar_vec)
 
                 if l == 0 or l == 15 or l == 29:
                     print("    layer ", l, " qkv=", String((tl_qkv_end - tl_qkv) * 1000), "ms",
