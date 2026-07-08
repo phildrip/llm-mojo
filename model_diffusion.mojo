@@ -219,6 +219,7 @@ struct hsa_kernel_dispatch_packet_t(Copyable, Movable):
         self.completion_signal = completion_signal
 
 struct GPUContext(Movable):
+    var has_queue: Bool
     var libc: OwnedDLHandle
     var cpu_fence_lib: OwnedDLHandle
     var kfd_fd: Int32
@@ -278,7 +279,8 @@ struct GPUContext(Movable):
     comptime KFD_IOC_ALLOC_MEM_FLAGS_COHERENT = 1 << 26
     comptime KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED = 1 << 25
 
-    def __init__(out self) raises:
+    def __init__(out self, init_queue: Bool = True) raises:
+        self.has_queue = init_queue
         self.libc = OwnedDLHandle("libc.so.6")
         self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
         
@@ -291,6 +293,25 @@ struct GPUContext(Movable):
         self.c_errno_loc = self.libc.get_function[def() thin abi("C") -> Int]("__errno_location")
         self.cpu_sfence = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
         self.cpu_clflush = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
+
+        self.kfd_fd = -1
+        self.drm_fd = -1
+        self.gpu_id = 0
+        self.queue_id = 0
+        self.doorbell_mmap_addr = 0
+        self.doorbell_reg_addr = 0
+        self.packet_idx = 0
+        self.ring_buf = GPUMemoryBuffer()
+        self.gart_buf = GPUMemoryBuffer()
+        self.cwsr_buf = GPUMemoryBuffer()
+        self.eop_buf = GPUMemoryBuffer()
+        self.hsaco_buf = GPUMemoryBuffer()
+        self.kernarg_buf = GPUMemoryBuffer()
+        self.completion_buf = GPUMemoryBuffer()
+        self.usleep_fn = self.libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
+
+        if not init_queue:
+            return
 
         var kfd_path = "/dev/kfd"
         var kfd_path_bytes = kfd_path.as_bytes()
@@ -606,6 +627,7 @@ struct GPUContext(Movable):
         temp_file_buf.free()
 
     def __init__(out self, *, deinit take: Self):
+        self.has_queue = take.has_queue
         self.libc = take.libc^
         self.cpu_fence_lib = take.cpu_fence_lib^
         self.kfd_fd = take.kfd_fd
@@ -634,30 +656,37 @@ struct GPUContext(Movable):
         self.doorbell_reg_addr = take.doorbell_reg_addr
 
     def __del__(deinit self):
-        # Destroy queue first
-        var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
-        destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=self.queue_id)
-        _ = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
-        destroy_args_ptr.free()
+        if self.has_queue:
+            # Destroy queue first
+            var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
+            destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=self.queue_id)
+            _ = self.c_ioctl(self.kfd_fd, self.AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
+            destroy_args_ptr.free()
 
-        _ = self.c_munmap(self.doorbell_mmap_addr, 0x2000)
+            _ = self.c_munmap(self.doorbell_mmap_addr, 0x2000)
 
-        # Free all queue buffers
-        try:
-            self.free_gpu_buffer(self.kernarg_buf)
-            self.free_gpu_buffer(self.completion_buf)
-            self.free_gpu_buffer(self.hsaco_buf)
-            self.free_gpu_buffer(self.eop_buf)
-            self.free_gpu_buffer(self.cwsr_buf)
-            self.free_gpu_buffer(self.gart_buf)
-            self.free_gpu_buffer(self.ring_buf)
-        except:
-            pass
+            # Free all queue buffers
+            try:
+                self.free_gpu_buffer(self.kernarg_buf)
+                self.free_gpu_buffer(self.completion_buf)
+                self.free_gpu_buffer(self.hsaco_buf)
+                self.free_gpu_buffer(self.eop_buf)
+                self.free_gpu_buffer(self.cwsr_buf)
+                self.free_gpu_buffer(self.gart_buf)
+                self.free_gpu_buffer(self.ring_buf)
+            except:
+                pass
 
-        _ = self.c_close(self.kfd_fd)
-        _ = self.c_close(self.drm_fd)
+            _ = self.c_close(self.kfd_fd)
+            _ = self.c_close(self.drm_fd)
 
     def alloc_gpu_buffer(self, size: Int, flags: UInt32, cpu_access: Bool) raises -> GPUMemoryBuffer:
+        if not self.has_queue:
+            var cpu_addr = self.c_mmap(0, size, self.PROT_READ | self.PROT_WRITE, self.MAP_PRIVATE | self.MAP_ANONYMOUS, -1, 0)
+            if cpu_addr == -1 or cpu_addr == 0:
+                raise Error("CPU-only mmap failed")
+            return GPUMemoryBuffer(cpu_addr, size, 0, cpu_addr)
+
         var va_addr = self.c_mmap(0, size, self.PROT_NONE, self.MAP_PRIVATE | self.MAP_ANONYMOUS, -1, 0)
         if va_addr == -1 or va_addr == 0:
             raise Error("mmap failed")
@@ -692,6 +721,10 @@ struct GPUContext(Movable):
         return GPUMemoryBuffer(va_addr, size, handle, cpu_addr)
 
     def free_gpu_buffer(self, buf: GPUMemoryBuffer) raises:
+        if not self.has_queue:
+            _ = self.c_munmap(buf.cpu_addr, buf.size)
+            return
+
         var unmap_device_ids_ptr = alloc[UInt32](1)
         unmap_device_ids_ptr[0] = self.gpu_id
         var unmap_args_ptr = alloc[kfd_ioctl_unmap_memory_from_gpu_args](1)
@@ -765,7 +798,9 @@ struct GPUContext(Movable):
         kernarg_p[3] = gpu_out_ptr_va
         kernarg_p[4] = UInt64(completion_slot_va_addr)
 
-        var num_workgroups = (batch_size * c_out + 15) // 16
+        var num_row_tiles = (c_out + 15) // 16
+        var num_token_tiles = (batch_size + 15) // 16
+        var num_workgroups = num_row_tiles * num_token_tiles
         if num_workgroups < 1:
             num_workgroups = 1
         var grid_stride = num_workgroups
@@ -1919,9 +1954,15 @@ def main() raises:
     var CONFIG = MoEConfig[]()
 
     # Initialize AMD direct GPU userspace queue
-    print("Initializing direct AMD GPU userspace queue...")
-    var gpu_ctx = GPUContext()
-    print("Direct AMD GPU userspace queue initialized successfully! (GPU ID: " + String(gpu_ctx.gpu_id) + ")")
+    if use_gpu:
+        print("Initializing direct AMD GPU userspace queue...")
+    else:
+        print("Initializing CPU-only context memory structures...")
+    var gpu_ctx = GPUContext(use_gpu)
+    if use_gpu:
+        print("Direct AMD GPU userspace queue initialized successfully! (GPU ID: " + String(gpu_ctx.gpu_id) + ")")
+    else:
+        print("CPU-only context memory structures initialized successfully!")
 
     # Setup SVM Flags
     var base_flags = (GPUContext.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
