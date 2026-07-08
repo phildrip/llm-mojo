@@ -2120,7 +2120,7 @@ def test_gpu_integration() raises:
     for i in range(16384 // 4):
         hsaco_u32_ptr[i] = 0
 
-    var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul.hsaco"
+    var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul_lds.hsaco"
     var hsaco_file_bytes = hsaco_file.as_bytes()
     var hsaco_file_ptr = alloc[UInt8](len(hsaco_file_bytes) + 1)
     for i in range(len(hsaco_file_bytes)):
@@ -2129,25 +2129,25 @@ def test_gpu_integration() raises:
     var hsaco_fd = c_open(hsaco_file_ptr.__int__(), 0)
     hsaco_file_ptr.free()
     if hsaco_fd < 0:
-        raise Error("Failed to open q8_matmul.hsaco")
+        raise Error("Failed to open q8_matmul_lds.hsaco")
 
     var temp_file_buf = alloc[UInt8](8192)
     var bytes_read = c_read(hsaco_fd, temp_file_buf.__int__(), 8192)
     _ = c_close(hsaco_fd)
-    assert_true(bytes_read > 0, "Failed to read any bytes from q8_matmul.hsaco")
+    assert_true(bytes_read > 0, "Failed to read any bytes from q8_matmul_lds.hsaco")
 
     var segment1_src = temp_file_buf
     var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0)
-    for i in range(0xa80):
+    for i in range(0xac0):
         segment1_dst[i] = segment1_src[i]
 
     var segment2_src = temp_file_buf + 0xb00
     var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x1b00)
-    for i in range(0x430):
+    for i in range(0x700):
         segment2_dst[i] = segment2_src[i]
 
-    var segment3_src = temp_file_buf + 0xf30
-    var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x2f30)
+    var segment3_src = temp_file_buf + 0x1200
+    var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=hsaco_buf.cpu_addr + 0x3200)
     for i in range(0x70):
         segment3_dst[i] = segment3_src[i]
 
@@ -2194,6 +2194,7 @@ def test_gpu_integration() raises:
         out_ptr[i] = 0.0
 
     completion_ptr[0] = 0
+    UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_buf.cpu_addr + 4)[0] = 0
 
     # CPU reference values
     var expected_out = alloc[Float32](test_c_out)
@@ -2221,11 +2222,14 @@ def test_gpu_integration() raises:
     kernarg_p[3] = UInt64(out_buf.va_addr)
     kernarg_p[4] = UInt64(completion_buf.va_addr)
 
+    var num_workgroups = (test_c_out + 15) // 16
+
     var kernarg_u32_p = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=kernarg_buf.cpu_addr + 40)
     kernarg_u32_p[0] = UInt32(test_c_in)
     kernarg_u32_p[1] = UInt32(test_c_out)
-    kernarg_u32_p[2] = UInt32(256)
-    kernarg_u32_p[3] = UInt32(1)
+    kernarg_u32_p[2] = UInt32(num_workgroups) # grid_stride in workgroups
+    kernarg_u32_p[3] = UInt32(num_workgroups) # num_workgroups
+    kernarg_u32_p[4] = UInt32(1) # batch_size = 1
 
     _ = cpu_sfence(0)
     _ = cpu_clflush(kernarg_buf.cpu_addr)
@@ -2237,12 +2241,12 @@ def test_gpu_integration() raises:
         workgroup_size_x=256,
         workgroup_size_y=1,
         workgroup_size_z=1,
-        grid_size_x=256,
+        grid_size_x=UInt32(num_workgroups * 256),
         grid_size_y=1,
         grid_size_z=1,
         private_segment_size=0,
-        group_segment_size=0,
-        kernel_object=UInt64(hsaco_buf.va_addr + 0xa40),
+        group_segment_size=2560,
+        kernel_object=UInt64(hsaco_buf.va_addr + 0xa80),
         kernarg_address=UInt64(kernarg_buf.va_addr),
         completion_signal=0
     )

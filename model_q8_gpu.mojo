@@ -424,21 +424,21 @@ struct GPUContext:
         _ = c_close(hsaco_fd)
 
         # Map ELF segments to virtual memory layout (do not copy flat):
-        # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xa80 (covering KD descriptor)
+        # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xac0 (covering KD descriptor)
         var segment1_src = temp_file_buf
         var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
-        for i in range(0xa80):
+        for i in range(0xac0):
             segment1_dst[i] = segment1_src[i]
 
-        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x430 (full instructions payload)
+        # Segment 2 (RX): offset 0xb00, virt_addr 0x1b00, size 0x700 (full instructions payload)
         var segment2_src = temp_file_buf + 0xb00
         var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
-        for i in range(0x430):
+        for i in range(0x700):
             segment2_dst[i] = segment2_src[i]
 
-        # Segment 3 (RW): offset 0xf30, virt_addr 0x2f30, size 0x70
-        var segment3_src = temp_file_buf + 0xf30
-        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f30)
+        # Segment 3 (RW): offset 0x1200, virt_addr 0x3200, size 0x70
+        var segment3_src = temp_file_buf + 0x1200
+        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x3200)
         for i in range(0x70):
             segment3_dst[i] = segment3_src[i]
 
@@ -551,12 +551,13 @@ struct GPUContext:
         out_ptr_addr: Int,
         c_in: Int,
         c_out: Int,
+        batch_size: Int = 1,
     ) raises -> Int:
         var cpu_sfence = self.cpu_sfence_fn
         var cpu_clflush = self.cpu_clflush_fn
 
         # Flush CPU cache lines for input vector x to ensure GPU reads current activations
-        var input_size_bytes = c_in * 4
+        var input_size_bytes = c_in * batch_size * 4
         var base_in = (x_addr // 64) * 64
         var end_in = x_addr + input_size_bytes
         while base_in < end_in:
@@ -592,7 +593,9 @@ struct GPUContext:
         kernarg_p[3] = gpu_out_ptr_va
         kernarg_p[4] = UInt64(completion_slot_va_addr)
 
-        var num_workgroups = 32
+        var num_workgroups = (batch_size * c_out + 255) // 256
+        if num_workgroups < 1:
+            num_workgroups = 1
         var workgroup_size = 256
         var grid_stride = num_workgroups * workgroup_size
 
@@ -601,6 +604,7 @@ struct GPUContext:
         kernarg_u32_p[1] = UInt32(c_out)
         kernarg_u32_p[2] = UInt32(grid_stride)
         kernarg_u32_p[3] = UInt32(num_workgroups)
+        kernarg_u32_p[4] = UInt32(batch_size)
         
         _ = cpu_sfence(0)
         _ = cpu_clflush(kernarg_slot_cpu_addr)
@@ -617,7 +621,7 @@ struct GPUContext:
             grid_size_z=1,
             private_segment_size=0,
             group_segment_size=0,
-            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa40), # KD address!
+            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa80), # KD address at 0xa80!
             kernarg_address=UInt64(kernarg_slot_va_addr),
             completion_signal=0
         )
@@ -649,6 +653,7 @@ struct GPUContext:
         slot: Int,
         out_ptr_addr: Int,
         c_out: Int,
+        batch_size: Int = 1,
     ) raises:
         var cpu_sfence = self.cpu_sfence_fn
         var cpu_clflush = self.cpu_clflush_fn
@@ -682,7 +687,7 @@ struct GPUContext:
                 raise Error("GPU execution timed out in wait_matmul!")
 
         # Flush/invalidate CPU cache lines for output vector out to ensure CPU reads the GPU's results
-        var output_size_bytes = c_out * 4
+        var output_size_bytes = c_out * batch_size * 4
         var base_out = (out_ptr_addr // 64) * 64
         var end_out = out_ptr_addr + output_size_bytes
         while base_out < end_out:
@@ -698,9 +703,10 @@ struct GPUContext:
         out_ptr_addr: Int,
         c_in: Int,
         c_out: Int,
+        batch_size: Int = 1,
     ) raises:
-        var slot = self.enqueue_matmul(W_packed_addr, scales_addr, x_addr, out_ptr_addr, c_in, c_out)
-        self.wait_matmul(slot, out_ptr_addr, c_out)
+        var slot = self.enqueue_matmul(W_packed_addr, scales_addr, x_addr, out_ptr_addr, c_in, c_out, batch_size)
+        self.wait_matmul(slot, out_ptr_addr, c_out, batch_size)
 
 # -----------------------------------------------------------------------------
 # 1. Model Configuration & Memory Offsets

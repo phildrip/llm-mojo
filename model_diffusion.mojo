@@ -568,7 +568,7 @@ struct GPUContext(Movable):
         for i in range(16384 // 4):
             hsaco_u32_ptr[i] = 0
 
-        var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul.hsaco"
+        var hsaco_file = "/home/phil/git/llm-mojo/scratch/q8_matmul_lds.hsaco"
         var hsaco_file_bytes = hsaco_file.as_bytes()
         var hsaco_file_ptr = alloc[UInt8](len(hsaco_file_bytes) + 1)
         for i in range(len(hsaco_file_bytes)):
@@ -577,27 +577,29 @@ struct GPUContext(Movable):
         var hsaco_fd = self.c_open(hsaco_file_ptr.__int__(), 0)
         hsaco_file_ptr.free()
         if hsaco_fd < 0:
-            raise Error("Failed to open q8_matmul.hsaco")
+            raise Error("Failed to open q8_matmul_lds.hsaco")
 
         var temp_file_buf = alloc[UInt8](8192)
         var bytes_read = self.c_read(hsaco_fd, temp_file_buf.__int__(), 8192)
         _ = self.c_close(hsaco_fd)
         if bytes_read <= 0:
             temp_file_buf.free()
-            raise Error("Failed to read any bytes from q8_matmul.hsaco")
+            raise Error("Failed to read any bytes from q8_matmul_lds.hsaco")
 
+        # Map ELF segments to virtual memory layout (do not copy flat):
+        # Segment 1 (RO): offset 0x0, virt_addr 0x0, size 0xac0 (covering KD descriptor)
         var segment1_src = temp_file_buf
         var segment1_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0)
-        for i in range(0xa80):
+        for i in range(0xac0):
             segment1_dst[i] = segment1_src[i]
 
         var segment2_src = temp_file_buf + 0xb00
         var segment2_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x1b00)
-        for i in range(0x430):
+        for i in range(0x700):
             segment2_dst[i] = segment2_src[i]
 
-        var segment3_src = temp_file_buf + 0xf30
-        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x2f30)
+        var segment3_src = temp_file_buf + 0x1200
+        var segment3_dst = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=self.hsaco_buf.cpu_addr + 0x3200)
         for i in range(0x70):
             segment3_dst[i] = segment3_src[i]
 
@@ -719,6 +721,7 @@ struct GPUContext(Movable):
         out_ptr_addr: Int,
         c_in: Int,
         c_out: Int,
+        batch_size: Int = 1,
         flush_cache: Bool = True,
     ) raises -> Int:
         var cpu_sfence = self.cpu_sfence
@@ -726,7 +729,7 @@ struct GPUContext(Movable):
 
         # Flush CPU cache lines for input vector x to ensure GPU reads current activations
         if flush_cache:
-            var input_size_bytes = c_in * 4
+            var input_size_bytes = c_in * batch_size * 4
             var base_in = (x_addr // 64) * 64
             var end_in = x_addr + input_size_bytes
             while base_in < end_in:
@@ -762,15 +765,17 @@ struct GPUContext(Movable):
         kernarg_p[3] = gpu_out_ptr_va
         kernarg_p[4] = UInt64(completion_slot_va_addr)
 
-        var num_workgroups = 32
-        var workgroup_size = 256
-        var grid_stride = num_workgroups * workgroup_size
+        var num_workgroups = (batch_size * c_out + 15) // 16
+        if num_workgroups < 1:
+            num_workgroups = 1
+        var grid_stride = num_workgroups
 
         var kernarg_u32_p = UnsafePointer[UInt32, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr + 40)
         kernarg_u32_p[0] = UInt32(c_in)
         kernarg_u32_p[1] = UInt32(c_out)
-        kernarg_u32_p[2] = UInt32(grid_stride)
-        kernarg_u32_p[3] = UInt32(num_workgroups)
+        kernarg_u32_p[2] = UInt32(grid_stride) # grid_stride in workgroups
+        kernarg_u32_p[3] = UInt32(num_workgroups) # num_workgroups
+        kernarg_u32_p[4] = UInt32(batch_size)
         
         _ = cpu_sfence(0)
         _ = cpu_clflush(kernarg_slot_cpu_addr)
@@ -782,12 +787,12 @@ struct GPUContext(Movable):
             workgroup_size_x=256,    # 256 threads in workgroup
             workgroup_size_y=1,
             workgroup_size_z=1,
-            grid_size_x=UInt32(grid_stride), # Grid size = num_workgroups * 256
+            grid_size_x=UInt32(num_workgroups * 256), # Grid size = num_workgroups * 256
             grid_size_y=1,
             grid_size_z=1,
             private_segment_size=0,
-            group_segment_size=0,
-            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa40), # KD address!
+            group_segment_size=2560,
+            kernel_object=UInt64(self.hsaco_buf.va_addr + 0xa80), # KD address at 0xa80!
             kernarg_address=UInt64(kernarg_slot_va_addr),
             completion_signal=0
         )
@@ -819,6 +824,7 @@ struct GPUContext(Movable):
         slot: Int,
         out_ptr_addr: Int,
         c_out: Int,
+        batch_size: Int = 1,
         flush_cache: Bool = True,
     ) raises:
         var cpu_sfence = self.cpu_sfence
@@ -854,7 +860,7 @@ struct GPUContext(Movable):
 
         # Flush/invalidate CPU cache lines for output vector out to ensure CPU reads the GPU's results
         if flush_cache:
-            var output_size_bytes = c_out * 4
+            var output_size_bytes = c_out * batch_size * 4
             var base_out = (out_ptr_addr // 64) * 64
             var end_out = out_ptr_addr + output_size_bytes
             while base_out < end_out:
@@ -942,8 +948,28 @@ struct MoEConfig[
             offset += self.get_layer_aligned_size(i)
         return offset
 
+    def get_q8_attn_size(self, layer_idx: Int) -> Int:
+        var is_global = self.is_global_layer(layer_idx)
+        var layer_heads = 16
+        var layer_head_dim = 512 if is_global else 256
+        var layer_kv_heads = 2 if is_global else 8
+        
+        var wq_size = layer_heads * layer_head_dim * Self.embed_dim
+        var wk_size = layer_kv_heads * layer_head_dim * Self.embed_dim
+        var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * Self.embed_dim)
+        var wo_size = Self.embed_dim * layer_heads * layer_head_dim
+        
+        var raw_size = wq_size + wk_size + wv_size + wo_size
+        return ((raw_size + 4095) // 4096) * 4096
+
+    def get_q8_attn_offset(self, layer_idx: Int) -> Int:
+        var offset = 0
+        for i in range(layer_idx):
+            offset += self.get_q8_attn_size(i)
+        return offset
+
     @always_inline
-    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[UInt8, _]) -> MoELayerWeights:
+    def get_layer_weights(self, layer_idx: Int, base_ptr: UnsafePointer[UInt8, _], q8_attn_base: Int = 0) -> MoELayerWeights:
         var is_global = self.is_global_layer(layer_idx)
         var layer_heads = 16
         var layer_head_dim = 512 if is_global else 256
@@ -1020,12 +1046,28 @@ struct MoEConfig[
         var router_scale = k_norm + layer_head_dim
         var router_per_expert_scale = router_scale + Self.embed_dim
         var layer_scalar = router_per_expert_scale + 128
+
+        var wq_q8_addr = 0
+        var wk_q8_addr = 0
+        var wv_q8_addr = 0
+        var wo_q8_addr = 0
+        
+        if q8_attn_base != 0:
+            var layer_q8_offset = self.get_q8_attn_offset(layer_idx)
+            wq_q8_addr = q8_attn_base + layer_q8_offset
+            wk_q8_addr = wq_q8_addr + wq_size
+            wv_q8_addr = wk_q8_addr + wk_size
+            wo_q8_addr = wv_q8_addr + wv_size
         
         return MoELayerWeights(
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wq_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wk_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wv_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=wo_packed.__int__()),
+            UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wq_q8_addr),
+            UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wk_q8_addr),
+            UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wv_q8_addr),
+            UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wo_q8_addr),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=w_gate_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=w_up_packed.__int__()),
             UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=w_down_packed.__int__()),
@@ -1069,6 +1111,10 @@ struct MoELayerWeights:
     var wk_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var wv_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var wo_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var wq_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin]
+    var wk_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin]
+    var wv_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin]
+    var wo_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin]
     var w_gate_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var w_up_packed: UnsafePointer[UInt8, MutExternalOrigin]
     var w_down_packed: UnsafePointer[UInt8, MutExternalOrigin]
@@ -1106,6 +1152,10 @@ struct MoELayerWeights:
         wk_packed: UnsafePointer[UInt8, MutExternalOrigin],
         wv_packed: UnsafePointer[UInt8, MutExternalOrigin],
         wo_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        wq_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin],
+        wk_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin],
+        wv_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin],
+        wo_q8: UnsafePointer[Scalar[DType.int8], MutExternalOrigin],
         w_gate_packed: UnsafePointer[UInt8, MutExternalOrigin],
         w_up_packed: UnsafePointer[UInt8, MutExternalOrigin],
         w_down_packed: UnsafePointer[UInt8, MutExternalOrigin],
@@ -1139,6 +1189,10 @@ struct MoELayerWeights:
         self.wk_packed = wk_packed
         self.wv_packed = wv_packed
         self.wo_packed = wo_packed
+        self.wq_q8 = wq_q8
+        self.wk_q8 = wk_q8
+        self.wv_q8 = wv_q8
+        self.wo_q8 = wo_q8
         self.w_gate_packed = w_gate_packed
         self.w_up_packed = w_up_packed
         self.w_down_packed = w_down_packed
@@ -1227,6 +1281,39 @@ def unpack_16bytes(
     w1 = masked_01.shift_left[8]().slice[8]().cast[DType.float32]()
     w2 = masked_23.slice[8]().cast[DType.float32]()
     w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
+@always_inline
+def unpack_q4_to_q8(
+    W_packed: UnsafePointer[UInt8, _],
+    W_q8: UnsafePointer[Scalar[DType.int8], MutUntrackedOrigin],
+    size: Int
+):
+    var steps = size // 32
+    for i in range(steps):
+        var packed_idx = i * 16
+        var unpacked_idx = i * 32
+        var bytes = W_packed.load[16](packed_idx)
+        
+        var repeated_01 = bytes.shuffle[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]()
+        var shifted_01 = repeated_01 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+        var masked_01 = (shifted_01 & 15).cast[DType.int8]() - 8
+        
+        var repeated_23 = bytes.shuffle[8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15]()
+        var shifted_23 = repeated_23 >> SIMD[DType.uint8, 16](0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4)
+        var masked_23 = (shifted_23 & 15).cast[DType.int8]() - 8
+        
+        W_q8.store(unpacked_idx, masked_01)
+        W_q8.store(unpacked_idx + 16, masked_23)
+        
+    var rem = size % 32
+    if rem > 0:
+        var packed_start = steps * 16
+        var unpacked_start = steps * 32
+        for j in range(rem // 2):
+            var b = W_packed[packed_start + j]
+            var w_low = (b & 15).cast[DType.int8]() - 8
+            var w_high = ((b >> 4) & 15).cast[DType.int8]() - 8
+            W_q8.store(unpacked_start + j * 2, w_low)
+            W_q8.store(unpacked_start + j * 2 + 1, w_high)
 
 
 @always_inline
@@ -1792,6 +1879,14 @@ def main() raises:
     var free_c = libc.get_function[def(Int) thin abi("C") -> None]("free")
     var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
 
+    var q8_attn_base: Int = 0
+    var q8_attn_size: Int = 0
+    var q8_attn_gpu_buf = GPUMemoryBuffer()
+    if use_gpu:
+        q8_attn_size = CONFIG.get_q8_attn_offset(CONFIG.num_layers)
+        q8_attn_gpu_buf = gpu_ctx.alloc_gpu_buffer(q8_attn_size, UInt32(gtt_uncached_flags), cpu_access=True)
+        q8_attn_base = q8_attn_gpu_buf.cpu_addr
+
     # 1. Allocate and Load DiffusionGemma Decoder Weights (RAM-resident)
     var weights_file = String("diffusiongemma_q4.bin")
     print("Opening MoE weights file '" + weights_file + "'...")
@@ -1828,6 +1923,43 @@ def main() raises:
             print("  Loaded: ", total_read // 1024 // 1024 // 1024, " GB / 14 GB...")
     print("Successfully loaded all DiffusionGemma weights into RAM: ", total_read, " bytes")
     _ = c_close(weights_fd)
+
+    if use_gpu:
+        print("Unpacking Q4 attention weights to Q8 in host SVM memory...")
+        var clflush = gpu_ctx.cpu_clflush
+        var sfence = gpu_ctx.cpu_sfence
+        for l in range(30):
+            var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+            var is_global = CONFIG.is_global_layer(l)
+            var layer_heads = 16
+            var layer_head_dim = 512 if is_global else 256
+            var layer_kv_heads = 2 if is_global else 8
+            
+            var wq_size = layer_heads * layer_head_dim * CONFIG.embed_dim
+            var wk_size = layer_kv_heads * layer_head_dim * CONFIG.embed_dim
+            var wv_size = 0 if is_global else (layer_kv_heads * layer_head_dim * CONFIG.embed_dim)
+            var wo_size = CONFIG.embed_dim * layer_heads * layer_head_dim
+            
+            var layer_q8_offset = CONFIG.get_q8_attn_offset(l)
+            var wq_q8_addr = q8_attn_base + layer_q8_offset
+            var wk_q8_addr = wq_q8_addr + wq_size
+            var wv_q8_addr = wk_q8_addr + wk_size
+            var wo_q8_addr = wv_q8_addr + wv_size
+            
+            unpack_q4_to_q8(weights.wq_packed, UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wq_q8_addr), wq_size)
+            unpack_q4_to_q8(weights.wk_packed, UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wk_q8_addr), wk_size)
+            if not is_global:
+                unpack_q4_to_q8(weights.wv_packed, UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wv_q8_addr), wv_size)
+            unpack_q4_to_q8(weights.wo_packed, UnsafePointer[Scalar[DType.int8], MutExternalOrigin](unsafe_from_address=wo_q8_addr), wo_size)
+            
+        print("Flushing CPU cache lines of unpacked Q8 attention weights...")
+        var base_flush = (q8_attn_base // 64) * 64
+        var end_flush = q8_attn_base + q8_attn_size
+        while base_flush < end_flush:
+            _ = clflush(base_flush)
+            base_flush += 64
+        _ = sfence(0)
+        print("Successfully unpacked and flushed Q8 attention weights!")
 
     # 2. Allocate and Load Final Layer Norm Weights
     var final_norm_file = String("diffusiongemma_final_norm.bin")
@@ -2007,6 +2139,15 @@ def main() raises:
     # Batched norm output [CANVAS_LEN, embed_dim]
     var canvas_norm_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.embed_dim * 4, UInt32(gtt_uncached_flags), cpu_access=True)
     var canvas_norm = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=canvas_norm_buf.cpu_addr)
+
+    # Reusable packed flat temp buffers for Coalesced Batched GEMM launches
+    var temp_packed_q_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_Q_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var temp_packed_k_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+    var temp_packed_v_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, UInt32(gtt_uncached_flags), cpu_access=True)
+
+    var temp_packed_q = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_q_buf.cpu_addr)
+    var temp_packed_k = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_k_buf.cpu_addr)
+    var temp_packed_v = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_v_buf.cpu_addr)
     # Batched FFN intermediates
     var canvas_ffn_gate = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
     var canvas_ffn_up = alloc[Float32](CANVAS_LEN * CONFIG.standard_mlp_dim)
@@ -2141,7 +2282,7 @@ def main() raises:
 
             # Run layers
             for l in range(30):
-                var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+                var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l), q8_attn_base)
                 var is_global = CONFIG.is_global_layer(l)
                 var layer_heads = 16
                 var layer_kv_heads = 2 if is_global else 8
@@ -2380,7 +2521,7 @@ def main() raises:
 
             # Decoder forward: layer-first, batched projections, bidirectional attention
             for l in range(30):
-                var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+                var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l), q8_attn_base)
                 var is_global = CONFIG.is_global_layer(l)
                 var layer_heads = 16
                 var layer_kv_heads = 2 if is_global else 8
@@ -2406,46 +2547,59 @@ def main() raises:
                         base_norm += 64
                     _ = sfence(0)
 
-                    # Asynchronously enqueue Q, K, and V projections for all tokens on GPU
-                    var slots_q = InlineArray[Int, 256](uninitialized=True)
-                    var slots_k = InlineArray[Int, 256](uninitialized=True)
-                    var slots_v = InlineArray[Int, 256](uninitialized=True)
-                    
-                    for t in range(CANVAS_LEN):
-                        slots_q[t] = gpu_ctx.enqueue_matmul(
-                            weights.wq_packed.__int__(),
-                            weights.wq_scales.__int__(),
-                            canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                            canvas_q.__int__() + t * MAX_Q_SIZE * 4,
-                            CONFIG.embed_dim,
-                            q_size,
-                            flush_cache=False
-                        )
-                        slots_k[t] = gpu_ctx.enqueue_matmul(
-                            weights.wk_packed.__int__(),
-                            weights.wk_scales.__int__(),
-                            canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                            canvas_k.__int__() + t * MAX_KV_SIZE * 4,
+                    # Asynchronously enqueue Q, K, and V projections for all tokens on GPU using Coalesced Batched GEMM
+                    var slot_q = gpu_ctx.enqueue_matmul(
+                        weights.wq_q8.__int__(),
+                        weights.wq_scales.__int__(),
+                        canvas_norm.__int__(),
+                        temp_packed_q.__int__(),
+                        CONFIG.embed_dim,
+                        q_size,
+                        batch_size=CANVAS_LEN,
+                        flush_cache=False
+                    )
+                    var slot_k = gpu_ctx.enqueue_matmul(
+                        weights.wk_q8.__int__(),
+                        weights.wk_scales.__int__(),
+                        canvas_norm.__int__(),
+                        temp_packed_k.__int__(),
+                        CONFIG.embed_dim,
+                        kv_stride,
+                        batch_size=CANVAS_LEN,
+                        flush_cache=False
+                    )
+                    var slot_v = Int(0)
+                    if not is_global:
+                        slot_v = gpu_ctx.enqueue_matmul(
+                            weights.wv_q8.__int__(),
+                            weights.wv_scales.__int__(),
+                            canvas_norm.__int__(),
+                            temp_packed_v.__int__(),
                             CONFIG.embed_dim,
                             kv_stride,
+                            batch_size=CANVAS_LEN,
                             flush_cache=False
                         )
-                        if not is_global:
-                            slots_v[t] = gpu_ctx.enqueue_matmul(
-                                weights.wv_packed.__int__(),
-                                weights.wv_scales.__int__(),
-                                canvas_norm.__int__() + t * CONFIG.embed_dim * 4,
-                                canvas_v.__int__() + t * MAX_KV_SIZE * 4,
-                                CONFIG.embed_dim,
-                                kv_stride,
-                                flush_cache=False
-                            )
                     
-                    # Wait for GPU completion of Q and K projections
+                    # Wait for GPU completions of the coalesced batched runs
+                    gpu_ctx.wait_matmul(slot_q, temp_packed_q.__int__(), q_size, batch_size=CANVAS_LEN, flush_cache=False)
+                    gpu_ctx.wait_matmul(slot_k, temp_packed_k.__int__(), kv_stride, batch_size=CANVAS_LEN, flush_cache=False)
+                    if not is_global:
+                        gpu_ctx.wait_matmul(slot_v, temp_packed_v.__int__(), kv_stride, batch_size=CANVAS_LEN, flush_cache=False)
+
+                    # Un-stride from packed temp buffers to stride-padded canvas buffers
                     for t in range(CANVAS_LEN):
-                        gpu_ctx.wait_matmul(slots_q[t], canvas_q.__int__() + t * MAX_Q_SIZE * 4, q_size, flush_cache=False)
-                        gpu_ctx.wait_matmul(slots_k[t], canvas_k.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
-                    
+                        var src_ptr = temp_packed_q + t * q_size
+                        var dst_ptr = canvas_q + t * MAX_Q_SIZE
+                        for i in range(0, q_size, 8):
+                            dst_ptr.store[8](i, src_ptr.load[8](i))
+
+                    for t in range(CANVAS_LEN):
+                        var src_ptr = temp_packed_k + t * kv_stride
+                        var dst_ptr = canvas_k + t * MAX_KV_SIZE
+                        for i in range(0, kv_stride, 8):
+                            dst_ptr.store[8](i, src_ptr.load[8](i))
+
                     if is_global:
                         for t in range(CANVAS_LEN):
                             var v_ptr = canvas_v + t * MAX_KV_SIZE
@@ -2454,7 +2608,10 @@ def main() raises:
                                 v_ptr.store[8](i, k_ptr.load[8](i))
                     else:
                         for t in range(CANVAS_LEN):
-                            gpu_ctx.wait_matmul(slots_v[t], canvas_v.__int__() + t * MAX_KV_SIZE * 4, kv_stride, flush_cache=False)
+                            var src_ptr = temp_packed_v + t * kv_stride
+                            var dst_ptr = canvas_v + t * MAX_KV_SIZE
+                            for i in range(0, kv_stride, 8):
+                                dst_ptr.store[8](i, src_ptr.load[8](i))
 
                     # Contiguous CPU cache invalidate on canvas_q, canvas_k, and canvas_v
                     var base_q = (canvas_q.__int__() // 64) * 64
@@ -2569,20 +2726,33 @@ def main() raises:
                         base_attn_out += 64
                     _ = sfence(0)
 
-                    # Phase 2b: Batched Wo projection + post-attn norm + residual
-                    var slots_o = InlineArray[Int, 256](uninitialized=True)
+                    # Pack/copy strided canvas_attn_out into temp_packed_q before enqueuing matmul
                     for t in range(CANVAS_LEN):
-                        slots_o[t] = gpu_ctx.enqueue_matmul(
-                            weights.wo_packed.__int__(),
-                            weights.wo_scales.__int__(),
-                            canvas_attn_out.__int__() + t * MAX_Q_SIZE * 4,
-                            canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4,
-                            q_size,
-                            CONFIG.embed_dim,
-                            flush_cache=False
-                        )
-                    for t in range(CANVAS_LEN):
-                        gpu_ctx.wait_matmul(slots_o[t], canvas_proj_attn.__int__() + t * CONFIG.embed_dim * 4, CONFIG.embed_dim, flush_cache=False)
+                        var src_ptr = canvas_attn_out + t * MAX_Q_SIZE
+                        var dst_ptr = temp_packed_q + t * q_size
+                        for i in range(0, q_size, 8):
+                            dst_ptr.store[8](i, src_ptr.load[8](i))
+
+                    # Contiguous CPU cache flush on temp_packed_q before Wo projection
+                    var base_temp_q = (temp_packed_q.__int__() // 64) * 64
+                    var end_temp_q = temp_packed_q.__int__() + (CANVAS_LEN * q_size * 4)
+                    while base_temp_q < end_temp_q:
+                        _ = clflush(base_temp_q)
+                        base_temp_q += 64
+                    _ = sfence(0)
+
+                    # Phase 2b: Coalesced Batched Wo projection + post-attn norm + residual
+                    var slot_o = gpu_ctx.enqueue_matmul(
+                        weights.wo_q8.__int__(),
+                        weights.wo_scales.__int__(),
+                        temp_packed_q.__int__(),
+                        canvas_proj_attn.__int__(),
+                        q_size,
+                        CONFIG.embed_dim,
+                        batch_size=CANVAS_LEN,
+                        flush_cache=False
+                    )
+                    gpu_ctx.wait_matmul(slot_o, canvas_proj_attn.__int__(), CONFIG.embed_dim, batch_size=CANVAS_LEN, flush_cache=False)
 
                     # Contiguous CPU cache invalidate on canvas_proj_attn
                     var base_proj = (canvas_proj_attn.__int__() // 64) * 64
@@ -3017,6 +3187,9 @@ def main() raises:
     gpu_ctx.free_gpu_buffer(canvas_attn_out_buf)
     gpu_ctx.free_gpu_buffer(canvas_proj_attn_buf)
     gpu_ctx.free_gpu_buffer(canvas_norm_buf)
+    gpu_ctx.free_gpu_buffer(temp_packed_q_buf)
+    gpu_ctx.free_gpu_buffer(temp_packed_k_buf)
+    gpu_ctx.free_gpu_buffer(temp_packed_v_buf)
     canvas_ffn_gate.free()
     canvas_ffn_up.free()
     canvas_ffn_gated.free()
