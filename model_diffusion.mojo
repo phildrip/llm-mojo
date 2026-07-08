@@ -2487,6 +2487,8 @@ def main() raises:
         var denoise_step: Int = 0
         var is_encoder_phase: Bool = False
         var hist_len: Int = 0
+        var prev_mean_ent: Float32 = 0.0
+        var steps_executed: Int = 0
 
         t_decode_start = std.time.perf_counter()
 
@@ -2498,6 +2500,7 @@ def main() raises:
 
         while denoise_step < MAX_DENOISE_STEPS:
             print("  [denoise ", denoise_step, "]")
+            steps_executed += 1
 
             # Compute canvas embeddings + self-conditioning
             for t in range(CANVAS_LEN):
@@ -3113,6 +3116,28 @@ def main() raises:
                     canvas_tokens[t] = new_tokens[t]
             print("    accepted=", n_accept, "/", CANVAS_LEN)
 
+            # Calculate local change metrics for adaptive step skipping
+            var num_flips = 0
+            var entropy_decay: Float32 = 0.0
+            if steps_executed > 1:
+                for t in range(CANVAS_LEN):
+                    if argmax_tokens[t] != argmax_canvas[t]:
+                        num_flips += 1
+                entropy_decay = prev_mean_ent - mean_ent
+
+            var skip_amount = 1
+            if steps_executed > 1:
+                # If very few tokens changed or entropy decay has flattened out, skip intermediate steps
+                if num_flips <= 2 or (entropy_decay >= 0.0 and entropy_decay < 0.003):
+                    skip_amount = 3
+                    print("    -> Adaptive skip: num_flips =", num_flips, "entropy_decay =", String(entropy_decay), "| Skipping 2 steps")
+                elif num_flips <= 8 or (entropy_decay >= 0.0 and entropy_decay < 0.008):
+                    skip_amount = 2
+                    print("    -> Adaptive skip: num_flips =", num_flips, "entropy_decay =", String(entropy_decay), "| Skipping 1 step")
+
+            # Store metrics for next step
+            prev_mean_ent = mean_ent
+
             # Update argmax_canvas
             for t in range(CANVAS_LEN):
                 argmax_canvas[t] = argmax_tokens[t]
@@ -3126,7 +3151,7 @@ def main() raises:
             # Zero out sc_embeds for positions that will commit (none in denoise-only mode)
             # All positions continue denoising, so sc_embeds stays
 
-            denoise_step += 1
+            denoise_step += skip_amount
 
         var t_end = std.time.perf_counter()
         var denoise_duration = t_end - t_decode_start
@@ -3135,9 +3160,9 @@ def main() raises:
         print("Diffusion generation complete!")
         print("  Prompt tokens:    ", num_prompt_tokens)
         print("  Canvas length:    ", CANVAS_LEN)
-        print("  Denoise steps:    ", denoise_step + 1)
+        print("  Denoise steps:    ", steps_executed)
         print("  Total denoise time: ", String(denoise_duration * 1000.0), " ms")
-        print("  Avg per step:     ", String(denoise_duration * 1000.0 / Float64(denoise_step + 1)), " ms")
+        print("  Avg per step:     ", String(denoise_duration * 1000.0 / Float64(steps_executed)), " ms")
         print("  Output:")
         var output_list = Python.list()
         for t in range(CANVAS_LEN):
