@@ -8,6 +8,15 @@ from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
 from attention import paged_attention_layer, ring_row
 from qk_dump import QKDumpWriter
+from lsa_core import (
+    lsa_index_query,
+    lsa_index_key,
+    LSALayerIndex,
+    lsa_sparse_paged_attention,
+    LSA_DIM,
+    GEMMA4_INDEX_DIM,
+)
+from lsa_pca import load_projections_file
 import std.time
 
 # -----------------------------------------------------------------------------
@@ -578,6 +587,65 @@ def mtp_paged_attention(
     )
 
 @always_inline
+def execute_attention_for_token(
+    q: UnsafePointer[Float32, _],
+    k_vec: UnsafePointer[Float32, _],
+    k_pool: UnsafePointer[Float32, _],
+    v_pool: UnsafePointer[Float32, _],
+    block_table: List[Int],
+    block_size: Int,
+    pos: Int,
+    l: Int,
+    is_global: Bool,
+    layer_heads: Int,
+    layer_kv_heads: Int,
+    layer_head_dim: Int,
+    sliding_window: Int,
+    ring_size: Int,
+    kv_slot: Int,
+    attn_scores: UnsafePointer[Float32, MutUntrackedOrigin],
+    attn_rows: UnsafePointer[Int, MutUntrackedOrigin],
+    attn_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    use_lsa: Bool,
+    lsa_indices: UnsafePointer[LSALayerIndex, MutUntrackedOrigin],
+    lsa_proj_weights: UnsafePointer[Float32, _],
+    k_lsa_idx: UnsafePointer[Float32, MutUntrackedOrigin],
+    q_lsa_idx: UnsafePointer[Float32, MutUntrackedOrigin],
+    lsa_k: Int,
+    lsa_p: Int,
+    lsa_sinks: Int,
+    lsa_window: Int,
+):
+    if use_lsa and is_global:
+        var g_idx = l // 6
+        var lsa_idx_ptr = lsa_indices + (kv_slot * 5 + g_idx)
+        var proj_w = lsa_proj_weights + g_idx * (LSA_DIM * GEMMA4_INDEX_DIM)
+        lsa_index_key(k_vec, proj_w, k_lsa_idx)
+        lsa_idx_ptr[].append_key(pos, k_lsa_idx)
+
+        if pos >= (lsa_sinks + lsa_window + lsa_k):
+            lsa_index_query(q, proj_w, q_lsa_idx)
+            var picked = lsa_idx_ptr[].select_top_p(q_lsa_idx, pos, lsa_p)
+            var selected_keys = lsa_idx_ptr[].expand_buckets(picked, pos, lsa_k, lsa_sinks, lsa_window)
+            lsa_sparse_paged_attention(
+                q, k_pool, v_pool, block_table, block_size,
+                selected_keys, layer_heads, layer_kv_heads, layer_head_dim,
+                attn_scores, attn_rows, attn_out
+            )
+            return
+
+    var ring_base = (ring_row(kv_slot, ring_size, 0) if ring_size > 0 else 0)
+    var cur_ring_size = 0 if is_global else ring_size
+    var cur_window = 0 if is_global else sliding_window
+
+    paged_attention_layer(
+        q, k_pool, v_pool, block_table, block_size, pos,
+        layer_heads, layer_kv_heads, layer_head_dim,
+        cur_window, attn_scores, attn_rows, attn_out,
+        cur_ring_size, ring_base,
+    )
+
+@always_inline
 def run_assistant_layer(
     layer_idx: Int,
     x: UnsafePointer[Float32, MutExternalOrigin],
@@ -1046,6 +1114,13 @@ def main() raises:
     var legacy_attn = False
     var use_ring = True
     var dump_qk_path = String("")
+    var use_lsa = False
+    var lsa_k = 256
+    var lsa_p = 20
+    var lsa_window = 128
+    var lsa_sinks = 4
+    var lsa_proj_path = String("gemma4_lsa_projections.bin")
+
     var early_args = std.sys.argv()
     for ai in range(1, len(early_args)):
         if early_args[ai] == "--legacy-attn":
@@ -1054,6 +1129,18 @@ def main() raises:
             use_ring = False
         elif early_args[ai] == "--dump-qk" and ai + 1 < len(early_args):
             dump_qk_path = String(early_args[ai + 1])
+        elif early_args[ai] == "--lsa":
+            use_lsa = True
+        elif early_args[ai] == "--lsa-k" and ai + 1 < len(early_args):
+            lsa_k = atol(String(early_args[ai + 1]))
+        elif early_args[ai] == "--lsa-p" and ai + 1 < len(early_args):
+            lsa_p = atol(String(early_args[ai + 1]))
+        elif early_args[ai] == "--lsa-window" and ai + 1 < len(early_args):
+            lsa_window = atol(String(early_args[ai + 1]))
+        elif early_args[ai] == "--lsa-sinks" and ai + 1 < len(early_args):
+            lsa_sinks = atol(String(early_args[ai + 1]))
+        elif early_args[ai] == "--lsa-projections" and ai + 1 < len(early_args):
+            lsa_proj_path = String(early_args[ai + 1])
     var sliding_window = 0 if legacy_attn else 1024
     # Ring holds exactly the window: every KV write is at the current pos (prefill, decode and MTP
     # verification are all sequential; the MTP drafter only reads), so a write at pos evicts
@@ -1063,6 +1150,8 @@ def main() raises:
     var num_kv_slots = 2   # must be >= max_active_slots in every scheduler mode (checked below)
     if legacy_attn:
         print("Attention mode:      LEGACY (paged, full causal on all layers)")
+    elif use_lsa:
+        print("Attention mode:      LSA (Latent Sparse Attention) on 5 global layers (k=" + String(lsa_k) + ", p=" + String(lsa_p) + ", win=" + String(lsa_window) + ") + sliding window 1024 on 25 sliding layers")
     elif ring_size > 0:
         print("Attention mode:      sliding window 1024 + ring KV on 25 sliding layers")
     else:
@@ -1427,6 +1516,19 @@ def main() raises:
     var run_draft_proposed_ptr = alloc[Int](1)
     var run_draft_accepted_ptr = alloc[Int](1)
 
+    var lsa_proj_weights = alloc[Float32](5 * LSA_DIM * GEMMA4_INDEX_DIM)
+    if use_lsa:
+        load_projections_file(lsa_proj_path, lsa_proj_weights)
+        print("LSA Projections:     Loaded " + lsa_proj_path + " successfully")
+
+    var lsa_indices = alloc[LSALayerIndex](num_kv_slots * 5)
+    if use_lsa:
+        for i in range(num_kv_slots * 5):
+            lsa_indices[i] = LSALayerIndex(max_capacity=max_blocks * block_size)
+
+    var q_lsa_idx = alloc[Float32](LSA_DIM)
+    var k_lsa_idx = alloc[Float32](LSA_DIM)
+
     def run_target_step(seq_ptr: UnsafePointer[Sequence, MutExternalOrigin]) capturing -> Int:
         run_target_steps_ptr[0] += 1
         var pos = seq_ptr[].pos
@@ -1483,8 +1585,13 @@ def main() raises:
                 k_target_ptr[i] = k_vec[i]
                 v_target_ptr[i] = v_vec[i]
                 
-            # Paged Attention
-            paged_attention_layer(q, k_block_pools_ptr[][l], v_block_pools_ptr[][l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
+            # Attention (LSA on global layers when enabled, else paged)
+            execute_attention_for_token(
+                q, k_vec, k_block_pools_ptr[][l], v_block_pools_ptr[][l], seq_ptr[].block_table, block_size, pos,
+                l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
+                attn_scores, attn_rows, attn_out, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
+                lsa_k, lsa_p, lsa_sinks, lsa_window,
+            )
             
             q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
             rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -1610,8 +1717,10 @@ def main() raises:
         elif a == "--prompt-file" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             prompt_file = String(cmd_args[arg_i])
-        elif a == "--" or a == "--legacy-attn" or a == "--no-ring":
+        elif a == "--" or a == "--legacy-attn" or a == "--no-ring" or a == "--lsa":
             pass   # handled by the early parse
+        elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections") and arg_i + 1 < len(cmd_args):
+            arg_i += 1  # handled by early parse
         elif a == "--dump-qk" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             dump_qk_path = String(cmd_args[arg_i])
@@ -1640,6 +1749,9 @@ def main() raises:
         # Reset block manager and pointers for this run
         block_manager = BlockManager(max_blocks, block_size)
         block_manager_ptr = UnsafePointer(to=block_manager)
+        if use_lsa:
+            for i in range(num_kv_slots * 5):
+                lsa_indices[i].reset()
         # Sliding-layer ring slots (one per concurrently active sequence)
         var free_kv_slots = List[Int]()
         for si in range(num_kv_slots - 1, -1, -1):
@@ -1827,8 +1939,13 @@ def main() raises:
                             k_target_ptr[i] = k_vec[i]
                             v_target_ptr[i] = v_vec[i]
                             
-                        # 6. Paged Attention
-                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
+                        # 6. Attention (LSA on global layers when enabled, else paged)
+                        execute_attention_for_token(
+                            q, k_vec, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos,
+                            l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
+                            attn_scores, attn_rows, attn_out, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
+                            lsa_k, lsa_p, lsa_sinks, lsa_window,
+                        )
                         
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -2119,8 +2236,13 @@ def main() raises:
                             k_target_ptr[i] = k_vec[i]
                             v_target_ptr[i] = v_vec[i]
                             
-                        # Paged Attention
-                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
+                        # Attention (LSA on global layers when enabled, else paged)
+                        execute_attention_for_token(
+                            q, k_vec, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos,
+                            l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
+                            attn_scores, attn_rows, attn_out, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
+                            lsa_k, lsa_p, lsa_sinks, lsa_window,
+                        )
                         
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -2249,6 +2371,9 @@ def main() raises:
                     for b in range(len(s_ptr[].block_table)):
                         block_manager.free(s_ptr[].block_table[b])
                     if s_ptr[].kv_slot >= 0:
+                        if use_lsa:
+                            for li in range(5):
+                                lsa_indices[s_ptr[].kv_slot * 5 + li].reset()
                         free_kv_slots.append(s_ptr[].kv_slot)
                     s_ptr[].recurrent_h.free()
                     s_ptr.free()
@@ -2383,4 +2508,12 @@ def main() raises:
     mtp_layer_ffn_up.free()
     mtp_layer_ffn_down.free()
     mtp_layer_ffn_post_norm.free()
+
+    if use_lsa:
+        for i in range(num_kv_slots * 5):
+            lsa_indices[i].free()
+        lsa_indices.free()
+        lsa_proj_weights.free()
+        q_lsa_idx.free()
+        k_lsa_idx.free()
 
