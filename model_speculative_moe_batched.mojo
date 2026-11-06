@@ -1054,11 +1054,11 @@ def main() raises:
 
     # Initialize FFI and libc functions
     var libc = OwnedDLHandle("libc.so.6")
-    var c_open = libc.get_function[def(Int, Int32, Int32) -> Int32]("open")
-    var c_close = libc.get_function[def(Int32) -> Int32]("close")
-    var posix_memalign = libc.get_function[def(Int, Int, Int) -> Int32]("posix_memalign")
-    var free_c = libc.get_function[def(Int) -> None]("free")
-    var c_read = libc.get_function[def(Int32, Int, Int) -> Int]("read")
+    var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
+    var c_close = libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
+    var posix_memalign = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int32]("posix_memalign")
+    var free_c = libc.get_function[def(Int) thin abi("C") -> None]("free")
+    var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
 
     # 1. Allocate and Load MoE Weights (RAM-resident)
     var weights_file = String("gemma4_moe_weights_q4.bin")
@@ -1229,7 +1229,7 @@ def main() raises:
         print("Real speculator weights not found. Falling back to dummy weights.")
         mtp_config = MTPConfig(1024, 2816, 4, 10000)
 
-    def read_floats(fd: Int32, ptr: UnsafePointer[Float32, MutExternalOrigin], count: Int) raises:
+    def read_floats(fd: Int32, ptr: UnsafePointer[Float32, MutExternalOrigin], count: Int) capturing raises:
         var bytes_to_read = count * 4
         var ptr_addr = ptr.__int__()
         var total_bytes_read = 0
@@ -1404,7 +1404,7 @@ def main() raises:
     var run_draft_proposed_ptr = alloc[Int](1)
     var run_draft_accepted_ptr = alloc[Int](1)
 
-    def run_target_step(seq_ptr: UnsafePointer[Sequence, MutExternalOrigin]) -> Int:
+    def run_target_step(seq_ptr: UnsafePointer[Sequence, MutExternalOrigin]) capturing -> Int:
         run_target_steps_ptr[0] += 1
         var pos = seq_ptr[].pos
         var current_token_id = seq_ptr[].tokens[pos]
@@ -1528,7 +1528,7 @@ def main() raises:
                 moe_out[i] = 0.0
             rms_norm(local_x, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
             
-            def decode_expert_worker(exp_idx: Int) capturing -> None:
+            def target_expert_worker(exp_idx: Int) capturing -> None:
                 var e = top_idx[exp_idx]
                 var w_e = top_weights[exp_idx]
                 if w_e == 0.0: return
@@ -1549,7 +1549,7 @@ def main() raises:
                 var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
                 q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
                 
-            parallelize[decode_expert_worker](CONFIG.top_k_experts)
+            parallelize[target_expert_worker](CONFIG.top_k_experts)
             
             for exp_idx in range(CONFIG.top_k_experts):
                 var w_e = top_weights[exp_idx]
