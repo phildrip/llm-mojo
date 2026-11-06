@@ -7,6 +7,7 @@ from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
 from attention import paged_attention_layer, ring_row
+from qk_dump import QKDumpWriter
 import std.time
 
 # -----------------------------------------------------------------------------
@@ -1044,12 +1045,15 @@ def main() raises:
     #   --no-ring     : debug - sliding window 1024 but KV stays paged (to A/B the ring addressing).
     var legacy_attn = False
     var use_ring = True
+    var dump_qk_path = String("")
     var early_args = std.sys.argv()
     for ai in range(1, len(early_args)):
         if early_args[ai] == "--legacy-attn":
             legacy_attn = True
         elif early_args[ai] == "--no-ring":
             use_ring = False
+        elif early_args[ai] == "--dump-qk" and ai + 1 < len(early_args):
+            dump_qk_path = String(early_args[ai + 1])
     var sliding_window = 0 if legacy_attn else 1024
     # Ring holds exactly the window: every KV write is at the current pos (prefill, decode and MTP
     # verification are all sequential; the MTP drafter only reads), so a write at pos evicts
@@ -1608,9 +1612,15 @@ def main() raises:
             prompt_file = String(cmd_args[arg_i])
         elif a == "--" or a == "--legacy-attn" or a == "--no-ring":
             pass   # handled by the early parse
+        elif a == "--dump-qk" and arg_i + 1 < len(cmd_args):
+            arg_i += 1
+            dump_qk_path = String(cmd_args[arg_i])
         else:
             positional_args.append(a)
         arg_i += 1
+
+    var qk_writer = QKDumpWriter()
+    var qk_dump_active_for_run = False
 
     for run_idx in range(2):
         if is_chat_mode:
@@ -1621,6 +1631,11 @@ def main() raises:
             use_mtp = (run_idx == 1)
             if use_mtp and not chat_use_mtp:
                 continue   # --no-mtp in batch mode: run the standard pass only
+        
+        if dump_qk_path != "" and (run_idx == 0 or is_chat_mode):
+            qk_writer = QKDumpWriter(dump_qk_path)
+            qk_dump_active_for_run = True
+            print("Q/K Dump:            dumping global layer Q/K/V to " + dump_qk_path)
         
         # Reset block manager and pointers for this run
         block_manager = BlockManager(max_blocks, block_size)
@@ -1790,6 +1805,8 @@ def main() raises:
                         # 4. Apply RoPE
                         apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
                         apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                        if qk_dump_active_for_run and is_global:
+                            qk_writer.write_record(pos, l, q, k_vec, v_vec)
                         
                         # 5. KV Cache write (Paged Attention)
                         var logical_blk = pos // block_size
@@ -2080,6 +2097,8 @@ def main() raises:
                             
                         apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
                         apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                        if qk_dump_active_for_run and is_global:
+                            qk_writer.write_record(pos, l, q, k_vec, v_vec)
                         
                         # KV Cache write
                         var logical_blk = pos // block_size
@@ -2262,6 +2281,12 @@ def main() raises:
                 std_total_target_steps = run_target_steps_ptr[0]
                 std_total_draft_proposed = run_draft_proposed_ptr[0]
                 std_total_draft_accepted = run_draft_accepted_ptr[0]
+
+            if qk_dump_active_for_run and qk_writer.is_active():
+                var dumped_count = qk_writer.max_pos_written + 1
+                qk_writer.close()
+                qk_dump_active_for_run = False
+                print("\n[Q/K Dump] Successfully dumped " + String(dumped_count) + " tokens to '" + dump_qk_path + "' (" + String(dumped_count * 200) + " KB)")
 
     if not is_chat_mode:
         # Print a stunning performance benchmark summary!
