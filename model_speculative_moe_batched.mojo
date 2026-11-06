@@ -1168,7 +1168,9 @@ def main() raises:
     var q = alloc[Float32](8192)
     var k_vec = alloc[Float32](2048)
     var v_vec = alloc[Float32](2048)
-    var attn_scores = alloc[Float32](CONFIG.max_seq_len)
+    # Sized to the paged KV capacity: attention writes one score per attended position.
+    # (Previously CONFIG.max_seq_len = 100, which overflowed for any context > 100 tokens.)
+    var attn_scores = alloc[Float32](max_blocks * block_size)
     var attn_out = alloc[Float32](8192)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
@@ -1600,12 +1602,28 @@ def main() raises:
 
     var is_chat_mode = False
     var chat_use_mtp = True
+    var max_total_tokens = 35          # total sequence length (prompt + generated) in batch mode
+    var prompt_file = String("")
+    var positional_args = List[String]()
     var cmd_args = std.sys.argv()
-    for idx in range(1, len(cmd_args)):
-        if cmd_args[idx] == "-i" or cmd_args[idx] == "--interactive" or cmd_args[idx] == "--chat" or cmd_args[idx] == "chat":
+    var arg_i = 1
+    while arg_i < len(cmd_args):
+        var a = String(cmd_args[arg_i])
+        if a == "-i" or a == "--interactive" or a == "--chat" or a == "chat":
             is_chat_mode = True
-        elif cmd_args[idx] == "--no-spec" or cmd_args[idx] == "--no-mtp":
+        elif a == "--no-spec" or a == "--no-mtp":
             chat_use_mtp = False
+        elif a == "--max-tokens" and arg_i + 1 < len(cmd_args):
+            arg_i += 1
+            max_total_tokens = atol(String(cmd_args[arg_i]))
+        elif a == "--prompt-file" and arg_i + 1 < len(cmd_args):
+            arg_i += 1
+            prompt_file = String(cmd_args[arg_i])
+        elif a == "--":
+            pass
+        else:
+            positional_args.append(a)
+        arg_i += 1
 
     for run_idx in range(2):
         if is_chat_mode:
@@ -1614,6 +1632,8 @@ def main() raises:
             use_mtp = chat_use_mtp
         else:
             use_mtp = (run_idx == 1)
+            if use_mtp and not chat_use_mtp:
+                continue   # --no-mtp in batch mode: run the standard pass only
         
         # Reset block manager and pointers for this run
         block_manager = BlockManager(max_blocks, block_size)
@@ -1630,20 +1650,18 @@ def main() raises:
         var active_sequences = List[UnsafePointer[Sequence, MutExternalOrigin]]()
         
         var prompts = List[String]()
-        var args = std.sys.argv()
         if is_chat_mode:
             # Under chat mode, the initial prompts list is empty. We will prompt the user inside the scheduler loop!
             pass
-        elif len(args) > 1:
-            var start_idx = 1
-            if args[1] == "--" and len(args) > 2:
-                start_idx = 2
-                
+        elif prompt_file.byte_length() > 0:
+            with open(prompt_file, "r") as f:
+                prompts.append(f.read())
+        elif len(positional_args) > 0:
             var custom_prompt = String("")
-            for idx in range(start_idx, len(args)):
-                if idx > start_idx:
+            for idx in range(len(positional_args)):
+                if idx > 0:
                     custom_prompt += " "
-                custom_prompt += args[idx]
+                custom_prompt += positional_args[idx]
             prompts.append(custom_prompt)
         else:
             prompts.append("The solar system is made of planets that revolve around the sun. For example,")
@@ -1658,7 +1676,7 @@ def main() raises:
                 tokens.append(Int(py=encoded[j]))
             
             var seq_ptr = alloc[Sequence](1)
-            seq_ptr[] = Sequence(i + 1, prompts[i], tokens^, 35) # Generate up to 35 tokens
+            seq_ptr[] = Sequence(i + 1, prompts[i], tokens^, max_total_tokens)
             pending_queue.append(seq_ptr)
 
         var pending_idx = 0
