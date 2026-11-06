@@ -180,7 +180,7 @@ def main() raises:
         # Benchmark select_top_p
         t0 = std.time.perf_counter()
         for _ in range(scan_iters):
-            var picked = lsa_idx.select_top_p(q_lsa, cur_T, 20)
+            _ = lsa_idx.select_top_p(q_lsa, cur_T, 20)
         t1 = std.time.perf_counter()
         var scan_us = ((t1 - t0) / Float64(scan_iters)) * 1e6
 
@@ -188,7 +188,7 @@ def main() raises:
         var picked = lsa_idx.select_top_p(q_lsa, cur_T, 20)
         t0 = std.time.perf_counter()
         for _ in range(scan_iters):
-            var selected = lsa_idx.expand_buckets(picked, cur_T, 256, 4, 128)
+            _ = lsa_idx.expand_buckets(picked, cur_T, 256, 4, 128)
         t1 = std.time.perf_counter()
         var expand_us = ((t1 - t0) / Float64(scan_iters)) * 1e6
 

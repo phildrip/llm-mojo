@@ -114,7 +114,7 @@ def jacobi_diagonalize(
                 var app = a[p_off + p]
                 var aqq = a[q_off + q]
                 var tau = (aqq - app) / (2.0 * apq)
-                var t: Float32 = 0.0
+                var t: Float32
                 if tau >= 0.0:
                     t = 1.0 / (tau + sqrt(1.0 + tau * tau))
                 else:
@@ -218,7 +218,7 @@ def block_subspace_iteration(
             v[r * k + j] *= inv_col_norm
 
     # Subspace iteration loop
-    for iter_idx in range(max_iters):
+    for _ in range(max_iters):
         # Step A: Y = Cov * V (dim x dim * dim x k -> dim x k)
         for r in range(dim):
             var cov_r_off = r * dim

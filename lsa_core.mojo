@@ -11,8 +11,8 @@
 
 from std.math import sqrt, exp
 from std.memory import alloc
-from std.algorithm import sort
-from attention import ring_row
+from std.collections import InlineArray
+from attention import ring_row, _softmax
 
 comptime GEMMA4_NUM_Q_HEADS: Int = 16
 comptime GEMMA4_NUM_KV_HEADS: Int = 2
@@ -44,7 +44,8 @@ def lsa_index_query(
     projects through [64, 768] projection weights using SIMD[Float32, 8],
     and L2-normalizes to a 64-d unit vector.
     """
-    var x_buf = alloc[Float32](GEMMA4_INDEX_DIM)
+    var x_arr = InlineArray[Float32, GEMMA4_INDEX_DIM](uninitialized=True)
+    var x_buf = x_arr.unsafe_ptr()
 
     # 1. Vectorized regrouping: Group 0 (heads 0..7) and Group 1 (heads 8..15)
     for g in range(GEMMA4_NUM_KV_HEADS):
@@ -82,8 +83,6 @@ def lsa_index_query(
     for r in range(0, LSA_DIM, 8):
         q_idx_out.store[8](r, q_idx_out.load[8](r) * inv_norm_vec)
 
-    x_buf.free()
-
 
 @always_inline
 def lsa_index_key(
@@ -97,7 +96,8 @@ def lsa_index_key(
     projects through [64, 768] projection weights using SIMD[Float32, 8],
     and L2-normalizes to a 64-d unit vector.
     """
-    var x_buf = alloc[Float32](GEMMA4_INDEX_DIM)
+    var x_arr = InlineArray[Float32, GEMMA4_INDEX_DIM](uninitialized=True)
+    var x_buf = x_arr.unsafe_ptr()
 
     # 1. Vectorized key copy
     for g in range(GEMMA4_NUM_KV_HEADS):
@@ -126,8 +126,6 @@ def lsa_index_key(
     var inv_norm_vec = SIMD[DType.float32, 8](inv_norm)
     for r in range(0, LSA_DIM, 8):
         k_idx_out.store[8](r, k_idx_out.load[8](r) * inv_norm_vec)
-
-    x_buf.free()
 
 
 # -----------------------------------------------------------------------------
@@ -629,52 +627,40 @@ def lsa_sparse_paged_attention(
     # 1. Precompute physical row offsets for all selected tokens
     for idx in range(n_sel):
         var t = selected_keys[idx]
-        var logical_blk = t // block_size
-        var blk_offset = t % block_size
-        var phys_blk_id = block_table[logical_blk]
-        attn_rows[idx] = phys_blk_id * block_size + blk_offset
+        attn_rows[idx] = (block_table[t // block_size] * block_size + t % block_size) * kv_stride
 
-    # 2. KV-Group-Major Attention
+    # 2. KV-Group-Major Attention (each K/V row fetched once into L1 and reused across all group heads)
     for g in range(num_kv_heads):
         var g_offset = g * head_dim
-        var h_base = g * ratio
+        var h_first = g * ratio
 
-        for h_rel in range(ratio):
-            var h = h_base + h_rel
-            var h_offset = h * head_dim
-            var q_ptr = q + h_offset
-
-            # Compute dot product scores
-            for idx in range(n_sel):
-                var row_offset = attn_rows[idx] * kv_stride + g_offset
-                var k_ptr = k_pool + row_offset
-                var acc = SIMD[DType.float32, 8](0.0)
+        # Scores: one pass over the group's K rows, reused by every query head in the group
+        for idx in range(n_sel):
+            var k_off = attn_rows[idx] + g_offset
+            for hh in range(ratio):
+                var h = h_first + hh
+                var h_offset = h * head_dim
+                var score_vec = SIMD[DType.float32, 8](0.0)
                 for d in range(0, head_dim, 8):
-                    acc += q_ptr.load[8](d) * k_ptr.load[8](d)
-                attn_scores[idx] = acc.reduce_add()
+                    score_vec = score_vec + q.load[8](h_offset + d) * k_pool.load[8](k_off + d)
+                attn_scores[h * n_sel + idx] = score_vec.reduce_add()
 
-            # Softmax
-            var max_val = attn_scores[0]
-            for idx in range(1, n_sel):
-                if attn_scores[idx] > max_val:
-                    max_val = attn_scores[idx]
-
-            var sum_exp: Float32 = 0.0
-            for idx in range(n_sel):
-                var e = exp(attn_scores[idx] - max_val)
-                attn_scores[idx] = e
-                sum_exp += e
-
-            var inv_sum = 1.0 / (sum_exp if sum_exp > 1e-12 else 1e-12)
-            for idx in range(n_sel):
-                attn_scores[idx] *= inv_sum
-
-            # Weighted V gather
-            var out_h = out_attn + h_offset
+        for hh in range(ratio):
+            var h = h_first + hh
+            _softmax(attn_scores + h * n_sel, n_sel)
+            var h_offset = h * head_dim
             for d in range(0, head_dim, 8):
-                var val_vec = SIMD[DType.float32, 8](0.0)
-                for idx in range(n_sel):
-                    var row_offset = attn_rows[idx] * kv_stride + g_offset
-                    var v_ptr = v_pool + row_offset
-                    val_vec += v_ptr.load[8](d) * SIMD[DType.float32, 8](attn_scores[idx])
-                out_h.store[8](d, val_vec)
+                out_attn.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
+
+        # Values: one pass over the group's V rows, reused by every query head in the group
+        for idx in range(n_sel):
+            var v_off = attn_rows[idx] + g_offset
+            for hh in range(ratio):
+                var h = h_first + hh
+                var h_offset = h * head_dim
+                var alpha_vec = SIMD[DType.float32, 8](attn_scores[h * n_sel + idx])
+                for d in range(0, head_dim, 8):
+                    out_attn.store[8](
+                        h_offset + d,
+                        out_attn.load[8](h_offset + d) + alpha_vec * v_pool.load[8](v_off + d)
+                    )

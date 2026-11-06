@@ -155,7 +155,7 @@ def test_sparse_attention_dense_equivalence() raises:
     block_table.append(0)
     block_table.append(1)
 
-    var attn_scores_dense = alloc[Float32](num_tokens)
+    var attn_scores_dense = alloc[Float32](num_heads * num_tokens)
     var attn_rows_dense = alloc[Int](num_tokens)
     var out_dense = alloc[Float32](num_heads * head_dim)
 
@@ -177,7 +177,7 @@ def test_sparse_attention_dense_equivalence() raises:
     for t in range(num_tokens):
         all_keys.append(t)
 
-    var attn_scores_sparse = alloc[Float32](num_tokens)
+    var attn_scores_sparse = alloc[Float32](num_heads * num_tokens)
     var attn_rows_sparse = alloc[Int](num_tokens)
     var out_sparse = alloc[Float32](num_heads * head_dim)
 
@@ -188,10 +188,9 @@ def test_sparse_attention_dense_equivalence() raises:
         attn_scores_sparse, attn_rows_sparse, out_sparse,
     )
 
-    # 3. Assert outputs match within float precision (< 1e-5)
+    # 3. Assert outputs are bit-exact with dense paged_attention_layer
     for i in range(num_heads * head_dim):
-        var diff = abs(out_sparse[i] - out_dense[i])
-        assert_true(diff < 1e-5)
+        assert_equal(out_sparse[i], out_dense[i])
 
     q.free()
     k_pool.free()
