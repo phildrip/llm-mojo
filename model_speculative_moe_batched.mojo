@@ -6,7 +6,7 @@ import std.os
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
-from attention import paged_attention_layer
+from attention import paged_attention_layer, ring_row
 import std.time
 
 # -----------------------------------------------------------------------------
@@ -562,48 +562,19 @@ def mtp_paged_attention(
     pos: Int,
     is_swa: Bool,
     attn_scores: UnsafePointer[Float32, MutExternalOrigin],
+    attn_rows: UnsafePointer[Int, MutExternalOrigin],
     out_attn: UnsafePointer[Float32, MutExternalOrigin],
+    swa_ring_size: Int,
+    swa_ring_base: Int,
 ):
-    var num_heads = 16
+    # Sliding pools may be ring buffers (swa_ring_size > 0); the global pool is always paged.
     var num_kv_heads = 8 if is_swa else 2
     var head_dim = 256 if is_swa else 512
-    var kv_stride = num_kv_heads * head_dim
-    var ratio = num_heads // num_kv_heads
-
-    var start_t = 0
-    if is_swa:
-        var window_limit = pos - 1023
-        if window_limit > 0:
-            start_t = window_limit
-
-    for h in range(num_heads):
-        var h_offset = h * head_dim
-        var g = h // ratio
-        var g_offset = g * head_dim
-
-        for t in range(start_t, pos + 1):
-            var t_logical_blk = t // block_size
-            var t_blk_offset = t % block_size
-            var t_phys_blk_id = block_table[t_logical_blk]
-            var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-
-            var score: Float32 = 0.0
-            for d in range(head_dim):
-                score += q[h_offset + d] * k_pool[t_cache_offset + d]
-            attn_scores[t - start_t] = score
-
-        var num_scores = pos + 1 - start_t
-        mtp_softmax(attn_scores, num_scores)
-
-        for d in range(head_dim):
-            var val_sum: Float32 = 0.0
-            for t in range(start_t, pos + 1):
-                var t_logical_blk = t // block_size
-                var t_blk_offset = t % block_size
-                var t_phys_blk_id = block_table[t_logical_blk]
-                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                val_sum += attn_scores[t - start_t] * v_pool[t_cache_offset + d]
-            out_attn[h_offset + d] = val_sum
+    paged_attention_layer(
+        q, k_pool, v_pool, block_table, block_size, pos, 16, num_kv_heads, head_dim,
+        1024 if is_swa else 0, attn_scores, attn_rows, out_attn,
+        swa_ring_size if is_swa else 0, swa_ring_base,
+    )
 
 @always_inline
 def run_assistant_layer(
@@ -622,14 +593,17 @@ def run_assistant_layer(
     norm_x: UnsafePointer[Float32, MutExternalOrigin],
     q: UnsafePointer[Float32, MutExternalOrigin],
     attn_scores: UnsafePointer[Float32, MutExternalOrigin],
+    attn_rows: UnsafePointer[Int, MutExternalOrigin],
     attn_out: UnsafePointer[Float32, MutExternalOrigin],
     proj_attn_out: UnsafePointer[Float32, MutExternalOrigin],
     ffn_h1: UnsafePointer[Float32, MutExternalOrigin],
     ffn_h2: UnsafePointer[Float32, MutExternalOrigin],
     ffn_out_gate: UnsafePointer[Float32, MutExternalOrigin],
     ffn_out: UnsafePointer[Float32, MutExternalOrigin],
+    swa_ring_size: Int,
+    swa_ring_base: Int,
 ):
-    var is_global = (layer_idx == 3)
+    var is_global = (layer_idx == 3)   # assistant layer 3 reads global pool 29; layers 0-2 read sliding pool 27
     var num_heads = 16
     var head_dim = 512 if is_global else 256
 
@@ -641,7 +615,7 @@ def run_assistant_layer(
         mtp_rms_norm(head_ptr, weights.q_norm_weight, head_ptr, head_dim)
 
     mtp_apply_rope(q, num_heads, head_dim, rope_pos, is_global)
-    mtp_paged_attention(q, k_pool, v_pool, block_table, block_size, kv_pos, not is_global, attn_scores, attn_out)
+    mtp_paged_attention(q, k_pool, v_pool, block_table, block_size, kv_pos, not is_global, attn_scores, attn_rows, attn_out, swa_ring_size, swa_ring_base)
     mtp_gemv(weights.wo, attn_out, proj_attn_out, embed_dim, num_heads * head_dim, num_tasks)
     mtp_rms_norm(proj_attn_out, weights.attn_post_norm_weight, proj_attn_out, embed_dim)
 
@@ -675,6 +649,8 @@ def mtp_generate_step(
     num_tasks: Int,
     embed: Q4Embedding,
     real_weights_loaded: Bool,
+    swa_ring_size: Int,
+    swa_ring_base: Int,
 ) raises:
     var concat_dim = 2 * CONFIG.backbone_dim
     var x_concat = alloc[Float32](concat_dim)
@@ -682,7 +658,8 @@ def mtp_generate_step(
 
     var norm_x = alloc[Float32](CONFIG.embed_dim)
     var q = alloc[Float32](16 * 512)
-    var attn_scores = alloc[Float32](kv_pos + 1)
+    var attn_scores = alloc[Float32](16 * (kv_pos + 1))
+    var attn_rows = alloc[Int](kv_pos + 1)
     var attn_out = alloc[Float32](16 * 512)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
@@ -696,6 +673,9 @@ def mtp_generate_step(
     mtp_gemv(weights.pre_proj, x_concat, x_assistant, CONFIG.embed_dim, concat_dim, num_tasks)
 
     var cur = x_assistant
+    # Pool routing below assumes exactly 4 assistant layers (0-2 -> sliding 27, 3 -> global 29),
+    # matching run_assistant_layer's `is_global = (layer_idx == 3)`.
+    debug_assert(CONFIG.num_layers == 4, "MTP pool routing assumes 4 assistant layers")
     for il in range(CONFIG.num_layers):
         var pool_idx = 27 if il < 3 else 29
         var k_pool = k_block_pools[pool_idx]
@@ -704,8 +684,8 @@ def mtp_generate_step(
         run_assistant_layer(
             il, cur, layers[il], block_table, block_size, k_pool, v_pool, rope_pos, kv_pos, num_tasks,
             CONFIG.embed_dim, intermediate_dim,
-            norm_x, q, attn_scores, attn_out, proj_attn_out,
-            ffn_h1, ffn_h2, ffn_out_gate, ffn_out
+            norm_x, q, attn_scores, attn_rows, attn_out, proj_attn_out,
+            ffn_h1, ffn_h2, ffn_out_gate, ffn_out, swa_ring_size, swa_ring_base
         )
 
     mtp_rms_norm(cur, weights.output_norm_weight, cur, CONFIG.embed_dim)
@@ -717,6 +697,7 @@ def mtp_generate_step(
     norm_x.free()
     q.free()
     attn_scores.free()
+    attn_rows.free()
     attn_out.free()
     proj_attn_out.free()
     ffn_h1.free()
@@ -760,6 +741,7 @@ struct Sequence(Movable):
     var is_finished: Bool
     var recurrent_h: UnsafePointer[Float32, MutExternalOrigin]
     var prompt_len: Int
+    var kv_slot: Int   # sliding-layer ring slot, assigned at admission (-1 = none)
 
     def __init__(out self, id: Int, prompt: String, var tokens: List[Int], max_gen: Int):
         self.id = id
@@ -770,6 +752,7 @@ struct Sequence(Movable):
         self.pos = 0 # Starts at 0
         self.max_gen = max_gen
         self.is_finished = False
+        self.kv_slot = -1
         self.recurrent_h = alloc[Float32](2816)
         for i in range(2816):
             self.recurrent_h[i] = 0.0
@@ -784,6 +767,7 @@ struct Sequence(Movable):
         self.max_gen = take.max_gen
         self.is_finished = take.is_finished
         self.recurrent_h = take.recurrent_h
+        self.kv_slot = take.kv_slot
 
 # BenchmarkMetrics is replaced by inline scalar variables below to avoid copyinit compilation issues.
 
@@ -1053,6 +1037,33 @@ def main() raises:
 
     var CONFIG = MoEConfig[]()
 
+    # Attention mode (parsed early: it decides the KV pool layout).
+    #   default       : sliding layers attend the last 1024 keys (Gemma-4 sliding_window) and keep
+    #                   their KV in a per-sequence ring buffer; global layers are paged + full causal.
+    #   --legacy-attn : pre-Phase-0 behaviour, every layer paged + full causal attention.
+    #   --no-ring     : debug - sliding window 1024 but KV stays paged (to A/B the ring addressing).
+    var legacy_attn = False
+    var use_ring = True
+    var early_args = std.sys.argv()
+    for ai in range(1, len(early_args)):
+        if early_args[ai] == "--legacy-attn":
+            legacy_attn = True
+        elif early_args[ai] == "--no-ring":
+            use_ring = False
+    var sliding_window = 0 if legacy_attn else 1024
+    # Ring holds exactly the window: every KV write is at the current pos (prefill, decode and MTP
+    # verification are all sequential; the MTP drafter only reads), so a write at pos evicts
+    # pos - ring_size, which is already outside the window. If batched/tree verification that
+    # writes ahead of pos is ever added, ring_size must grow by the speculative depth.
+    var ring_size = sliding_window if (use_ring and not legacy_attn) else 0
+    var num_kv_slots = 2   # must be >= max_active_slots in every scheduler mode (checked below)
+    if legacy_attn:
+        print("Attention mode:      LEGACY (paged, full causal on all layers)")
+    elif ring_size > 0:
+        print("Attention mode:      sliding window 1024 + ring KV on 25 sliding layers")
+    else:
+        print("Attention mode:      sliding window 1024, paged KV (--no-ring debug)")
+
     # Initialize FFI and libc functions
     var libc = OwnedDLHandle("libc.so.6")
     var c_open = libc.get_function[def(Int, Int32, Int32) thin abi("C") -> Int32]("open")
@@ -1152,6 +1163,8 @@ def main() raises:
         var head_dim = 512 if is_global else 256
         var kv_stride = kv_heads * head_dim
         var pool_size = max_blocks * block_size * kv_stride
+        if ring_size > 0 and not is_global:
+            pool_size = num_kv_slots * ring_size * kv_stride
         total_pool_elements += pool_size
         var k_pool = alloc[Float32](pool_size)
         var v_pool = alloc[Float32](pool_size)
@@ -1175,8 +1188,6 @@ def main() raises:
     var kv_capacity = max_blocks * block_size
     var attn_scores = alloc[Float32](16 * kv_capacity)
     var attn_rows = alloc[Int](kv_capacity)
-    # Sliding-window size for the 25 sliding layers; 0 = full causal (legacy behaviour).
-    var sliding_window = 0
     var attn_out = alloc[Float32](8192)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
@@ -1461,14 +1472,15 @@ def main() raises:
                 seq_ptr[].block_table.append(new_blk)
                 
             var phys_blk_id = seq_ptr[].block_table[logical_blk]
-            var k_target_ptr = k_block_pools_ptr[][l] + (phys_blk_id * block_size + blk_offset) * kv_stride
-            var v_target_ptr = v_block_pools_ptr[][l] + (phys_blk_id * block_size + blk_offset) * kv_stride
+            var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
+            var k_target_ptr = k_block_pools_ptr[][l] + kv_row * kv_stride
+            var v_target_ptr = v_block_pools_ptr[][l] + kv_row * kv_stride
             for i in range(kv_stride):
                 k_target_ptr[i] = k_vec[i]
                 v_target_ptr[i] = v_vec[i]
                 
             # Paged Attention
-            paged_attention_layer(q, k_block_pools_ptr[][l], v_block_pools_ptr[][l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+            paged_attention_layer(q, k_block_pools_ptr[][l], v_block_pools_ptr[][l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
             
             q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
             rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -1594,8 +1606,8 @@ def main() raises:
         elif a == "--prompt-file" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             prompt_file = String(cmd_args[arg_i])
-        elif a == "--":
-            pass
+        elif a == "--" or a == "--legacy-attn" or a == "--no-ring":
+            pass   # handled by the early parse
         else:
             positional_args.append(a)
         arg_i += 1
@@ -1613,6 +1625,10 @@ def main() raises:
         # Reset block manager and pointers for this run
         block_manager = BlockManager(max_blocks, block_size)
         block_manager_ptr = UnsafePointer(to=block_manager)
+        # Sliding-layer ring slots (one per concurrently active sequence)
+        var free_kv_slots = List[Int]()
+        for si in range(num_kv_slots - 1, -1, -1):
+            free_kv_slots.append(si)
 
         # Clear/Reset counters
         run_tokens_generated_ptr[0] = 0
@@ -1656,6 +1672,9 @@ def main() raises:
 
         var pending_idx = 0
         var max_active_slots = 1 if is_chat_mode else 2 # Max concurrent requests being decoded on CPU
+        if max_active_slots > num_kv_slots:
+            print("CRITICAL: max_active_slots exceeds num_kv_slots; refusing to run")
+            return
         
         print()
         if is_chat_mode:
@@ -1717,8 +1736,11 @@ def main() raises:
             while True:
                 if len(active_sequences) >= max_active_slots or pending_idx >= len(pending_queue):
                     break
+                if len(free_kv_slots) == 0:
+                    break   # unreachable while num_kv_slots >= max_active_slots (asserted at startup)
                 var seq_ptr = pending_queue[pending_idx]
                 pending_idx += 1
+                seq_ptr[].kv_slot = free_kv_slots.pop()
                 if not is_chat_mode:
                     print("\n[Scheduler] Dequeuing prompt #" + String(seq_ptr[].id) + " to fill active slot...")
                     print("  Prompt: \"" + seq_ptr[].prompt + "\"")
@@ -1781,14 +1803,15 @@ def main() raises:
                             seq_ptr[].block_table.append(new_blk)
                             
                         var phys_blk_id = seq_ptr[].block_table[logical_blk]
-                        var k_target_ptr = k_block_pools[l] + (phys_blk_id * block_size + blk_offset) * kv_stride
-                        var v_target_ptr = v_block_pools[l] + (phys_blk_id * block_size + blk_offset) * kv_stride
+                        var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
+                        var k_target_ptr = k_block_pools[l] + kv_row * kv_stride
+                        var v_target_ptr = v_block_pools[l] + kv_row * kv_stride
                         for i in range(kv_stride):
                             k_target_ptr[i] = k_vec[i]
                             v_target_ptr[i] = v_vec[i]
                             
                         # 6. Paged Attention
-                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
                         
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -1929,7 +1952,8 @@ def main() raises:
                             draft_active_token, cur_recurrent_h, mtp_weights, mtp_layers,
                             seq_ptr[].block_table, block_size, k_block_pools, v_block_pools,
                             rope_pos, kv_pos, mtp_h_next, mtp_logits, mtp_config, num_tasks,
-                            embed, real_weights_loaded
+                            embed, real_weights_loaded,
+                            ring_size, (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0)
                         )
                         
                         var sampled_tok = 0
@@ -2069,14 +2093,15 @@ def main() raises:
                             seq_ptr[].block_table.append(new_blk)
                             
                         var phys_blk_id = seq_ptr[].block_table[logical_blk]
-                        var k_target_ptr = k_block_pools[l] + (phys_blk_id * block_size + blk_offset) * kv_stride
-                        var v_target_ptr = v_block_pools[l] + (phys_blk_id * block_size + blk_offset) * kv_stride
+                        var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
+                        var k_target_ptr = k_block_pools[l] + kv_row * kv_stride
+                        var v_target_ptr = v_block_pools[l] + kv_row * kv_stride
                         for i in range(kv_stride):
                             k_target_ptr[i] = k_vec[i]
                             v_target_ptr[i] = v_vec[i]
                             
                         # Paged Attention
-                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out, (0 if is_global else ring_size), (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0))
                         
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
@@ -2204,6 +2229,8 @@ def main() raises:
                         print("\n[Scheduler] Request #" + String(s_ptr[].id) + " finished! Retiring and freeing " + String(len(s_ptr[].block_table)) + " blocks...")
                     for b in range(len(s_ptr[].block_table)):
                         block_manager.free(s_ptr[].block_table[b])
+                    if s_ptr[].kv_slot >= 0:
+                        free_kv_slots.append(s_ptr[].kv_slot)
                     s_ptr[].recurrent_h.free()
                     s_ptr.free()
                 else:
