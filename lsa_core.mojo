@@ -290,6 +290,9 @@ struct LSALayerIndex:
         Appends a 64-d unit index key at position pos.
         When pos closes a 512-token cluster block, runs Ward clustering and populates bucket cache.
         """
+        if pos >= self.max_capacity:
+            return
+
         var local_pos = pos % LSA_CLUSTER_BLOCK_SIZE
         var dest = self.staging_keys + local_pos * LSA_DIM
         for i in range(0, LSA_DIM, 8):
@@ -303,8 +306,10 @@ struct LSALayerIndex:
 
     def ward_cluster_block(mut self):
         var b = self.closed_blocks
-        var block_start_token = b * LSA_CLUSTER_BLOCK_SIZE
         var bucket_base = b * LSA_BLOCK_BUCKET_COUNT
+        if bucket_base + LSA_BLOCK_BUCKET_COUNT > self.max_buckets:
+            return
+        var block_start_token = b * LSA_CLUSTER_BLOCK_SIZE
 
         # 1. Pool 4 consecutive keys -> 128 pools
         for p in range(LSA_POOLS_PER_BLOCK):
@@ -435,12 +440,13 @@ struct LSALayerIndex:
         var label = 0
         for i in range(LSA_POOLS_PER_BLOCK):
             if self.ward_alive[i]:
-                self.ward_root_to_label[i] = label
+                self.ward_root_to_label[i] = min(label, LSA_BLOCK_BUCKET_COUNT - 1)
                 label += 1
 
         for i in range(LSA_POOLS_PER_BLOCK):
             var root = self.ward_parent[i]
-            self.staging_labels[i] = self.ward_root_to_label[root]
+            var raw_lbl = self.ward_root_to_label[root]
+            self.staging_labels[i] = min(max(0, raw_lbl), LSA_BLOCK_BUCKET_COUNT - 1)
 
         # Reset bucket storage for this block
         for k in range(LSA_BLOCK_BUCKET_COUNT):

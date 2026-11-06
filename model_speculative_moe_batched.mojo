@@ -2467,6 +2467,7 @@ def main() raises:
     k_vec.free()
     v_vec.free()
     attn_scores.free()
+    attn_rows.free()
     attn_out.free()
     proj_attn_out.free()
     shared_h1.free()
