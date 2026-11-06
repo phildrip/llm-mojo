@@ -1,4 +1,5 @@
 from std.math import exp
+from std.os import abort
 
 # =============================================================================
 # Shared paged attention kernel for the Gemma-4 AR engines.
@@ -32,6 +33,17 @@ def attention_window_start(pos: Int, window: Int) -> Int:
 
 
 @always_inline
+def ring_row(slot: Int, ring_size: Int, t: Int) -> Int:
+    """Physical row of token `t` in sequence slot `slot` of a ring-buffer KV pool.
+
+    Single source of truth for ring addressing: the engine's KV write sites and the
+    kernel's reads both go through here.
+    """
+    debug_assert(slot >= 0 and ring_size > 0 and t >= 0, "invalid ring address")
+    return slot * ring_size + t % ring_size
+
+
+@always_inline
 def _softmax(scores: UnsafePointer[Float32, MutUntrackedOrigin], size: Int):
     # Kept identical to the engine's `softmax` so the no-window path stays bit-exact.
     var max_val = scores[0]
@@ -60,6 +72,8 @@ def paged_attention_layer(
     scores: UnsafePointer[Float32, MutUntrackedOrigin],
     rows: UnsafePointer[Int, MutUntrackedOrigin],
     attn_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    ring_size: Int = 0,
+    ring_base: Int = 0,
 ):
     """Single-query attention over a paged KV cache.
 
@@ -77,6 +91,10 @@ def paged_attention_layer(
         scores: Scratch, at least num_heads * (number of attended keys) floats.
         rows: Scratch, at least (number of attended keys) ints.
         attn_out: Output [num_heads * head_dim].
+        ring_size: If > 0, the cache is a ring buffer: token t lives at physical row
+            ring_base + t % ring_size and block_table/block_size are ignored. Requires
+            ring_size >= number of attended keys (else live keys would alias).
+        ring_base: First physical row of this sequence's ring.
     """
     var kv_stride = num_kv_heads * head_dim
     var ratio = num_heads // num_kv_heads
@@ -84,12 +102,19 @@ def paged_attention_layer(
     var n = pos + 1 - start_t
     debug_assert(num_kv_heads > 0 and num_heads % num_kv_heads == 0, "num_kv_heads must divide num_heads")
     debug_assert(head_dim % 8 == 0, "head_dim must be a multiple of 8")
-    debug_assert(pos >= 0 and pos // block_size < len(block_table), "pos beyond the sequence's block table")
-
     # Resolve physical cache offsets once per attended token.
-    for i in range(n):
-        var t = start_t + i
-        rows[i] = (block_table[t // block_size] * block_size + t % block_size) * kv_stride
+    if ring_size > 0:
+        # Hard check (not debug-only): a ring smaller than the window silently aliases live keys.
+        if n > ring_size:
+            abort("paged_attention_layer: ring_size smaller than the attended window")
+        for i in range(n):
+            var t = start_t + i
+            rows[i] = (ring_base + t % ring_size) * kv_stride
+    else:
+        debug_assert(pos >= 0 and pos // block_size < len(block_table), "pos beyond the sequence's block table")
+        for i in range(n):
+            var t = start_t + i
+            rows[i] = (block_table[t // block_size] * block_size + t % block_size) * kv_stride
 
     for g in range(num_kv_heads):
         var g_offset = g * head_dim

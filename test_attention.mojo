@@ -1,7 +1,7 @@
 from std.memory import alloc
 from std.math import exp
 from std.testing import assert_equal, assert_true
-from attention import paged_attention_layer, attention_window_start
+from attention import paged_attention_layer, attention_window_start, ring_row
 
 # =============================================================================
 # Phase 0 tests for the shared paged attention kernel (attention.mojo).
@@ -497,11 +497,146 @@ def test_window_block_aligned_edge() raises:
     fx3.free()
 
 
+def test_ring_matches_paged() raises:
+    # Ring-buffer addressing (row = ring_base + t % ring_size) must give BIT-IDENTICAL results to
+    # paged addressing when the same K/V rows are placed in the ring. Evicted slots hold garbage
+    # that must never be read.
+    print("test_ring_matches_paged")
+    var heads = 16
+    var kv_heads = 8
+    var head_dim = 256
+    var kv_stride = kv_heads * head_dim
+    var window = 1024
+    var ring_size = 1024 + 64
+    var num_slots = 3
+    var fx = Fixture(heads, kv_heads, head_dim, 77, 0.25)
+    var ring_k = alloc[Float32](num_slots * ring_size * kv_stride)
+    var ring_v = alloc[Float32](num_slots * ring_size * kv_stride)
+    var out_paged = alloc[Float32](heads * head_dim)
+    var empty_table = List[Int]()
+    for slot in [0, 2]:
+        var ring_base = slot * ring_size
+        for pos in [0, 1, 1023, 1024, 1087, 1088, 1089, 2000, CAPACITY - 1]:
+            # Poison the whole ring, then place exactly the attended window.
+            for i in range(num_slots * ring_size * kv_stride):
+                ring_k[i] = 9999.0
+                ring_v[i] = -9999.0
+            var start_t = attention_window_start(pos, window)
+            for t in range(start_t, pos + 1):
+                var src = (fx.table[t // BLOCK_SIZE] * BLOCK_SIZE + t % BLOCK_SIZE) * kv_stride
+                var dst = (ring_base + t % ring_size) * kv_stride
+                for d in range(kv_stride):
+                    ring_k[dst + d] = fx.k_pool[src + d]
+                    ring_v[dst + d] = fx.v_pool[src + d]
+            fx.run_new(pos, window)
+            for i in range(heads * head_dim):
+                out_paged[i] = fx.out_new[i]
+            paged_attention_layer(
+                fx.q, ring_k, ring_v, empty_table, BLOCK_SIZE, pos,
+                heads, kv_heads, head_dim, window,
+                fx.scores, fx.rows, fx.out_new, ring_size, ring_base,
+            )
+            var mismatches = 0
+            for i in range(heads * head_dim):
+                if fx.out_new[i] != out_paged[i]:
+                    mismatches += 1
+            assert_equal(mismatches, 0, "ring vs paged slot=" + String(slot) + " pos=" + String(pos))
+            fx.check_canaries()
+    ring_k.free()
+    ring_v.free()
+    out_paged.free()
+    fx.free()
+
+
+def ring_write(
+    src: Fixture,
+    ring_k: UnsafePointer[Float32, MutUntrackedOrigin],
+    ring_v: UnsafePointer[Float32, MutUntrackedOrigin],
+    slot: Int, ring_size: Int, pos: Int,
+):
+    var kv_stride = src.kv_stride
+    var paged_row = (src.table[pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE) * kv_stride
+    var dst = ring_row(slot, ring_size, pos) * kv_stride
+    for d in range(kv_stride):
+        ring_k[dst + d] = src.k_pool[paged_row + d]
+        ring_v[dst + d] = src.v_pool[paged_row + d]
+
+
+def ring_check(
+    src: Fixture,
+    ring_k: UnsafePointer[Float32, MutUntrackedOrigin],
+    ring_v: UnsafePointer[Float32, MutUntrackedOrigin],
+    out_ring: UnsafePointer[Float32, MutUntrackedOrigin],
+    slot: Int, ring_size: Int, window: Int, pos: Int, empty_table: List[Int],
+) raises:
+    src.run_new(pos, window)
+    paged_attention_layer(
+        src.q, ring_k, ring_v, empty_table, BLOCK_SIZE, pos,
+        src.heads, src.kv_heads, src.head_dim, window,
+        src.scores, src.rows, out_ring, ring_size, ring_row(slot, ring_size, 0),
+    )
+    var mismatches = 0
+    for i in range(src.heads * src.head_dim):
+        if out_ring[i] != src.out_new[i]:
+            mismatches += 1
+    assert_equal(mismatches, 0, "interleaved ring slot=" + String(slot) + " pos=" + String(pos))
+
+
+def test_ring_interleaved_writes() raises:
+    # Simulates the engine: two sequences (slots 0 and 1) decode in lockstep, each writing its own
+    # K/V at ring_row(slot, ring_size, pos) - the SAME helper the engine write sites use - then
+    # attending. Every step must be bit-identical to paged attention over that sequence's history.
+    print("test_ring_interleaved_writes")
+    var heads = 16
+    var kv_heads = 8
+    var head_dim = 256
+    var kv_stride = kv_heads * head_dim
+    var window = 1024
+    var ring_size = window
+    var steps = 2600
+    var fa = Fixture(heads, kv_heads, head_dim, 301, 0.25)   # history of sequence A (paged source)
+    var fb = Fixture(heads, kv_heads, head_dim, 302, 0.25)   # history of sequence B
+    var ring_k = alloc[Float32](2 * ring_size * kv_stride)
+    var ring_v = alloc[Float32](2 * ring_size * kv_stride)
+    for i in range(2 * ring_size * kv_stride):
+        ring_k[i] = 9999.0
+        ring_v[i] = -9999.0
+    var out_ring = alloc[Float32](heads * head_dim)
+    var empty_table = List[Int]()
+    var checked = 0
+    for pos in range(min(steps, CAPACITY)):
+        ring_write(fa, ring_k, ring_v, 0, ring_size, pos)
+        ring_write(fb, ring_k, ring_v, 1, ring_size, pos)
+        # Attend at a sample of positions (every step near the wrap points, sparse elsewhere).
+        var near_wrap = (pos % ring_size) < 3 or (pos % ring_size) > ring_size - 3
+        if near_wrap or pos % 97 == 0 or pos == CAPACITY - 1:
+            ring_check(fa, ring_k, ring_v, out_ring, 0, ring_size, window, pos, empty_table)
+            ring_check(fb, ring_k, ring_v, out_ring, 1, ring_size, window, pos, empty_table)
+            checked += 2
+    assert_true(checked > 50, "interleaved test checked too few positions")
+    ring_k.free()
+    ring_v.free()
+    out_ring.free()
+    fa.free()
+    fb.free()
+
+
+def test_ring_row() raises:
+    print("test_ring_row")
+    assert_equal(ring_row(0, 1024, 0), 0)
+    assert_equal(ring_row(0, 1024, 1023), 1023)
+    assert_equal(ring_row(0, 1024, 1024), 0)
+    assert_equal(ring_row(1, 1024, 0), 1024)
+    assert_equal(ring_row(1, 1024, 2049), 1024 + 1)
+    assert_equal(ring_row(3, 100, 250), 350)
+
+
 def main() raises:
     print("=========================================================")
     print("        PHASE 0: SHARED PAGED ATTENTION KERNEL TESTS     ")
     print("=========================================================")
     test_window_start()
+    test_ring_row()
     test_full_bit_exact(16, 2, 512, "global(16q/2kv/512)")
     test_full_bit_exact(16, 8, 256, "sliding(16q/8kv/256)")
     test_window_is_noop_when_short()
@@ -511,4 +646,6 @@ def main() raises:
     test_tight_scratch_contract()
     test_ratio_one_and_seeds()
     test_window_block_aligned_edge()
+    test_ring_matches_paged()
+    test_ring_interleaved_writes()
     print("ALL ATTENTION TESTS PASSED")
