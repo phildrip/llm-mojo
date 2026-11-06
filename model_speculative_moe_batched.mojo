@@ -6,6 +6,7 @@ import std.os
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
+from attention import paged_attention_layer
 import std.time
 
 # -----------------------------------------------------------------------------
@@ -1168,9 +1169,14 @@ def main() raises:
     var q = alloc[Float32](8192)
     var k_vec = alloc[Float32](2048)
     var v_vec = alloc[Float32](2048)
-    # Sized to the paged KV capacity: attention writes one score per attended position.
-    # (Previously CONFIG.max_seq_len = 100, which overflowed for any context > 100 tokens.)
-    var attn_scores = alloc[Float32](max_blocks * block_size)
+    # Attention scratch, sized to the paged KV capacity (see attention.mojo contract):
+    #   scores: num_heads * attended_keys, rows: attended_keys.
+    # (Previously CONFIG.max_seq_len = 100 floats, which overflowed for any context > 100 tokens.)
+    var kv_capacity = max_blocks * block_size
+    var attn_scores = alloc[Float32](16 * kv_capacity)
+    var attn_rows = alloc[Int](kv_capacity)
+    # Sliding-window size for the 25 sliding layers; 0 = full causal (legacy behaviour).
+    var sliding_window = 0
     var attn_out = alloc[Float32](8192)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
@@ -1462,39 +1468,8 @@ def main() raises:
                 v_target_ptr[i] = v_vec[i]
                 
             # Paged Attention
-            for h in range(layer_heads):
-                var h_offset = h * layer_head_dim
-                var g = h // ratio
-                var g_offset = g * layer_head_dim
-                for t in range(pos + 1):
-                    var t_logical_blk = t // block_size
-                    var t_blk_offset = t % block_size
-                    var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                    var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                    
-                    var score_vec = SIMD[DType.float32, 8](0.0)
-                    for d in range(0, layer_head_dim, 8):
-                        score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools_ptr[][l].load[8](t_cache_offset + d)
-                    attn_scores[t] = score_vec.reduce_add()
-                    
-                softmax(attn_scores, pos + 1)
-                
-                for d in range(0, layer_head_dim, 8):
-                    attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
-                    
-                for t in range(pos + 1):
-                    var t_logical_blk = t // block_size
-                    var t_blk_offset = t % block_size
-                    var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                    var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                    
-                    var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
-                    for d in range(0, layer_head_dim, 8):
-                        attn_out.store[8](
-                            h_offset + d, 
-                            attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools_ptr[][l].load[8](t_cache_offset + d)
-                        )
-                    
+            paged_attention_layer(q, k_block_pools_ptr[][l], v_block_pools_ptr[][l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+            
             q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
             rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
             for i in range(CONFIG.embed_dim):
@@ -1813,40 +1788,8 @@ def main() raises:
                             v_target_ptr[i] = v_vec[i]
                             
                         # 6. Paged Attention
-                        for h in range(layer_heads):
-                            var h_offset = h * layer_head_dim
-                            var g = h // ratio
-                            var g_offset = g * layer_head_dim
-                            for t in range(pos + 1):
-                                var t_logical_blk = t // block_size
-                                var t_blk_offset = t % block_size
-                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                
-                                var score_vec = SIMD[DType.float32, 8](0.0)
-                                for d in range(0, layer_head_dim, 8):
-                                    score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools[l].load[8](t_cache_offset + d)
-                                attn_scores[t] = score_vec.reduce_add()
-                                
-                            softmax(attn_scores, pos + 1)
-                            
-                            for d in range(0, layer_head_dim, 8):
-                                attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
-                                
-                            for t in range(pos + 1):
-                                var t_logical_blk = t // block_size
-                                var t_blk_offset = t % block_size
-                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                
-                                var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
-                                for d in range(0, layer_head_dim, 8):
-                                    attn_out.store[8](
-                                        h_offset + d, 
-                                        attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools[l].load[8](t_cache_offset + d)
-                                    )
-                                
-                        # 7. Out Projection & Residual Add
+                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+                        
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
                         for i in range(CONFIG.embed_dim):
@@ -2133,39 +2076,8 @@ def main() raises:
                             v_target_ptr[i] = v_vec[i]
                             
                         # Paged Attention
-                        for h in range(layer_heads):
-                            var h_offset = h * layer_head_dim
-                            var g = h // ratio
-                            var g_offset = g * layer_head_dim
-                            for t in range(pos + 1):
-                                var t_logical_blk = t // block_size
-                                var t_blk_offset = t % block_size
-                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                
-                                var score_vec = SIMD[DType.float32, 8](0.0)
-                                for d in range(0, layer_head_dim, 8):
-                                    score_vec = score_vec + q.load[8](h_offset + d) * k_block_pools[l].load[8](t_cache_offset + d)
-                                attn_scores[t] = score_vec.reduce_add()
-                                
-                            softmax(attn_scores, pos + 1)
-                            
-                            for d in range(0, layer_head_dim, 8):
-                                attn_out.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
-                                
-                            for t in range(pos + 1):
-                                var t_logical_blk = t // block_size
-                                var t_blk_offset = t % block_size
-                                var t_phys_blk_id = seq_ptr[].block_table[t_logical_blk]
-                                var t_cache_offset = (t_phys_blk_id * block_size + t_blk_offset) * kv_stride + g_offset
-                                
-                                var alpha_vec = SIMD[DType.float32, 8](attn_scores[t])
-                                for d in range(0, layer_head_dim, 8):
-                                    attn_out.store[8](
-                                        h_offset + d, 
-                                        attn_out.load[8](h_offset + d) + alpha_vec * v_block_pools[l].load[8](t_cache_offset + d)
-                                    )
-                                
+                        paged_attention_layer(q, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos, layer_heads, layer_kv_heads, layer_head_dim, (0 if is_global else sliding_window), attn_scores, attn_rows, attn_out)
+                        
                         q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
                         rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
                         for i in range(CONFIG.embed_dim):
