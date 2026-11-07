@@ -330,32 +330,27 @@ struct LSALayerIndex:
 
         var active_count = LSA_POOLS_PER_BLOCK
 
-        # 3. Ward merge rounds
+        # 3. Initial symmetric Gram matrix using SIMD dot products (computed once!)
+        for i in range(LSA_POOLS_PER_BLOCK):
+            var i_off = i * LSA_DIM
+            for j in range(i, LSA_POOLS_PER_BLOCK):
+                var j_off = j * LSA_DIM
+                var acc = SIMD[DType.float32, 8](0.0)
+                for d in range(0, LSA_DIM, 8):
+                    acc += self.ward_key_sums.load[8](i_off + d) * self.ward_key_sums.load[8](j_off + d)
+                var dot = acc.reduce_add()
+                self.ward_gram[i * LSA_POOLS_PER_BLOCK + j] = dot
+                self.ward_gram[j * LSA_POOLS_PER_BLOCK + i] = dot
+
+        for i in range(LSA_POOLS_PER_BLOCK):
+            var g_ii = self.ward_gram[i * LSA_POOLS_PER_BLOCK + i]
+            self.ward_alignments[i] = sqrt(g_ii if g_ii > 0.0 else 0.0)
+
+        # 4. Ward merge rounds (only recompute Gram row/col for merged clusters!)
         for _ in range(256):
             var merges_left = active_count - LSA_BLOCK_BUCKET_COUNT
             if merges_left <= 0:
                 break
-
-            # Symmetric Gram matrix using SIMD dot products
-            for i in range(LSA_POOLS_PER_BLOCK):
-                if not self.ward_alive[i]:
-                    continue
-                var i_off = i * LSA_DIM
-                for j in range(i, LSA_POOLS_PER_BLOCK):
-                    if not self.ward_alive[j]:
-                        continue
-                    var j_off = j * LSA_DIM
-                    var acc = SIMD[DType.float32, 8](0.0)
-                    for d in range(0, LSA_DIM, 8):
-                        acc += self.ward_key_sums.load[8](i_off + d) * self.ward_key_sums.load[8](j_off + d)
-                    var dot = acc.reduce_add()
-                    self.ward_gram[i * LSA_POOLS_PER_BLOCK + j] = dot
-                    self.ward_gram[j * LSA_POOLS_PER_BLOCK + i] = dot
-
-            for i in range(LSA_POOLS_PER_BLOCK):
-                if self.ward_alive[i]:
-                    var g_ii = self.ward_gram[i * LSA_POOLS_PER_BLOCK + i]
-                    self.ward_alignments[i] = sqrt(g_ii if g_ii > 0.0 else 0.0)
 
             # Find cheapest allowed partner
             for i in range(LSA_POOLS_PER_BLOCK):
@@ -420,6 +415,20 @@ struct LSALayerIndex:
                     self.ward_parent[v] = u
                     active_count -= 1
                     merges_done += 1
+
+                    # Incremental Gram row/col update for merged cluster u
+                    for k in range(LSA_POOLS_PER_BLOCK):
+                        if not self.ward_alive[k]:
+                            continue
+                        var k_off = k * LSA_DIM
+                        var acc = SIMD[DType.float32, 8](0.0)
+                        for d in range(0, LSA_DIM, 8):
+                            acc += self.ward_key_sums.load[8](u_off + d) * self.ward_key_sums.load[8](k_off + d)
+                        var dot = acc.reduce_add()
+                        self.ward_gram[u * LSA_POOLS_PER_BLOCK + k] = dot
+                        self.ward_gram[k * LSA_POOLS_PER_BLOCK + u] = dot
+                    var g_uu = self.ward_gram[u * LSA_POOLS_PER_BLOCK + u]
+                    self.ward_alignments[u] = sqrt(g_uu if g_uu > 0.0 else 0.0)
 
             if merges_done == 0:
                 break

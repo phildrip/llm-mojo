@@ -50,6 +50,8 @@ __pycache__/
 
 test_bin_*
 /model_diffusion
+/model_diffusion_new
+/gemma4_chat
 
 
 # Beads / Dolt files (added by bd init)

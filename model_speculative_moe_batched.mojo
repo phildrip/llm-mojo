@@ -17,6 +17,7 @@ from lsa_core import (
     GEMMA4_INDEX_DIM,
 )
 from lsa_pca import load_projections_file
+from kfd_gpu import KFDContext, GPUMemoryBuffer, HSACOKernel
 import std.time
 
 # -----------------------------------------------------------------------------
@@ -1122,6 +1123,7 @@ def main() raises:
     var lsa_proj_path = String("gemma4_lsa_projections.bin")
     var max_kv_tokens = 8192
     var early_no_mtp = False
+    var use_gpu = False
 
     var early_args = std.sys.argv()
     for ai in range(1, len(early_args)):
@@ -1131,6 +1133,10 @@ def main() raises:
             use_ring = False
         elif early_args[ai] == "--no-mtp" or early_args[ai] == "--no-spec":
             early_no_mtp = True
+        elif early_args[ai] == "--gpu" or early_args[ai] == "--kfd":
+            use_gpu = True
+        elif early_args[ai] == "--no-gpu" or early_args[ai] == "--cpu":
+            use_gpu = False
         elif early_args[ai] == "--dump-qk" and ai + 1 < len(early_args):
             dump_qk_path = String(early_args[ai + 1])
         elif early_args[ai] == "--lsa":
@@ -1171,7 +1177,17 @@ def main() raises:
     var free_c = libc.get_function[def(Int) thin abi("C") -> None]("free")
     var c_read = libc.get_function[def(Int32, Int, Int) thin abi("C") -> Int]("read")
 
-    # 1. Allocate and Load MoE Weights (RAM-resident)
+    var gpu_ctx = KFDContext(
+        init_queue=use_gpu,
+        default_hsaco_path="/home/phil/git/llm-mojo/scratch/q4_matmul_lds.hsaco" if use_gpu else "",
+        default_kernel_name="q4_matmul" if use_gpu else "",
+    )
+    if use_gpu:
+        print("Execution Mode:      Hybrid CPU + AMD KFD iGPU (GPU ID: " + String(gpu_ctx.gpu_id) + ", q4_matmul_lds.hsaco)")
+    else:
+        print("Execution Mode:      Multi-threaded CPU SIMD (--gpu to enable AMD KFD iGPU)")
+
+    # 1. Allocate and Load MoE Weights (RAM-resident or Zero-Copy GTT)
     var weights_file = String("gemma4_moe_weights_q4.bin")
     print("Opening MoE weights file '" + weights_file + "'...")
     var path_bytes = weights_file.as_bytes()
@@ -1186,15 +1202,21 @@ def main() raises:
         return
 
     var weights_file_size: Int = 15311790080
-    var memptr_weights = alloc[Int](1)
-    var err_weights = posix_memalign(memptr_weights.__int__(), 4096, weights_file_size)
-    if err_weights != 0:
-        print("CRITICAL: Failed to allocate aligned memory for MoE weights (14.3 GB)!")
-        _ = c_close(weights_fd)
+    var weights_gpu_buf = GPUMemoryBuffer()
+    var base_addr: Int = 0
+    if use_gpu:
+        weights_gpu_buf = gpu_ctx.alloc_gpu_buffer(weights_file_size)
+        base_addr = weights_gpu_buf.cpu_addr
+    else:
+        var memptr_weights = alloc[Int](1)
+        var err_weights = posix_memalign(memptr_weights.__int__(), 4096, weights_file_size)
+        if err_weights != 0:
+            print("CRITICAL: Failed to allocate aligned memory for MoE weights (14.3 GB)!")
+            _ = c_close(weights_fd)
+            memptr_weights.free()
+            return
+        base_addr = memptr_weights[0]
         memptr_weights.free()
-        return
-    var base_addr = memptr_weights[0]
-    memptr_weights.free()
     var base_ptr = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=base_addr)
 
     print("Loading MoE weights into RAM (14.26 GB) in chunks...")
@@ -1214,6 +1236,16 @@ def main() raises:
             print("  Loaded: ", total_read // 1024 // 1024 // 1024, " GB / 14 GB...")
     print("Successfully loaded all MoE weights into RAM: ", total_read, " bytes")
     _ = c_close(weights_fd)
+
+    if use_gpu:
+        print("Flushing CPU cache lines for dense Q4 attention & shared MLP weights...")
+        for l in range(30):
+            var lw = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+            var dense_packed_bytes = lw.experts_gate_up_packed.__int__() - lw.wq_packed.__int__()
+            var dense_scales_bytes = lw.experts_gate_up_scales.__int__() - lw.wq_scales.__int__()
+            gpu_ctx.flush_cache_range(lw.wq_packed.__int__(), dense_packed_bytes)
+            gpu_ctx.flush_cache_range(lw.wq_scales.__int__(), dense_scales_bytes)
+        print("Dense Q4 weights & scales ready for zero-copy KFD GPU access!")
 
     # 2. Allocate and Load Final Layer Norm Weights
     var final_norm_file = String("gemma4_moe_final_norm.bin")
@@ -1274,7 +1306,49 @@ def main() raises:
         v_block_pools.append(v_pool)
     print("Allocating Virtual Paged Attention pools: ", (total_pool_elements * 4) // 1024 // 1024, " MB total...")
 
-    # 5. Allocate thread-safe reusable activation buffers
+    # 5. Allocate thread-safe reusable activation buffers (and GPU GTT prefill/decode buffers when use_gpu=True)
+    comptime MAX_PREFILL_BATCH = 64
+    var pref_x_buf = GPUMemoryBuffer()
+    var pref_norm_x_buf = GPUMemoryBuffer()
+    var pref_q_buf = GPUMemoryBuffer()
+    var pref_k_buf = GPUMemoryBuffer()
+    var pref_v_buf = GPUMemoryBuffer()
+    var pref_attn_out_buf = GPUMemoryBuffer()
+    var pref_proj_out_buf = GPUMemoryBuffer()
+    var pref_h1_buf = GPUMemoryBuffer()
+    var pref_h2_buf = GPUMemoryBuffer()
+    var pref_gate_buf = GPUMemoryBuffer()
+    var pref_mlp_out_buf = GPUMemoryBuffer()
+    var gpu_mlp_norm_x_buf = GPUMemoryBuffer()
+
+    if use_gpu:
+        pref_x_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.embed_dim * 4)
+        pref_norm_x_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.embed_dim * 4)
+        pref_q_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * 8192 * 4)
+        pref_k_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * 2048 * 4)
+        pref_v_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * 2048 * 4)
+        pref_attn_out_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * 8192 * 4)
+        pref_proj_out_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.embed_dim * 4)
+        pref_h1_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.standard_mlp_dim * 4)
+        pref_h2_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.standard_mlp_dim * 4)
+        pref_gate_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.standard_mlp_dim * 4)
+        pref_mlp_out_buf = gpu_ctx.alloc_gpu_buffer(MAX_PREFILL_BATCH * CONFIG.embed_dim * 4)
+        gpu_mlp_norm_x_buf = gpu_ctx.alloc_gpu_buffer(CONFIG.embed_dim * 4)
+
+    var pref_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_x_buf.cpu_addr if use_gpu else 1)
+    var pref_norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_norm_x_buf.cpu_addr if use_gpu else 1)
+    var pref_q = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_q_buf.cpu_addr if use_gpu else 1)
+    var pref_k = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_k_buf.cpu_addr if use_gpu else 1)
+    var pref_v = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_v_buf.cpu_addr if use_gpu else 1)
+    var pref_attn_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_attn_out_buf.cpu_addr if use_gpu else 1)
+    var pref_proj_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_proj_out_buf.cpu_addr if use_gpu else 1)
+    var pref_h1 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_h1_buf.cpu_addr if use_gpu else 1)
+    var pref_h2 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_h2_buf.cpu_addr if use_gpu else 1)
+    var pref_gate = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_gate_buf.cpu_addr if use_gpu else 1)
+    var pref_mlp_out = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=pref_mlp_out_buf.cpu_addr if use_gpu else 1)
+    var gpu_mlp_norm_x = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=gpu_mlp_norm_x_buf.cpu_addr if use_gpu else 1)
+    var pref_moe_out_norm = alloc[Float32](MAX_PREFILL_BATCH * CONFIG.embed_dim)
+
     var local_x = alloc[Float32](CONFIG.embed_dim)
     var norm_x = alloc[Float32](CONFIG.embed_dim)
     var scaled_norm_x = alloc[Float32](CONFIG.embed_dim)
@@ -1290,8 +1364,8 @@ def main() raises:
     var attn_out = alloc[Float32](8192)
     var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
     
-    var shared_h1 = alloc[Float32](CONFIG.standard_mlp_dim)
-    var shared_h2 = alloc[Float32](CONFIG.standard_mlp_dim)
+    var shared_h1 = pref_h1 if use_gpu else alloc[Float32](CONFIG.standard_mlp_dim)
+    var shared_h2 = pref_h2 if use_gpu else alloc[Float32](CONFIG.standard_mlp_dim)
     var shared_ffn_out_gate = alloc[Float32](CONFIG.standard_mlp_dim)
     var shared_mlp_out = alloc[Float32](CONFIG.embed_dim)
     var shared_h1_norm = alloc[Float32](CONFIG.embed_dim)
@@ -1540,6 +1614,7 @@ def main() raises:
     var block_manager_ptr = UnsafePointer(to=block_manager)
     var k_block_pools_ptr = UnsafePointer(to=k_block_pools)
     var v_block_pools_ptr = UnsafePointer(to=v_block_pools)
+    var gpu_ctx_ptr = UnsafePointer(to=gpu_ctx)
 
     var run_tokens_generated_ptr = alloc[Int](1)
     var run_target_steps_ptr = alloc[Int](1)
@@ -1628,13 +1703,48 @@ def main() raises:
             for i in range(CONFIG.embed_dim):
                 local_x[i] += proj_attn_out[i]
                 
-            # Feedforward
-            rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-            q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-            q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-            gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
-            q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-            rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+            # Feedforward (Hybrid iGPU Shared MLP overlapped with CPU MoE Router + Top-8 Experts when use_gpu=True)
+            var slot_gate = 0
+            var slot_up = 0
+            var gpu_dispatched = False
+            if use_gpu:
+                rms_norm(local_x, weights.pre_feedforward_layernorm_weight, gpu_mlp_norm_x, CONFIG.embed_dim)
+                try:
+                    slot_gate = gpu_ctx_ptr[].enqueue_matmul(
+                        weights.w_gate_packed.__int__(),
+                        weights.w_gate_scales.__int__(),
+                        gpu_mlp_norm_x.__int__(),
+                        shared_h1.__int__(),
+                        CONFIG.embed_dim,
+                        CONFIG.standard_mlp_dim,
+                        batch_size=1,
+                        flush_cache=True,
+                        barrier=False,
+                        ring_doorbell_now=False,
+                    )
+                    slot_up = gpu_ctx_ptr[].enqueue_matmul(
+                        weights.w_up_packed.__int__(),
+                        weights.w_up_scales.__int__(),
+                        gpu_mlp_norm_x.__int__(),
+                        shared_h2.__int__(),
+                        CONFIG.embed_dim,
+                        CONFIG.standard_mlp_dim,
+                        batch_size=1,
+                        flush_cache=False,
+                        barrier=False,
+                        ring_doorbell_now=False,
+                    )
+                    gpu_ctx_ptr[].ring_doorbell()
+                    gpu_dispatched = True
+                except:
+                    gpu_dispatched = False
+            if not gpu_dispatched:
+                rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
             
             rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
             for j in range(CONFIG.embed_dim):
@@ -1689,6 +1799,22 @@ def main() raises:
                     moe_out[j] += exp_down_out[j] * w_e
                     
             rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
+
+            if gpu_dispatched:
+                var gpu_completed = False
+                try:
+                    gpu_ctx_ptr[].wait_matmul(slot_gate, shared_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=1)
+                    gpu_ctx_ptr[].wait_matmul(slot_up, shared_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=1)
+                    gpu_completed = True
+                except:
+                    gpu_completed = False
+                if not gpu_completed:
+                    rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                    q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                    q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
             
             for i in range(CONFIG.embed_dim):
                 combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
@@ -1749,7 +1875,7 @@ def main() raises:
         elif a == "--prompt-file" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             prompt_file = String(cmd_args[arg_i])
-        elif a == "--" or a == "--legacy-attn" or a == "--no-ring" or a == "--lsa":
+        elif a == "--" or a == "--legacy-attn" or a == "--no-ring" or a == "--lsa" or a == "--gpu" or a == "--kfd" or a == "--no-gpu" or a == "--cpu":
             pass   # handled by the early parse
         elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections" or a == "--max-kv-tokens") and arg_i + 1 < len(cmd_args):
             arg_i += 1  # handled by early parse
@@ -1840,6 +1966,7 @@ def main() raises:
             print("=========================================================")
             print("   GEMMA 4 SPECULATIVE MOE INTERACTIVE CHAT AGENT        ")
             print("=========================================================")
+            print("  Execution Mode:            " + ("Hybrid CPU + AMD KFD iGPU (q4_matmul_lds.hsaco)" if use_gpu else "Multi-threaded CPU SIMD"))
             print("  Speculative Assistant:     " + ("Fully RAM-Resident MTP (4 draft tokens)" if use_mtp else "Disabled (--no-mtp standard decode)"))
             print("  Attention Mode:            " + ("LSA Sparse Global (k=" + String(lsa_k) + ", p=" + String(lsa_p) + ") + Ring SWA 1024" if use_lsa else "Dense Global + Ring SWA 1024"))
             print("  Multi-Turn KV Capacity:    " + String(max_blocks * block_size) + " tokens")
@@ -1968,152 +2095,436 @@ def main() raises:
                 if is_chat_mode:
                     chat_prefill_toks = num_prompt_tokens - prefill_start_pos
 
-                # Execute prefill pass for each new prompt token sequentially to build up the KV cache
-                for pos in range(prefill_start_pos, num_prompt_tokens):
-                    var current_token_id = seq_ptr[].tokens[pos]
-                    embed.reconstruct(current_token_id, local_x)
-                    for i in range(CONFIG.embed_dim):
-                        local_x[i] *= prompt_scale
-                    
-                    # Run layers
-                    for l in range(30):
-                        var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
-                        var is_global = CONFIG.is_global_layer(l)
-                        var layer_heads = 16
-                        var layer_kv_heads = 2 if is_global else 8
-                        var layer_head_dim = 512 if is_global else 256
-                        var kv_stride = layer_kv_heads * layer_head_dim
-                        var ratio = layer_heads // layer_kv_heads
-                        
-                        # 1. Attention Input Norm
-                        rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
-                        
-                        # 2. Attention projections
-                        q4_matmul_vec(weights.wq_packed, weights.wq_scales, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
-                        q4_matmul_vec(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
-                        if is_global:
-                            for i in range(kv_stride):
-                                v_vec[i] = k_vec[i]
-                        else:
-                            q4_matmul_vec(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
-                            
-                        # 3. Head norms & scaling
-                        for h in range(layer_heads):
-                            rms_norm(q + h * layer_head_dim, weights.q_norm_weight, q + h * layer_head_dim, layer_head_dim)
-                        for h in range(layer_kv_heads):
-                            rms_norm(k_vec + h * layer_head_dim, weights.k_norm_weight, k_vec + h * layer_head_dim, layer_head_dim)
-                        for h in range(layer_kv_heads):
-                            rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
-                            
-                        # 4. Apply RoPE
-                        apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
-                        apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
-                        if qk_dump_active_for_run and is_global:
-                            qk_writer.write_record(pos, l, q, k_vec, v_vec)
-                        
-                        # 5. KV Cache write (Paged Attention)
-                        var logical_blk = pos // block_size
-                        var blk_offset = pos % block_size
-                        if logical_blk >= len(seq_ptr[].block_table):
-                            var new_blk = block_manager.allocate()
-                            if new_blk < 0:
-                                print("CRITICAL: Out of block memory during prefill!")
-                                seq_ptr[].is_finished = True
-                                break
-                            seq_ptr[].block_table.append(new_blk)
-                            
-                        var phys_blk_id = seq_ptr[].block_table[logical_blk]
-                        var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
-                        var k_target_ptr = k_block_pools[l] + kv_row * kv_stride
-                        var v_target_ptr = v_block_pools[l] + kv_row * kv_stride
-                        for i in range(kv_stride):
-                            k_target_ptr[i] = k_vec[i]
-                            v_target_ptr[i] = v_vec[i]
-                            
-                        # 6. Attention (LSA on global layers when enabled, else paged)
-                        execute_attention_for_token(
-                            q, k_vec, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos,
-                            l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
-                            attn_scores, attn_rows, attn_out, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
-                            lsa_k, lsa_p, lsa_sinks, lsa_window,
-                        )
-                        
-                        q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
-                        rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
+                # Execute prefill pass:
+                # When use_gpu=True and >1 prompt tokens are added, execute layer-first batched KFD iGPU prefill
+                # (2D LDS-tiled q4_matmul_lds.hsaco across chunks of up to MAX_PREFILL_BATCH=64 tokens + overlapped CPU MoE).
+                var num_new_prefill = num_prompt_tokens - prefill_start_pos
+                if use_gpu and num_new_prefill > 1:
+                    var chunk_start = prefill_start_pos
+                    while chunk_start < num_prompt_tokens:
+                        var chunk_b = num_prompt_tokens - chunk_start
+                        if chunk_b > MAX_PREFILL_BATCH:
+                            chunk_b = MAX_PREFILL_BATCH
+
+                        # 0. Allocate needed KV blocks for this chunk up front and reconstruct embeddings
+                        for b in range(chunk_b):
+                            var pos = chunk_start + b
+                            var logical_blk = pos // block_size
+                            if logical_blk >= len(seq_ptr[].block_table):
+                                var new_blk = block_manager.allocate()
+                                if new_blk < 0:
+                                    print("CRITICAL: Out of block memory during batched prefill!")
+                                    seq_ptr[].is_finished = True
+                                    break
+                                seq_ptr[].block_table.append(new_blk)
+                            var tok_id = seq_ptr[].tokens[pos]
+                            var x_b = pref_x + b * CONFIG.embed_dim
+                            embed.reconstruct(tok_id, x_b)
+                            for i in range(CONFIG.embed_dim):
+                                x_b[i] *= prompt_scale
+
+                        if seq_ptr[].is_finished:
+                            break
+
+                        # Layer-first loop across all chunk_b tokens simultaneously!
+                        for l in range(30):
+                            var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+                            var is_global = CONFIG.is_global_layer(l)
+                            var layer_heads = 16
+                            var layer_kv_heads = 2 if is_global else 8
+                            var layer_head_dim = 512 if is_global else 256
+                            var kv_stride = layer_kv_heads * layer_head_dim
+                            var q_dim = layer_heads * layer_head_dim
+
+                            # 1. Batched Attention Input Norm
+                            for b in range(chunk_b):
+                                rms_norm(
+                                    pref_x + b * CONFIG.embed_dim,
+                                    weights.input_layernorm_weight,
+                                    pref_norm_x + b * CONFIG.embed_dim,
+                                    CONFIG.embed_dim,
+                                )
+
+                            # 2. Multi-packet barrier-free Q, K, V dispatch on KFD iGPU
+                            gpu_ctx.flush_cache_range(pref_norm_x.__int__(), chunk_b * CONFIG.embed_dim * 4)
+                            var slot_q = gpu_ctx.enqueue_matmul(
+                                weights.wq_packed.__int__(),
+                                weights.wq_scales.__int__(),
+                                pref_norm_x.__int__(),
+                                pref_q.__int__(),
+                                CONFIG.embed_dim,
+                                q_dim,
+                                batch_size=chunk_b,
+                                flush_cache=False,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            var slot_k = gpu_ctx.enqueue_matmul(
+                                weights.wk_packed.__int__(),
+                                weights.wk_scales.__int__(),
+                                pref_norm_x.__int__(),
+                                pref_k.__int__(),
+                                CONFIG.embed_dim,
+                                kv_stride,
+                                batch_size=chunk_b,
+                                flush_cache=False,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            var slot_v = 0
+                            if not is_global:
+                                slot_v = gpu_ctx.enqueue_matmul(
+                                    weights.wv_packed.__int__(),
+                                    weights.wv_scales.__int__(),
+                                    pref_norm_x.__int__(),
+                                    pref_v.__int__(),
+                                    CONFIG.embed_dim,
+                                    kv_stride,
+                                    batch_size=chunk_b,
+                                    flush_cache=False,
+                                    barrier=False,
+                                    ring_doorbell_now=False,
+                                )
+                            gpu_ctx.ring_doorbell()
+
+                            gpu_ctx.wait_matmul(slot_q, pref_q.__int__(), q_dim, batch_size=chunk_b)
+                            gpu_ctx.wait_matmul(slot_k, pref_k.__int__(), kv_stride, batch_size=chunk_b)
+                            if not is_global:
+                                gpu_ctx.wait_matmul(slot_v, pref_v.__int__(), kv_stride, batch_size=chunk_b)
+
+                            # 3. Head norms, RoPE, KV Cache write, and Causal Attention per token in chunk
+                            for b in range(chunk_b):
+                                var pos = chunk_start + b
+                                var q_b = pref_q + b * q_dim
+                                var k_b = pref_k + b * kv_stride
+                                var v_b = pref_v + b * kv_stride
+                                var attn_out_b = pref_attn_out + b * q_dim
+
+                                if is_global:
+                                    for i in range(kv_stride):
+                                        v_b[i] = k_b[i]
+
+                                for h in range(layer_heads):
+                                    rms_norm(q_b + h * layer_head_dim, weights.q_norm_weight, q_b + h * layer_head_dim, layer_head_dim)
+                                for h in range(layer_kv_heads):
+                                    rms_norm(k_b + h * layer_head_dim, weights.k_norm_weight, k_b + h * layer_head_dim, layer_head_dim)
+                                for h in range(layer_kv_heads):
+                                    rms_norm_noscale(v_b + h * layer_head_dim, v_b + h * layer_head_dim, layer_head_dim)
+
+                                apply_rope(q_b, layer_heads, layer_head_dim, pos, is_global)
+                                apply_rope(k_b, layer_kv_heads, layer_head_dim, pos, is_global)
+                                if qk_dump_active_for_run and is_global:
+                                    qk_writer.write_record(pos, l, q_b, k_b, v_b)
+
+                                var logical_blk = pos // block_size
+                                var blk_offset = pos % block_size
+                                var phys_blk_id = seq_ptr[].block_table[logical_blk]
+                                var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
+                                var k_target_ptr = k_block_pools[l] + kv_row * kv_stride
+                                var v_target_ptr = v_block_pools[l] + kv_row * kv_stride
+                                for i in range(kv_stride):
+                                    k_target_ptr[i] = k_b[i]
+                                    v_target_ptr[i] = v_b[i]
+
+                                execute_attention_for_token(
+                                    q_b, k_b, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos,
+                                    l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
+                                    attn_scores, attn_rows, attn_out_b, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
+                                    lsa_k, lsa_p, lsa_sinks, lsa_window,
+                                )
+
+                            # 4. Batched Wo Projection on KFD iGPU
+                            var slot_wo = gpu_ctx.enqueue_matmul(
+                                weights.wo_packed.__int__(),
+                                weights.wo_scales.__int__(),
+                                pref_attn_out.__int__(),
+                                pref_proj_out.__int__(),
+                                q_dim,
+                                CONFIG.embed_dim,
+                                batch_size=chunk_b,
+                                flush_cache=True,
+                                barrier=False,
+                                ring_doorbell_now=True,
+                            )
+                            gpu_ctx.wait_matmul(slot_wo, pref_proj_out.__int__(), CONFIG.embed_dim, batch_size=chunk_b)
+
+                            for b in range(chunk_b):
+                                var proj_b = pref_proj_out + b * CONFIG.embed_dim
+                                var x_b = pref_x + b * CONFIG.embed_dim
+                                rms_norm(proj_b, weights.post_attention_layernorm_weight, proj_b, CONFIG.embed_dim)
+                                for i in range(CONFIG.embed_dim):
+                                    x_b[i] += proj_b[i]
+                                rms_norm(x_b, weights.pre_feedforward_layernorm_weight, pref_norm_x + b * CONFIG.embed_dim, CONFIG.embed_dim)
+
+                            # 5. Hybrid Overlapped FFN: Enqueue Batched w_gate & w_up on KFD iGPU while CPU runs MoE Router + Top-8 Experts!
+                            gpu_ctx.flush_cache_range(pref_norm_x.__int__(), chunk_b * CONFIG.embed_dim * 4)
+                            var slot_gate = gpu_ctx.enqueue_matmul(
+                                weights.w_gate_packed.__int__(),
+                                weights.w_gate_scales.__int__(),
+                                pref_norm_x.__int__(),
+                                pref_h1.__int__(),
+                                CONFIG.embed_dim,
+                                CONFIG.standard_mlp_dim,
+                                batch_size=chunk_b,
+                                flush_cache=False,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            var slot_up = gpu_ctx.enqueue_matmul(
+                                weights.w_up_packed.__int__(),
+                                weights.w_up_scales.__int__(),
+                                pref_norm_x.__int__(),
+                                pref_h2.__int__(),
+                                CONFIG.embed_dim,
+                                CONFIG.standard_mlp_dim,
+                                batch_size=chunk_b,
+                                flush_cache=False,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            gpu_ctx.ring_doorbell()
+
+                            # CPU concurrently evaluates MoE Router + Top-8 Experts for chunk_b tokens
+                            for b in range(chunk_b):
+                                var x_b = pref_x + b * CONFIG.embed_dim
+                                var moe_norm_b = pref_moe_out_norm + b * CONFIG.embed_dim
+                                rms_norm_noscale(x_b, norm_x, CONFIG.embed_dim)
+                                for j in range(CONFIG.embed_dim):
+                                    scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+                                q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
+                                softmax(scores, CONFIG.num_experts)
+                                get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
+
+                                var sum_top_val: Float32 = 0.0
+                                for i in range(CONFIG.top_k_experts):
+                                    sum_top_val += top_val[i]
+                                for i in range(CONFIG.top_k_experts):
+                                    var idx = top_idx[i]
+                                    var norm_prob = top_val[i] / (sum_top_val + 1e-10)
+                                    if norm_prob < 0.05:
+                                        top_weights[i] = 0.0
+                                    else:
+                                        top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+
+                                for i in range(CONFIG.embed_dim):
+                                    moe_out[i] = 0.0
+                                rms_norm(x_b, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
+
+                                def batched_prefill_expert_worker(exp_idx: Int) capturing -> None:
+                                    var e = top_idx[exp_idx]
+                                    var w_e = top_weights[exp_idx]
+                                    if w_e == 0.0:
+                                        return
+                                    var exp_gate_up_out = gate_up_out_all + exp_idx * (CONFIG.expert_mlp_dim * 2)
+                                    var exp_act = act_all + exp_idx * CONFIG.expert_mlp_dim
+                                    var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                                    var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
+                                    var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
+                                    q4_matmul_vec(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                                    gelu_and_mul(exp_gate_up_out, exp_gate_up_out + CONFIG.expert_mlp_dim, exp_act, CONFIG.expert_mlp_dim)
+                                    var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
+                                    var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
+                                    q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
+
+                                parallelize[batched_prefill_expert_worker](CONFIG.top_k_experts)
+
+                                for exp_idx in range(CONFIG.top_k_experts):
+                                    var w_e = top_weights[exp_idx]
+                                    if w_e == 0.0:
+                                        continue
+                                    var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                                    for j in range(CONFIG.embed_dim):
+                                        moe_out[j] += exp_down_out[j] * w_e
+                                rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_norm_b, CONFIG.embed_dim)
+
+                            # Wait for iGPU w_gate & w_up, apply GeLU, and dispatch batched w_down on iGPU!
+                            gpu_ctx.wait_matmul(slot_gate, pref_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=chunk_b)
+                            gpu_ctx.wait_matmul(slot_up, pref_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=chunk_b)
+                            gelu_and_mul(pref_h1, pref_h2, pref_gate, chunk_b * CONFIG.standard_mlp_dim)
+
+                            var slot_down = gpu_ctx.enqueue_matmul(
+                                weights.w_down_packed.__int__(),
+                                weights.w_down_scales.__int__(),
+                                pref_gate.__int__(),
+                                pref_mlp_out.__int__(),
+                                CONFIG.standard_mlp_dim,
+                                CONFIG.embed_dim,
+                                batch_size=chunk_b,
+                                flush_cache=True,
+                                barrier=False,
+                                ring_doorbell_now=True,
+                            )
+                            gpu_ctx.wait_matmul(slot_down, pref_mlp_out.__int__(), CONFIG.embed_dim, batch_size=chunk_b)
+
+                            var scalar = weights.layer_scalar[0]
+                            for b in range(chunk_b):
+                                var x_b = pref_x + b * CONFIG.embed_dim
+                                var mlp_b = pref_mlp_out + b * CONFIG.embed_dim
+                                var moe_norm_b = pref_moe_out_norm + b * CONFIG.embed_dim
+                                rms_norm(mlp_b, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+                                for i in range(CONFIG.embed_dim):
+                                    combined_ffn[i] = shared_h1_norm[i] + moe_norm_b[i]
+                                rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
+                                for i in range(CONFIG.embed_dim):
+                                    x_b[i] = (x_b[i] + ffn_out[i]) * scalar
+
+                        # Copy final token of chunk into local_x
+                        var last_x = pref_x + (chunk_b - 1) * CONFIG.embed_dim
                         for i in range(CONFIG.embed_dim):
-                            local_x[i] += proj_attn_out[i]
+                            local_x[i] = last_x[i]
+
+                        chunk_start += chunk_b
+                else:
+                    # Sequential single-token prefill fallback (CPU or single-token turn)
+                    for pos in range(prefill_start_pos, num_prompt_tokens):
+                        var current_token_id = seq_ptr[].tokens[pos]
+                        embed.reconstruct(current_token_id, local_x)
+                        for i in range(CONFIG.embed_dim):
+                            local_x[i] *= prompt_scale
+                        
+                        # Run layers
+                        for l in range(30):
+                            var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
+                            var is_global = CONFIG.is_global_layer(l)
+                            var layer_heads = 16
+                            var layer_kv_heads = 2 if is_global else 8
+                            var layer_head_dim = 512 if is_global else 256
+                            var kv_stride = layer_kv_heads * layer_head_dim
+                            var ratio = layer_heads // layer_kv_heads
                             
-                        # 8. Feedforward (Shared MLP & MoE Path)
-                        rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-                        q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                        q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                        gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
-                        q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-                        rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
-                        
-                        rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
-                        for j in range(CONFIG.embed_dim):
-                            scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
-                        q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
-                        softmax(scores, CONFIG.num_experts)
-                        get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
-                        
-                        var sum_top_val: Float32 = 0.0
-                        for i in range(CONFIG.top_k_experts):
-                            sum_top_val += top_val[i]
-                        for i in range(CONFIG.top_k_experts):
-                            var idx = top_idx[i]
-                            var norm_prob = top_val[i] / (sum_top_val + 1e-10)
-                            if norm_prob < 0.05:
-                                top_weights[i] = 0.0
+                            # 1. Attention Input Norm
+                            rms_norm(local_x, weights.input_layernorm_weight, norm_x, CONFIG.embed_dim)
+                            
+                            # 2. Attention projections
+                            q4_matmul_vec(weights.wq_packed, weights.wq_scales, norm_x, q, CONFIG.embed_dim, layer_heads * layer_head_dim, num_tasks)
+                            q4_matmul_vec(weights.wk_packed, weights.wk_scales, norm_x, k_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
+                            if is_global:
+                                for i in range(kv_stride):
+                                    v_vec[i] = k_vec[i]
                             else:
-                                top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                                q4_matmul_vec(weights.wv_packed, weights.wv_scales, norm_x, v_vec, CONFIG.embed_dim, layer_kv_heads * layer_head_dim, num_tasks)
                                 
-                        for i in range(CONFIG.embed_dim):
-                            moe_out[i] = 0.0
-                        rms_norm(local_x, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
-                        
-                        def prefill_expert_worker(exp_idx: Int) capturing -> None:
-                            var e = top_idx[exp_idx]
-                            var w_e = top_weights[exp_idx]
-                            if w_e == 0.0: return
+                            # 3. Head norms & scaling
+                            for h in range(layer_heads):
+                                rms_norm(q + h * layer_head_dim, weights.q_norm_weight, q + h * layer_head_dim, layer_head_dim)
+                            for h in range(layer_kv_heads):
+                                rms_norm(k_vec + h * layer_head_dim, weights.k_norm_weight, k_vec + h * layer_head_dim, layer_head_dim)
+                            for h in range(layer_kv_heads):
+                                rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
+                                
+                            # 4. Apply RoPE
+                            apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
+                            apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                            if qk_dump_active_for_run and is_global:
+                                qk_writer.write_record(pos, l, q, k_vec, v_vec)
                             
-                            var exp_gate_up_out = gate_up_out_all + exp_idx * (CONFIG.expert_mlp_dim * 2)
-                            var exp_act = act_all + exp_idx * CONFIG.expert_mlp_dim
-                            var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                            # 5. KV Cache write (Paged Attention)
+                            var logical_blk = pos // block_size
+                            var blk_offset = pos % block_size
+                            if logical_blk >= len(seq_ptr[].block_table):
+                                var new_blk = block_manager.allocate()
+                                if new_blk < 0:
+                                    print("CRITICAL: Out of block memory during prefill!")
+                                    seq_ptr[].is_finished = True
+                                    break
+                                seq_ptr[].block_table.append(new_blk)
+                                
+                            var phys_blk_id = seq_ptr[].block_table[logical_blk]
+                            var kv_row = ring_row(seq_ptr[].kv_slot, ring_size, pos) if (ring_size > 0 and not is_global) else (phys_blk_id * block_size + blk_offset)
+                            var k_target_ptr = k_block_pools[l] + kv_row * kv_stride
+                            var v_target_ptr = v_block_pools[l] + kv_row * kv_stride
+                            for i in range(kv_stride):
+                                k_target_ptr[i] = k_vec[i]
+                                v_target_ptr[i] = v_vec[i]
+                                
+                            # 6. Attention (LSA on global layers when enabled, else paged)
+                            execute_attention_for_token(
+                                q, k_vec, k_block_pools[l], v_block_pools[l], seq_ptr[].block_table, block_size, pos,
+                                l, is_global, layer_heads, layer_kv_heads, layer_head_dim, sliding_window, ring_size, seq_ptr[].kv_slot,
+                                attn_scores, attn_rows, attn_out, use_lsa, lsa_indices, lsa_proj_weights, k_lsa_idx, q_lsa_idx,
+                                lsa_k, lsa_p, lsa_sinks, lsa_window,
+                            )
                             
-                            var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
-                            var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
-                            q4_matmul_vec(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                            q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, layer_heads * layer_head_dim, CONFIG.embed_dim, num_tasks)
+                            rms_norm(proj_attn_out, weights.post_attention_layernorm_weight, proj_attn_out, CONFIG.embed_dim)
+                            for i in range(CONFIG.embed_dim):
+                                local_x[i] += proj_attn_out[i]
+                                
+                            # 8. Feedforward (Shared MLP & MoE Path)
+                            rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                            q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                            q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                            gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                            q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                            rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
                             
-                            var gate_ptr = exp_gate_up_out
-                            var up_ptr = exp_gate_up_out + CONFIG.expert_mlp_dim
-                            gelu_and_mul(gate_ptr, up_ptr, exp_act, CONFIG.expert_mlp_dim)
-                            
-                            var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
-                            var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
-                            q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
-                            
-                        parallelize[prefill_expert_worker](CONFIG.top_k_experts)
-                        
-                        for exp_idx in range(CONFIG.top_k_experts):
-                            var w_e = top_weights[exp_idx]
-                            if w_e == 0.0: continue
-                            var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                            rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
                             for j in range(CONFIG.embed_dim):
-                                moe_out[j] += exp_down_out[j] * w_e
-                                
-                        rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
-                        
-                        for i in range(CONFIG.embed_dim):
-                            combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
-                        rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
-                        
-                        var scalar = weights.layer_scalar[0]
-                        for i in range(CONFIG.embed_dim):
-                            local_x[i] += ffn_out[i]
-                            local_x[i] *= scalar
+                                scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+                            q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, CONFIG.embed_dim, CONFIG.num_experts, num_tasks)
+                            softmax(scores, CONFIG.num_experts)
+                            get_top_k[8](scores, top_idx, top_val, CONFIG.num_experts)
                             
+                            var sum_top_val: Float32 = 0.0
+                            for i in range(CONFIG.top_k_experts):
+                                sum_top_val += top_val[i]
+                            for i in range(CONFIG.top_k_experts):
+                                var idx = top_idx[i]
+                                var norm_prob = top_val[i] / (sum_top_val + 1e-10)
+                                if norm_prob < 0.05:
+                                    top_weights[i] = 0.0
+                                else:
+                                    top_weights[i] = norm_prob * weights.router_per_expert_scale[idx]
+                                    
+                            for i in range(CONFIG.embed_dim):
+                                moe_out[i] = 0.0
+                            rms_norm(local_x, weights.pre_feedforward_layernorm_2_weight, moe_in, CONFIG.embed_dim)
+                            
+                            def prefill_expert_worker(exp_idx: Int) capturing -> None:
+                                var e = top_idx[exp_idx]
+                                var w_e = top_weights[exp_idx]
+                                if w_e == 0.0: return
+                                
+                                var exp_gate_up_out = gate_up_out_all + exp_idx * (CONFIG.expert_mlp_dim * 2)
+                                var exp_act = act_all + exp_idx * CONFIG.expert_mlp_dim
+                                var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                                
+                                var exp_gate_up_packed = weights.experts_gate_up_packed + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 2)
+                                var exp_gate_up_scales = weights.experts_gate_up_scales + e * (CONFIG.expert_mlp_dim * 2 * CONFIG.embed_dim // 32)
+                                q4_matmul_vec(exp_gate_up_packed, exp_gate_up_scales, moe_in, exp_gate_up_out, CONFIG.embed_dim, CONFIG.expert_mlp_dim * 2, 1)
+                                
+                                var gate_ptr = exp_gate_up_out
+                                var up_ptr = exp_gate_up_out + CONFIG.expert_mlp_dim
+                                gelu_and_mul(gate_ptr, up_ptr, exp_act, CONFIG.expert_mlp_dim)
+                                
+                                var exp_down_packed = weights.experts_down_packed + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 2)
+                                var exp_down_scales = weights.experts_down_scales + e * (CONFIG.embed_dim * CONFIG.expert_mlp_dim // 32)
+                                q4_matmul_vec(exp_down_packed, exp_down_scales, exp_act, exp_down_out, CONFIG.expert_mlp_dim, CONFIG.embed_dim, 1)
+                                
+                            parallelize[prefill_expert_worker](CONFIG.top_k_experts)
+                            
+                            for exp_idx in range(CONFIG.top_k_experts):
+                                var w_e = top_weights[exp_idx]
+                                if w_e == 0.0: continue
+                                var exp_down_out = down_out_all + exp_idx * CONFIG.embed_dim
+                                for j in range(CONFIG.embed_dim):
+                                    moe_out[j] += exp_down_out[j] * w_e
+                                    
+                            rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
+                            
+                            for i in range(CONFIG.embed_dim):
+                                combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
+                            rms_norm(combined_ffn, weights.post_feedforward_layernorm_weight, ffn_out, CONFIG.embed_dim)
+                            
+                            var scalar = weights.layer_scalar[0]
+                            for i in range(CONFIG.embed_dim):
+                                local_x[i] += ffn_out[i]
+                                local_x[i] *= scalar
+                            
+                if seq_ptr[].is_finished:
+                    active_sequences.append(seq_ptr)
+                    continue
+
                 # Project logits for first token
                 rms_norm(local_x, final_norm_weight, target_final_norm_x, CONFIG.embed_dim)
                 embed.project_logits_parallel(target_final_norm_x, local_max_logits, local_next_tokens, num_tasks)
@@ -2356,13 +2767,43 @@ def main() raises:
                         for i in range(CONFIG.embed_dim):
                             local_x[i] += proj_attn_out[i]
                             
-                        # Feedforward
-                        rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
-                        q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                        q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                        gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
-                        q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-                        rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
+                        # Feedforward (Hybrid iGPU Shared MLP overlapped with CPU MoE Router + Top-8 Experts when use_gpu=True)
+                        var slot_gate = 0
+                        var slot_up = 0
+                        if use_gpu:
+                            rms_norm(local_x, weights.pre_feedforward_layernorm_weight, gpu_mlp_norm_x, CONFIG.embed_dim)
+                            slot_gate = gpu_ctx.enqueue_matmul(
+                                weights.w_gate_packed.__int__(),
+                                weights.w_gate_scales.__int__(),
+                                gpu_mlp_norm_x.__int__(),
+                                shared_h1.__int__(),
+                                CONFIG.embed_dim,
+                                CONFIG.standard_mlp_dim,
+                                batch_size=1,
+                                flush_cache=True,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            slot_up = gpu_ctx.enqueue_matmul(
+                                weights.w_up_packed.__int__(),
+                                weights.w_up_scales.__int__(),
+                                gpu_mlp_norm_x.__int__(),
+                                shared_h2.__int__(),
+                                CONFIG.embed_dim,
+                                CONFIG.standard_mlp_dim,
+                                batch_size=1,
+                                flush_cache=False,
+                                barrier=False,
+                                ring_doorbell_now=False,
+                            )
+                            gpu_ctx.ring_doorbell()
+                        else:
+                            rms_norm(local_x, weights.pre_feedforward_layernorm_weight, norm_x, CONFIG.embed_dim)
+                            q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, norm_x, shared_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                            q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, norm_x, shared_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                            gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                            q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                            rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
                         
                         rms_norm_noscale(local_x, norm_x, CONFIG.embed_dim)
                         for j in range(CONFIG.embed_dim):
@@ -2417,6 +2858,13 @@ def main() raises:
                                 moe_out[j] += exp_down_out[j] * w_e
                                 
                         rms_norm(moe_out, weights.post_feedforward_layernorm_2_weight, moe_out_norm, CONFIG.embed_dim)
+
+                        if use_gpu:
+                            gpu_ctx.wait_matmul(slot_gate, shared_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=1)
+                            gpu_ctx.wait_matmul(slot_up, shared_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=1)
+                            gelu_and_mul(shared_h1, shared_h2, shared_ffn_out_gate, CONFIG.standard_mlp_dim)
+                            q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, shared_ffn_out_gate, shared_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                            rms_norm(shared_mlp_out, weights.post_feedforward_layernorm_1_weight, shared_h1_norm, CONFIG.embed_dim)
                         
                         for i in range(CONFIG.embed_dim):
                             combined_ffn[i] = shared_h1_norm[i] + moe_out_norm[i]
@@ -2570,7 +3018,25 @@ def main() raises:
     run_draft_accepted_ptr.free()
 
     # Clean up pools and variables
-    free_c(base_addr)
+    if use_gpu:
+        gpu_ctx.free_gpu_buffer(weights_gpu_buf)
+        gpu_ctx.free_gpu_buffer(pref_x_buf)
+        gpu_ctx.free_gpu_buffer(pref_norm_x_buf)
+        gpu_ctx.free_gpu_buffer(pref_q_buf)
+        gpu_ctx.free_gpu_buffer(pref_k_buf)
+        gpu_ctx.free_gpu_buffer(pref_v_buf)
+        gpu_ctx.free_gpu_buffer(pref_attn_out_buf)
+        gpu_ctx.free_gpu_buffer(pref_proj_out_buf)
+        gpu_ctx.free_gpu_buffer(pref_h1_buf)
+        gpu_ctx.free_gpu_buffer(pref_h2_buf)
+        gpu_ctx.free_gpu_buffer(pref_gate_buf)
+        gpu_ctx.free_gpu_buffer(pref_mlp_out_buf)
+        gpu_ctx.free_gpu_buffer(gpu_mlp_norm_x_buf)
+    else:
+        free_c(base_addr)
+        shared_h1.free()
+        shared_h2.free()
+    pref_moe_out_norm.free()
     final_norm_weight.free()
     for l in range(30):
         k_block_pools[l].free()
@@ -2585,8 +3051,6 @@ def main() raises:
     attn_rows.free()
     attn_out.free()
     proj_attn_out.free()
-    shared_h1.free()
-    shared_h2.free()
     shared_ffn_out_gate.free()
     shared_mlp_out.free()
     shared_h1_norm.free()
