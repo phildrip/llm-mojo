@@ -7,7 +7,7 @@ import std.os
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
-from attention import paged_attention_layer, ring_row
+from attention import paged_attention_layer, ring_row, apply_rope, apply_rope_qk
 from qk_dump import QKDumpWriter
 from lsa_core import (
     lsa_index_query,
@@ -506,25 +506,7 @@ def mtp_softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
 
 @always_inline
 def mtp_apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
-    var half_dim = head_dim // 2
-    var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
-    var rope_dim = 512 if is_global else 256
-
-    for h in range(num_heads):
-        var h_offset = h * head_dim
-        for i in range(half_dim):
-            var theta: Float32 = 0.0
-            if (not is_global) or (i < 64):
-                theta = Float32(pos) / (base ** (Float32(2 * i) / Float32(rope_dim)))
-
-            var cos_theta = cos(theta)
-            var sin_theta = sin(theta)
-
-            var val1 = vec[h_offset + i]
-            var val2 = vec[h_offset + half_dim + i]
-
-            vec[h_offset + i] = val1 * cos_theta - val2 * sin_theta
-            vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
+    apply_rope(vec, num_heads, head_dim, pos, is_global)
 
 @always_inline
 def mtp_gelu_and_mul(
@@ -921,28 +903,6 @@ def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], o
         out_ptr.store[8](i, gelu * h2.load[8](i))
 
 @always_inline
-def apply_rope(vec: UnsafePointer[Float32, MutExternalOrigin], num_heads: Int, head_dim: Int, pos: Int, is_global: Bool):
-    var half_dim = head_dim // 2
-    var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
-    var rope_dim = 512 if is_global else 256
-    
-    for h in range(num_heads):
-        var h_offset = h * head_dim
-        for i in range(half_dim):
-            var theta: Float32 = 0.0
-            if (not is_global) or (i < 64):
-                theta = Float32(pos) / (base ** (Float32(2 * i) / Float32(rope_dim)))
-                
-            var cos_theta = cos(theta)
-            var sin_theta = sin(theta)
-            
-            var val1 = vec[h_offset + i]
-            var val2 = vec[h_offset + half_dim + i]
-            
-            vec[h_offset + i] = val1 * cos_theta - val2 * sin_theta
-            vec[h_offset + half_dim + i] = val2 * cos_theta + val1 * sin_theta
-
-@always_inline
 def softmax(scores: UnsafePointer[Float32, MutExternalOrigin], size: Int):
     var max_val = scores[0]
     for i in range(1, size):
@@ -1221,9 +1181,10 @@ def main() raises:
         return
 
     var weights_file_size: Int = 15311790080
+    var gpu_allocated = use_gpu
     var weights_gpu_buf = GPUMemoryBuffer()
     var base_addr: Int = 0
-    if use_gpu:
+    if gpu_allocated:
         weights_gpu_buf = gpu_ctx.alloc_gpu_buffer(weights_file_size)
         base_addr = weights_gpu_buf.cpu_addr
     else:
@@ -1761,8 +1722,7 @@ def main() raises:
             for h in range(layer_kv_heads):
                 rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
                 
-            apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
-            apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+            apply_rope_qk(q, k_vec, layer_heads, layer_kv_heads, layer_head_dim, pos, is_global)
             
             # KV Cache write
             var logical_blk = pos // block_size
@@ -2137,7 +2097,7 @@ def main() raises:
                 tokens.append(Int(py=encoded[j]))
             
             var seq_ptr = alloc[Sequence](1)
-            seq_ptr[] = Sequence(i + 1, prompts[i], tokens^, max_total_tokens)
+            seq_ptr.init_pointee_move(Sequence(i + 1, prompts[i], tokens^, max_total_tokens))
             pending_queue.append(seq_ptr)
 
         var pending_idx = 0
@@ -2198,6 +2158,7 @@ def main() raises:
                                         lsa_indices[c_ptr[].kv_slot * 5 + li].reset()
                                 free_kv_slots.append(c_ptr[].kv_slot)
                             c_ptr[].recurrent_h.free()
+                            c_ptr.destroy_pointee()
                             c_ptr.free()
                             pending_queue.clear()
                             pending_idx = 0
@@ -2214,6 +2175,7 @@ def main() raises:
                                         lsa_indices[c_ptr[].kv_slot * 5 + li].reset()
                                 free_kv_slots.append(c_ptr[].kv_slot)
                             c_ptr[].recurrent_h.free()
+                            c_ptr.destroy_pointee()
                             c_ptr.free()
                             pending_queue.clear()
                             pending_idx = 0
@@ -2235,7 +2197,7 @@ def main() raises:
                             tokens.append(Int(py=encoded[j]))
 
                         var seq_ptr = alloc[Sequence](1)
-                        seq_ptr[] = Sequence(1, String(user_input_str), tokens^, num_encoded + chat_max_new_tokens)
+                        seq_ptr.init_pointee_move(Sequence(1, String(user_input_str), tokens^, num_encoded + chat_max_new_tokens))
                         pending_queue.append(seq_ptr)
                         pending_idx = 0
                     else:
@@ -2396,8 +2358,7 @@ def main() raises:
                                 for h in range(layer_kv_heads):
                                     rms_norm_noscale(v_b + h * layer_head_dim, v_b + h * layer_head_dim, layer_head_dim)
 
-                                apply_rope(q_b, layer_heads, layer_head_dim, pos, is_global)
-                                apply_rope(k_b, layer_kv_heads, layer_head_dim, pos, is_global)
+                                apply_rope_qk(q_b, k_b, layer_heads, layer_kv_heads, layer_head_dim, pos, is_global)
                                 if qk_dump_active_for_run and is_global:
                                     qk_writer.write_record(pos, l, q_b, k_b, v_b)
 
@@ -2585,8 +2546,7 @@ def main() raises:
                                 rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
                                 
                             # 4. Apply RoPE
-                            apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
-                            apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                            apply_rope_qk(q, k_vec, layer_heads, layer_kv_heads, layer_head_dim, pos, is_global)
                             if qk_dump_active_for_run and is_global:
                                 qk_writer.write_record(pos, l, q, k_vec, v_vec)
                             
@@ -2899,8 +2859,7 @@ def main() raises:
                                     rms_norm(k_b + h * layer_head_dim, weights.k_norm_weight, k_b + h * layer_head_dim, layer_head_dim)
                                 for h in range(layer_kv_heads):
                                     rms_norm_noscale(v_b + h * layer_head_dim, v_b + h * layer_head_dim, layer_head_dim)
-                                apply_rope(q_b, layer_heads, layer_head_dim, v_pos, is_global)
-                                apply_rope(k_b, layer_kv_heads, layer_head_dim, v_pos, is_global)
+                                apply_rope_qk(q_b, k_b, layer_heads, layer_kv_heads, layer_head_dim, v_pos, is_global)
 
                                 var logical_blk = v_pos // block_size
                                 var blk_offset = v_pos % block_size
@@ -3194,8 +3153,7 @@ def main() raises:
                         for h in range(layer_kv_heads):
                             rms_norm_noscale(v_vec + h * layer_head_dim, v_vec + h * layer_head_dim, layer_head_dim)
                             
-                        apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
-                        apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
+                        apply_rope_qk(q, k_vec, layer_heads, layer_kv_heads, layer_head_dim, pos, is_global)
                         if qk_dump_active_for_run and is_global:
                             qk_writer.write_record(pos, l, q, k_vec, v_vec)
                         
@@ -3403,6 +3361,7 @@ def main() raises:
                                     lsa_indices[s_ptr[].kv_slot * 5 + li].reset()
                             free_kv_slots.append(s_ptr[].kv_slot)
                         s_ptr[].recurrent_h.free()
+                        s_ptr.destroy_pointee()
                         s_ptr.free()
                 else:
                     next_active_sequences.append(s_ptr)
@@ -3482,7 +3441,7 @@ def main() raises:
     run_draft_accepted_ptr.free()
 
     # Clean up pools and variables
-    if use_gpu:
+    if gpu_allocated:
         gpu_ctx.free_gpu_buffer(weights_gpu_buf)
         gpu_ctx.free_gpu_buffer(pref_x_buf)
         gpu_ctx.free_gpu_buffer(pref_norm_x_buf)
@@ -3498,6 +3457,18 @@ def main() raises:
         gpu_ctx.free_gpu_buffer(gpu_mlp_norm_x_buf)
     else:
         free_c(base_addr)
+        pref_x.free()
+        pref_norm_x.free()
+        pref_q.free()
+        pref_k.free()
+        pref_v.free()
+        pref_attn_out.free()
+        pref_proj_out.free()
+        pref_h1.free()
+        pref_h2.free()
+        pref_gate.free()
+        pref_mlp_out.free()
+        gpu_mlp_norm_x.free()
         q.free()
         k_vec.free()
         v_vec.free()

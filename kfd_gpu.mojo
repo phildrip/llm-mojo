@@ -1012,16 +1012,6 @@ struct KFDContext(Movable):
         if flush_output_before and out_ptr_addr != 0 and effective_out_stride == c_out:
             self.flush_cache_range(out_ptr_addr, c_out * batch_size * 4)
 
-        # Backpressure check: ensure we do not overwrite an unconsumed AQL ring slot
-        var rptr_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=self.gart_buf.cpu_addr + 128)
-        var spin_rptr = 0
-        while self.packet_idx >= rptr_ptr[0] + 1024:
-            _ = cpu_clflush(self.gart_buf.cpu_addr + 128)
-            _ = cpu_sfence(0)
-            spin_rptr += 1
-            if spin_rptr > 1000000:
-                raise Error("AQL ring buffer full (1024 packets in flight)")
-
         var slot = Int(self.packet_idx % 1024)
 
         # 1. Reset completion flag & atomic workgroup counter for this slot

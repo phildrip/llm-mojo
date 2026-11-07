@@ -12,7 +12,8 @@
 from std.math import sqrt, exp
 from std.memory import alloc
 from std.collections import InlineArray
-from attention import ring_row, _softmax
+from std.algorithm import parallelize
+from attention import ring_row, _softmax, _eval_head_range, PARALLEL_ATTN_MIN_N
 
 comptime GEMMA4_NUM_Q_HEADS: Int = 16
 comptime GEMMA4_NUM_KV_HEADS: Int = 2
@@ -658,38 +659,22 @@ def lsa_sparse_paged_attention(
         var t = selected_keys[idx]
         attn_rows[idx] = (block_table[t // block_size] * block_size + t % block_size) * kv_stride
 
-    # 2. KV-Group-Major Attention (each K/V row fetched once into L1 and reused across all group heads)
-    for g in range(num_kv_heads):
-        var g_offset = g * head_dim
-        var h_first = g * ratio
-
-        # Scores: one pass over the group's K rows, reused by every query head in the group
-        for idx in range(n_sel):
-            var k_off = attn_rows[idx] + g_offset
-            for hh in range(ratio):
-                var h = h_first + hh
-                var h_offset = h * head_dim
-                var score_vec = SIMD[DType.float32, 8](0.0)
-                for d in range(0, head_dim, 8):
-                    score_vec = score_vec + q.load[8](h_offset + d) * k_pool.load[8](k_off + d)
-                attn_scores[h * n_sel + idx] = score_vec.reduce_add()
-
-        for hh in range(ratio):
-            var h = h_first + hh
-            _softmax(attn_scores + h * n_sel, n_sel)
-            var h_offset = h * head_dim
-            for d in range(0, head_dim, 8):
-                out_attn.store[8](h_offset + d, SIMD[DType.float32, 8](0.0))
-
-        # Values: one pass over the group's V rows, reused by every query head in the group
-        for idx in range(n_sel):
-            var v_off = attn_rows[idx] + g_offset
-            for hh in range(ratio):
-                var h = h_first + hh
-                var h_offset = h * head_dim
-                var alpha_vec = SIMD[DType.float32, 8](attn_scores[h * n_sel + idx])
-                for d in range(0, head_dim, 8):
-                    out_attn.store[8](
-                        h_offset + d,
-                        out_attn.load[8](h_offset + d) + alpha_vec * v_pool.load[8](v_off + d)
-                    )
+    # 2. KV-Group-Major Attention (parallelized across query-head pairs when n_sel >= PARALLEL_ATTN_MIN_N)
+    # NOTE: Callers must invoke `lsa_sparse_paged_attention` from a serial context.
+    if n_sel >= PARALLEL_ATTN_MIN_N and num_heads >= 4 and (num_heads % 2 == 0) and (ratio % 2 == 0):
+        var num_pairs = num_heads // 2
+        def lsa_pair_worker(t: Int) capturing -> None:
+            var h_start = t * 2
+            var g = h_start // ratio
+            _eval_head_range(
+                q, k_pool, v_pool, attn_rows, attn_scores, out_attn,
+                n_sel, g * head_dim, h_start, h_start + 2, head_dim,
+            )
+        parallelize[lsa_pair_worker](num_pairs)
+    else:
+        for g in range(num_kv_heads):
+            var h_first = g * ratio
+            _eval_head_range(
+                q, k_pool, v_pool, attn_rows, attn_scores, out_attn,
+                n_sel, g * head_dim, h_first, h_first + ratio, head_dim,
+            )
