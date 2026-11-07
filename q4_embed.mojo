@@ -2,7 +2,7 @@ from std.ffi import OwnedDLHandle
 from std.memory import alloc
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
-from std.math import tanh
+from std.math import tanh, sqrt
 
 @always_inline
 def unpack_16bytes(
@@ -31,6 +31,11 @@ struct Q4Embedding:
     var embed_dim: Int
     var packed_weights: UnsafePointer[UInt8, MutExternalOrigin]
     var scales: UnsafePointer[Float32, MutExternalOrigin]
+    var row_tail_bound_11: UnsafePointer[Float32, MutExternalOrigin]
+    var last_winner_tok: UnsafePointer[Int, MutExternalOrigin]
+    var scratch_x_even: UnsafePointer[Float32, MutExternalOrigin]
+    var scratch_x_odd: UnsafePointer[Float32, MutExternalOrigin]
+    var scratch_shared_best: UnsafePointer[Float32, MutExternalOrigin]
     var _libc: OwnedDLHandle
 
     def __init__(out self, path: String, vocab_size: Int = 0, embed_dim: Int = 0) raises:
@@ -153,13 +158,59 @@ struct Q4Embedding:
 
         _ = c_close(fd)
         self._libc = libc^
+
+        # Precompute exact Euclidean tail L2 norm ||W_{r, tail}||_2 after prefix_blocks (25% of row)
+        self.row_tail_bound_11 = alloc[Float32](self.vocab_size)
+        self.last_winner_tok = alloc[Int](1)
+        self.last_winner_tok[0] = 0
+        self.scratch_x_even = alloc[Float32](self.embed_dim // 2)
+        self.scratch_x_odd = alloc[Float32](self.embed_dim // 2)
+        self.scratch_shared_best = alloc[Float32](1)
+        var num_blocks_init = self.embed_dim // 32
+        var b_pref = num_blocks_init // 2
+        var packed_init_ptr = self.packed_weights
+        var scales_init_ptr = self.scales
+        var bound_ptr = self.row_tail_bound_11
+        var half_dim_init = self.embed_dim // 2
+        var vs_init = self.vocab_size
+        var init_tasks = max(1, num_physical_cores())
+
+        def init_tail_bounds_worker(t: Int) capturing -> None:
+            var chunk = vs_init // init_tasks
+            var s_r = t * chunk
+            var e_r = (t + 1) * chunk if t < init_tasks - 1 else vs_init
+            for r in range(s_r, e_r):
+                var r_pack = r * half_dim_init
+                var r_off = r * num_blocks_init
+                var tail_norm_sq: Float32 = 0.0
+                for b in range(b_pref, num_blocks_init):
+                    var sc = scales_init_ptr[r_off + b]
+                    var bytes = packed_init_ptr.load[16](r_pack + b * 16)
+                    var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                    var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                    var blk_sq = (we * we + wo * wo).reduce_add()
+                    tail_norm_sq += (sc * sc) * blk_sq
+                bound_ptr[r] = sqrt(tail_norm_sq)
+
+        parallelize[init_tail_bounds_worker](init_tasks)
+
         print("Q4 Embedding Loaded successfully:")
         print("  Vocab:     ", self.vocab_size)
         print("  Dimension: ", self.embed_dim)
         print("  RAM:       ", (packed_size_bytes + scales_size_bytes) // 1024 // 1024, "MB")
 
+    def free(mut self):
+        var c_free = self._libc.get_function[def(Int) thin abi("C") -> None]("free")
+        c_free(Int(self.packed_weights))
+        c_free(Int(self.scales))
+        self.row_tail_bound_11.free()
+        self.last_winner_tok.free()
+        self.scratch_x_even.free()
+        self.scratch_x_odd.free()
+        self.scratch_shared_best.free()
+
     @always_inline
-    def reconstruct(self, token: Int, out_ptr: UnsafePointer[Float32, MutExternalOrigin]) -> None:
+    def reconstruct[type: DType = DType.float32](self, token: Int, out_ptr: UnsafePointer[Scalar[type], MutExternalOrigin]) -> None:
         var row_packed_offset = token * (self.embed_dim // 2)
         var row_scales_offset = token * (self.embed_dim // 32)
         var num_blocks = self.embed_dim // 32
@@ -177,17 +228,17 @@ struct Q4Embedding:
                 
                 var out_idx = block_out_offset + j * 8
                 
-                out_ptr[out_idx]     = Float32(Int(b0 & 15) - 8) * scale
-                out_ptr[out_idx + 1] = Float32(Int(b0 >> 4) - 8) * scale
-                out_ptr[out_idx + 2] = Float32(Int(b1 & 15) - 8) * scale
-                out_ptr[out_idx + 3] = Float32(Int(b1 >> 4) - 8) * scale
-                out_ptr[out_idx + 4] = Float32(Int(b2 & 15) - 8) * scale
-                out_ptr[out_idx + 5] = Float32(Int(b2 >> 4) - 8) * scale
-                out_ptr[out_idx + 6] = Float32(Int(b3 & 15) - 8) * scale
-                out_ptr[out_idx + 7] = Float32(Int(b3 >> 4) - 8) * scale
+                out_ptr[out_idx]     = Scalar[type](Float32(Int(b0 & 15) - 8) * scale)
+                out_ptr[out_idx + 1] = Scalar[type](Float32(Int(b0 >> 4) - 8) * scale)
+                out_ptr[out_idx + 2] = Scalar[type](Float32(Int(b1 & 15) - 8) * scale)
+                out_ptr[out_idx + 3] = Scalar[type](Float32(Int(b1 >> 4) - 8) * scale)
+                out_ptr[out_idx + 4] = Scalar[type](Float32(Int(b2 & 15) - 8) * scale)
+                out_ptr[out_idx + 5] = Scalar[type](Float32(Int(b2 >> 4) - 8) * scale)
+                out_ptr[out_idx + 6] = Scalar[type](Float32(Int(b3 & 15) - 8) * scale)
+                out_ptr[out_idx + 7] = Scalar[type](Float32(Int(b3 >> 4) - 8) * scale)
 
     @always_inline
-    def project_logits_parallel(
+    def project_logits_parallel_reference(
         self,
         x: UnsafePointer[Float32, _],
         local_max_logits: UnsafePointer[Float32, MutExternalOrigin],
@@ -197,7 +248,7 @@ struct Q4Embedding:
         var chunk_size = self.vocab_size // num_tasks
         var num_blocks = self.embed_dim // 32
         
-        def initial_proj_worker(t: Int) capturing -> None:
+        def ref_proj_worker(t: Int) capturing -> None:
             var start_r = t * chunk_size
             var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else self.vocab_size
             var local_max_l: Float32 = -999999.0
@@ -227,7 +278,6 @@ struct Q4Embedding:
                     acc = acc + (w3 * x.load[8](block_x_offset + 24)) * scale
                 
                 var sum = acc.reduce_add()
-                # Apply fast tanh and scaling as per standard gemma4 scaling
                 var logit = Float32(30.0) * tanh(sum / Float32(30.0))
                 if logit > local_max_l:
                     local_max_l = logit
@@ -235,7 +285,207 @@ struct Q4Embedding:
             local_max_logits[t] = local_max_l
             local_next_tokens[t] = local_tok
             
+        parallelize[ref_proj_worker](num_tasks)
+
+    @always_inline
+    def _eval_row_full(
+        self,
+        r: Int,
+        x_even: UnsafePointer[Float32, _],
+        x_odd: UnsafePointer[Float32, _],
+        num_blocks: Int,
+    ) -> Float32:
+        var row_packed_offset = r * (self.embed_dim // 2)
+        var row_scales_offset = r * num_blocks
+        var acc = SIMD[DType.float32, 16](0.0)
+        for b in range(num_blocks):
+            var scale = self.scales[row_scales_offset + b]
+            var bytes = self.packed_weights.load[16](row_packed_offset + b * 16)
+            var w_even = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+            var w_odd = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+            var block_dot = w_even * x_even.load[16](b * 16) + w_odd * x_odd.load[16](b * 16)
+            acc = acc + block_dot * scale
+        return acc.reduce_add()
+
+    @always_inline
+    def project_logits_parallel(
+        self,
+        x: UnsafePointer[Float32, _],
+        local_max_logits: UnsafePointer[Float32, MutExternalOrigin],
+        local_next_tokens: UnsafePointer[Int, MutExternalOrigin],
+        num_tasks: Int,
+    ) -> None:
+        """Fast Dual-Space Deinterleaved + Early-Z PVS logit projection with monotonic tanh hoisting."""
+        var chunk_size = self.vocab_size // num_tasks
+        var num_blocks = self.embed_dim // 32
+        var prefix_blocks = num_blocks // 2
+
+        # 1. Dual-Space Deinterleaving (1970s Loop-Invariant Permutation):
+        # Permute x ONCE into pre-allocated even (low-nibble) and odd (high-nibble) streams
+        # so the 262,144-row inner loop executes ZERO byte shuffles, shifts, or heap allocations!
+        var half_dim = self.embed_dim // 2
+        var x_even = self.scratch_x_even
+        var x_odd = self.scratch_x_odd
+        var x_tail_sq = SIMD[DType.float32, 16](0.0)
+        for b in range(num_blocks):
+            var v0 = x.load[16](b * 32)
+            var v1 = x.load[16](b * 32 + 16)
+            var ev = v0.deinterleave()[0].join(v1.deinterleave()[0])
+            var od = v0.deinterleave()[1].join(v1.deinterleave()[1])
+            x_even.store[16](b * 16, ev)
+            x_odd.store[16](b * 16, od)
+            if b >= prefix_blocks:
+                x_tail_sq = x_tail_sq + ev * ev + od * od
+        var x_tail_rms = sqrt(x_tail_sq.reduce_add())
+
+        # 2. Seed initial lower bound from hot working-set tokens [0..256) + last winning token
+        var seed_count = 256 if self.vocab_size >= 256 else self.vocab_size
+        var seed_best_sum: Float32 = -1e30
+        var seed_best_tok: Int = 0
+        var prev_win = self.last_winner_tok[0]
+        if prev_win >= seed_count and prev_win < self.vocab_size:
+            seed_best_sum = self._eval_row_full(prev_win, x_even, x_odd, num_blocks)
+            seed_best_tok = prev_win
+
+        for r in range(seed_count):
+            var s = self._eval_row_full(r, x_even, x_odd, num_blocks)
+            if s > seed_best_sum or (s == seed_best_sum and r < seed_best_tok):
+                seed_best_sum = s
+                seed_best_tok = r
+
+        var shared_best = self.scratch_shared_best
+        shared_best[0] = seed_best_sum
+
+        def initial_proj_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            if start_r < seed_count:
+                start_r = seed_count
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else self.vocab_size
+            var local_max_sum: Float32 = seed_best_sum if t == 0 else -1e30
+            var local_tok = seed_best_tok if t == 0 else start_r
+            var prune_thresh: Float32 = shared_best[0]
+
+            var r = start_r
+            while r + 1 < end_r:
+                if (r & 63) == 0:
+                    var g_best = shared_best[0]
+                    if g_best > prune_thresh:
+                        prune_thresh = g_best
+
+                var r0_pack = r * half_dim
+                var r1_pack = (r + 1) * half_dim
+                var r0_sc = r * num_blocks
+                var r1_sc = (r + 1) * num_blocks
+                var acc0 = SIMD[DType.float32, 16](0.0)
+                var acc1 = SIMD[DType.float32, 16](0.0)
+
+                # Stage 1: Evaluate first 25% of blocks for 2 rows simultaneously (reusing x_even/x_odd in registers)
+                for b in range(prefix_blocks):
+                    var xe = x_even.load[16](b * 16)
+                    var xo = x_odd.load[16](b * 16)
+                    var sc0 = self.scales[r0_sc + b]
+                    var b0 = self.packed_weights.load[16](r0_pack + b * 16)
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+
+                    var sc1 = self.scales[r1_sc + b]
+                    var b1 = self.packed_weights.load[16](r1_pack + b * 16)
+                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                    acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+
+                var p0 = acc0.reduce_add()
+                var p1 = acc1.reduce_add()
+                var keep0 = (p0 + self.row_tail_bound_11[r] * x_tail_rms >= prune_thresh)
+                var keep1 = (p1 + self.row_tail_bound_11[r + 1] * x_tail_rms >= prune_thresh)
+
+                if keep0 and keep1:
+                    for b in range(prefix_blocks, num_blocks):
+                        var xe = x_even.load[16](b * 16)
+                        var xo = x_odd.load[16](b * 16)
+                        var sc0 = self.scales[r0_sc + b]
+                        var b0 = self.packed_weights.load[16](r0_pack + b * 16)
+                        var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+
+                        var sc1 = self.scales[r1_sc + b]
+                        var b1 = self.packed_weights.load[16](r1_pack + b * 16)
+                        var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+
+                    var sum0 = acc0.reduce_add()
+                    if sum0 > local_max_sum:
+                        local_max_sum = sum0
+                        local_tok = r
+                        if sum0 > prune_thresh:
+                            prune_thresh = sum0
+                            shared_best[0] = sum0
+                    var sum1 = acc1.reduce_add()
+                    if sum1 > local_max_sum:
+                        local_max_sum = sum1
+                        local_tok = r + 1
+                        if sum1 > prune_thresh:
+                            prune_thresh = sum1
+                            shared_best[0] = sum1
+                elif keep0:
+                    for b in range(prefix_blocks, num_blocks):
+                        var sc0 = self.scales[r0_sc + b]
+                        var b0 = self.packed_weights.load[16](r0_pack + b * 16)
+                        var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we0 * x_even.load[16](b * 16) + wo0 * x_odd.load[16](b * 16)) * sc0
+                    var sum0 = acc0.reduce_add()
+                    if sum0 > local_max_sum:
+                        local_max_sum = sum0
+                        local_tok = r
+                        if sum0 > prune_thresh:
+                            prune_thresh = sum0
+                            shared_best[0] = sum0
+                elif keep1:
+                    for b in range(prefix_blocks, num_blocks):
+                        var sc1 = self.scales[r1_sc + b]
+                        var b1 = self.packed_weights.load[16](r1_pack + b * 16)
+                        var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc1 = acc1 + (we1 * x_even.load[16](b * 16) + wo1 * x_odd.load[16](b * 16)) * sc1
+                    var sum1 = acc1.reduce_add()
+                    if sum1 > local_max_sum:
+                        local_max_sum = sum1
+                        local_tok = r + 1
+                        if sum1 > prune_thresh:
+                            prune_thresh = sum1
+                            shared_best[0] = sum1
+
+                r += 2
+
+            while r < end_r:
+                var sum = self._eval_row_full(r, x_even, x_odd, num_blocks)
+                if sum > local_max_sum:
+                    local_max_sum = sum
+                    local_tok = r
+                    if sum > prune_thresh:
+                        prune_thresh = sum
+                        shared_best[0] = sum
+                r += 1
+
+            # Monotonic tanh soft-cap applied ONCE per worker thread instead of 262,144 times!
+            local_max_logits[t] = Float32(30.0) * tanh(local_max_sum / Float32(30.0))
+            local_next_tokens[t] = local_tok
+
         parallelize[initial_proj_worker](num_tasks)
+
+        var overall_best_l: Float32 = -1e30
+        var overall_best_tok: Int = 0
+        for t in range(num_tasks):
+            if local_max_logits[t] > overall_best_l or (
+                local_max_logits[t] == overall_best_l and local_next_tokens[t] < overall_best_tok
+            ):
+                overall_best_l = local_max_logits[t]
+                overall_best_tok = local_next_tokens[t]
+        self.last_winner_tok[0] = overall_best_tok
 
     @always_inline
     def project_full_logits(
