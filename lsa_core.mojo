@@ -262,7 +262,7 @@ struct LSALayerIndex:
         for i in range(self.max_buckets):
             self.sizes[i] = 0
 
-        self.staging_keys = alloc[Float32](LSA_CLUSTER_BLOCK_SIZE * LSA_DIM)
+        self.staging_keys = alloc[Float32](2 * LSA_CLUSTER_BLOCK_SIZE * LSA_DIM)
         self.staging_pools = alloc[Float32](LSA_POOLS_PER_BLOCK * LSA_DIM)
         self.staging_labels = alloc[Int](LSA_POOLS_PER_BLOCK)
 
@@ -283,6 +283,24 @@ struct LSALayerIndex:
         for i in range(self.max_buckets):
             self.sizes[i] = 0
 
+    def rollback_to(mut self, target_tokens: Int):
+        """Rolls back speculative draft keys (including across a 512-token cluster block boundary)."""
+        if target_tokens <= 0:
+            self.reset()
+            return
+        var clamped = min(target_tokens, self.max_capacity)
+        self.total_tokens_appended = clamped
+        var valid_closed = clamped // LSA_CLUSTER_BLOCK_SIZE
+        debug_assert(
+            self.closed_blocks - valid_closed <= 1,
+            "LSALayerIndex.rollback_to supports at most 1 unclosed 512-token block boundary",
+        )
+        while self.closed_blocks > valid_closed:
+            self.closed_blocks -= 1
+            var bucket_base = self.closed_blocks * LSA_BLOCK_BUCKET_COUNT
+            for i in range(LSA_BLOCK_BUCKET_COUNT):
+                self.sizes[bucket_base + i] = 0
+
     def append_key(mut self, pos: Int, k_idx: UnsafePointer[Float32, _]):
         """
         Appends a 64-d unit index key at position pos.
@@ -292,7 +310,8 @@ struct LSALayerIndex:
             return
 
         var local_pos = pos % LSA_CLUSTER_BLOCK_SIZE
-        var dest = self.staging_keys + local_pos * LSA_DIM
+        var bank_pos = pos % (2 * LSA_CLUSTER_BLOCK_SIZE)
+        var dest = self.staging_keys + bank_pos * LSA_DIM
         for i in range(0, LSA_DIM, 8):
             dest.store[8](i, k_idx.load[8](i))
 
@@ -308,6 +327,7 @@ struct LSALayerIndex:
         if bucket_base + LSA_BLOCK_BUCKET_COUNT > self.max_buckets:
             return
         var block_start_token = b * LSA_CLUSTER_BLOCK_SIZE
+        var bank_keys = self.staging_keys + (b % 2) * LSA_CLUSTER_BLOCK_SIZE * LSA_DIM
 
         # 1. Pool 4 consecutive keys -> 128 pools
         for p in range(LSA_POOLS_PER_BLOCK):
@@ -315,7 +335,7 @@ struct LSALayerIndex:
             for d in range(0, LSA_DIM, 8):
                 var s = SIMD[DType.float32, 8](0.0)
                 for j in range(LSA_POOL_SIZE):
-                    var k_ptr = self.staging_keys + (p * LSA_POOL_SIZE + j) * LSA_DIM
+                    var k_ptr = bank_keys + (p * LSA_POOL_SIZE + j) * LSA_DIM
                     s += k_ptr.load[8](d)
                 self.staging_pools.store[8](p_off + d, s)
 
@@ -470,7 +490,7 @@ struct LSALayerIndex:
             for j in range(LSA_POOL_SIZE):
                 var local_tok = p * LSA_POOL_SIZE + j
                 var global_tok = block_start_token + local_tok
-                var k_ptr = self.staging_keys + local_tok * LSA_DIM
+                var k_ptr = bank_keys + local_tok * LSA_DIM
 
                 for d in range(0, LSA_DIM, 8):
                     self.centroids.store[8](c_off + d, self.centroids.load[8](c_off + d) + k_ptr.load[8](d))
