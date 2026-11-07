@@ -1121,6 +1121,7 @@ def main() raises:
     var lsa_sinks = 4
     var lsa_proj_path = String("gemma4_lsa_projections.bin")
     var max_kv_tokens = 8192
+    var early_no_mtp = False
 
     var early_args = std.sys.argv()
     for ai in range(1, len(early_args)):
@@ -1128,6 +1129,8 @@ def main() raises:
             legacy_attn = True
         elif early_args[ai] == "--no-ring":
             use_ring = False
+        elif early_args[ai] == "--no-mtp" or early_args[ai] == "--no-spec":
+            early_no_mtp = True
         elif early_args[ai] == "--dump-qk" and ai + 1 < len(early_args):
             dump_qk_path = String(early_args[ai + 1])
         elif early_args[ai] == "--lsa":
@@ -1320,29 +1323,35 @@ def main() raises:
     print("Loading AutoTokenizer...")
     var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
     var py_builtins = Python.import_module("builtins")
+    try:
+        _ = Python.import_module("readline")
+    except:
+        pass
     print("Tokenizer loaded successfully!")
 
     # MTP SPECULATIVE DECODING SETUP
     var use_mtp = True
     var real_weights_loaded = False
     var mtp_config = MTPConfig()
+    var assistant_fd: Int32 = -1
 
-    var assistant_file = String("assistant_weights.bin")
-    var ast_path_bytes = assistant_file.as_bytes()
-    var ast_path_ptr = alloc[UInt8](len(ast_path_bytes) + 1)
-    for i in range(len(ast_path_bytes)):
-        ast_path_ptr[i] = ast_path_bytes[i]
-    ast_path_ptr[len(ast_path_bytes)] = 0
-    var assistant_fd = c_open(ast_path_ptr.__int__(), 0, 0)
-    ast_path_ptr.free()
+    if not early_no_mtp:
+        var assistant_file = String("assistant_weights.bin")
+        var ast_path_bytes = assistant_file.as_bytes()
+        var ast_path_ptr = alloc[UInt8](len(ast_path_bytes) + 1)
+        for i in range(len(ast_path_bytes)):
+            ast_path_ptr[i] = ast_path_bytes[i]
+        ast_path_ptr[len(ast_path_bytes)] = 0
+        assistant_fd = c_open(ast_path_ptr.__int__(), 0, 0)
+        ast_path_ptr.free()
 
-    if assistant_fd >= 0:
-        real_weights_loaded = True
-        print("Found real speculator weights in 'assistant_weights.bin'. Setting vocab_size to 262144.")
-        mtp_config = MTPConfig(1024, 2816, 4, 262144)
-    else:
-        print("Real speculator weights not found. Falling back to dummy weights.")
-        mtp_config = MTPConfig(1024, 2816, 4, 10000)
+        if assistant_fd >= 0:
+            real_weights_loaded = True
+            print("Found real speculator weights in 'assistant_weights.bin'. Setting vocab_size to 262144.")
+            mtp_config = MTPConfig(1024, 2816, 4, 262144)
+        else:
+            print("Real speculator weights not found. Falling back to dummy weights.")
+            mtp_config = MTPConfig(1024, 2816, 4, 10000)
 
     def read_floats(fd: Int32, ptr: UnsafePointer[Float32, MutExternalOrigin], count: Int) capturing raises:
         var bytes_to_read = count * 4
@@ -1373,133 +1382,151 @@ def main() raises:
 
     var mtp_layers = List[AssistantLayerWeights]()
 
-    print("Allocating MTP Assistant model and layer weights...")
-    if real_weights_loaded:
-        mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
-        mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
-        mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
-        mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
-        # Tie lm_head with tok_embd to save 1 GB RAM
+    if early_no_mtp:
+        print("Skipping MTP Assistant weight allocation (--no-mtp enabled, saving 4.5 GB RAM).")
+        mtp_tok_embd = alloc[Float32](1)
+        mtp_pre_proj = alloc[Float32](1)
+        mtp_post_proj = alloc[Float32](1)
+        mtp_output_norm_weight = alloc[Float32](1)
         mtp_lm_head = mtp_tok_embd
+        mtp_layer_attn_norm = alloc[Float32](1)
+        mtp_layer_wq = alloc[Float32](1)
+        mtp_layer_wo = alloc[Float32](1)
+        mtp_layer_q_norm = alloc[Float32](1)
+        mtp_layer_attn_post_norm = alloc[Float32](1)
+        mtp_layer_ffn_norm = alloc[Float32](1)
+        mtp_layer_ffn_gate = alloc[Float32](1)
+        mtp_layer_ffn_up = alloc[Float32](1)
+        mtp_layer_ffn_down = alloc[Float32](1)
+        mtp_layer_ffn_post_norm = alloc[Float32](1)
     else:
-        mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
-        mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
-        mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
-        mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
-        mtp_lm_head = alloc[Float32](mtp_config.get_lm_head_size())
+        print("Allocating MTP Assistant model and layer weights...")
+        if real_weights_loaded:
+            mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
+            mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
+            mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
+            mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
+            # Tie lm_head with tok_embd to save 1 GB RAM
+            mtp_lm_head = mtp_tok_embd
+        else:
+            mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
+            mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
+            mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
+            mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
+            mtp_lm_head = alloc[Float32](mtp_config.get_lm_head_size())
 
-    mtp_layer_attn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-    
-    var wq_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * 4096 * mtp_config.embed_dim
-    mtp_layer_wq = alloc[Float32](wq_size)
+        mtp_layer_attn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+        
+        var wq_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * 4096 * mtp_config.embed_dim
+        mtp_layer_wq = alloc[Float32](wq_size)
 
-    var wo_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * mtp_config.embed_dim * 4096
-    mtp_layer_wo = alloc[Float32](wo_size)
+        var wo_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * mtp_config.embed_dim * 4096
+        mtp_layer_wo = alloc[Float32](wo_size)
 
-    var q_norm_size = (3 * 256 + 512) if real_weights_loaded else mtp_config.num_layers * 256
-    mtp_layer_q_norm = alloc[Float32](q_norm_size)
+        var q_norm_size = (3 * 256 + 512) if real_weights_loaded else mtp_config.num_layers * 256
+        mtp_layer_q_norm = alloc[Float32](q_norm_size)
 
-    mtp_layer_attn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-    mtp_layer_ffn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-    mtp_layer_ffn_gate = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-    mtp_layer_ffn_up = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-    mtp_layer_ffn_down = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 8192)
-    mtp_layer_ffn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+        mtp_layer_attn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+        mtp_layer_ffn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
+        mtp_layer_ffn_gate = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
+        mtp_layer_ffn_up = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
+        mtp_layer_ffn_down = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 8192)
+        mtp_layer_ffn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
 
-    for il in range(mtp_config.num_layers):
-        var wq_offset = il * 4096 * mtp_config.embed_dim if (not real_weights_loaded) else (il * 4096 * mtp_config.embed_dim if il < 3 else 3 * 4096 * mtp_config.embed_dim)
-        var wo_offset = il * mtp_config.embed_dim * 4096 if (not real_weights_loaded) else (il * mtp_config.embed_dim * 4096 if il < 3 else 3 * mtp_config.embed_dim * 4096)
-        var q_norm_offset = il * 256 if (not real_weights_loaded) else (il * 256 if il < 3 else 3 * 256)
+        for il in range(mtp_config.num_layers):
+            var wq_offset = il * 4096 * mtp_config.embed_dim if (not real_weights_loaded) else (il * 4096 * mtp_config.embed_dim if il < 3 else 3 * 4096 * mtp_config.embed_dim)
+            var wo_offset = il * mtp_config.embed_dim * 4096 if (not real_weights_loaded) else (il * mtp_config.embed_dim * 4096 if il < 3 else 3 * mtp_config.embed_dim * 4096)
+            var q_norm_offset = il * 256 if (not real_weights_loaded) else (il * 256 if il < 3 else 3 * 256)
 
-        mtp_layers.append(
-            AssistantLayerWeights(
-                mtp_layer_attn_norm + il * mtp_config.embed_dim,
-                mtp_layer_wq + wq_offset,
-                mtp_layer_wo + wo_offset,
-                mtp_layer_q_norm + q_norm_offset,
-                mtp_layer_attn_post_norm + il * mtp_config.embed_dim,
-                Float32(0.95),
-                mtp_layer_ffn_norm + il * mtp_config.embed_dim,
-                mtp_layer_ffn_gate + il * 8192 * mtp_config.embed_dim,
-                mtp_layer_ffn_up + il * 8192 * mtp_config.embed_dim,
-                mtp_layer_ffn_down + mtp_config.embed_dim * (il * 8192),
-                mtp_layer_ffn_post_norm + il * mtp_config.embed_dim
+            mtp_layers.append(
+                AssistantLayerWeights(
+                    mtp_layer_attn_norm + il * mtp_config.embed_dim,
+                    mtp_layer_wq + wq_offset,
+                    mtp_layer_wo + wo_offset,
+                    mtp_layer_q_norm + q_norm_offset,
+                    mtp_layer_attn_post_norm + il * mtp_config.embed_dim,
+                    Float32(0.95),
+                    mtp_layer_ffn_norm + il * mtp_config.embed_dim,
+                    mtp_layer_ffn_gate + il * 8192 * mtp_config.embed_dim,
+                    mtp_layer_ffn_up + il * 8192 * mtp_config.embed_dim,
+                    mtp_layer_ffn_down + mtp_config.embed_dim * (il * 8192),
+                    mtp_layer_ffn_post_norm + il * mtp_config.embed_dim
+                )
             )
-        )
 
-    if real_weights_loaded:
-        try:
-            print("Reading real weights from assistant_weights.bin...")
-            read_floats(assistant_fd, mtp_tok_embd, mtp_config.vocab_size * mtp_config.embed_dim)
-            read_floats(assistant_fd, mtp_pre_proj, mtp_config.get_pre_proj_size())
-            read_floats(assistant_fd, mtp_post_proj, mtp_config.get_post_proj_size())
-            read_floats(assistant_fd, mtp_output_norm_weight, mtp_config.embed_dim)
+        if real_weights_loaded:
+            try:
+                print("Reading real weights from assistant_weights.bin...")
+                read_floats(assistant_fd, mtp_tok_embd, mtp_config.vocab_size * mtp_config.embed_dim)
+                read_floats(assistant_fd, mtp_pre_proj, mtp_config.get_pre_proj_size())
+                read_floats(assistant_fd, mtp_post_proj, mtp_config.get_post_proj_size())
+                read_floats(assistant_fd, mtp_output_norm_weight, mtp_config.embed_dim)
 
-            # Read layer weights for 4 layers
-            for il in range(mtp_config.num_layers):
-                var is_global = (il == 3)
-                print("  Loading real weights for Layer " + String(il) + "...")
-                read_floats(assistant_fd, mtp_layers[il].attn_norm_weight, mtp_config.embed_dim)
+                # Read layer weights for 4 layers
+                for il in range(mtp_config.num_layers):
+                    var is_global = (il == 3)
+                    print("  Loading real weights for Layer " + String(il) + "...")
+                    read_floats(assistant_fd, mtp_layers[il].attn_norm_weight, mtp_config.embed_dim)
+                    
+                    var layer_head_dim = 512 if is_global else 256
+                    var q_proj_size = 16 * layer_head_dim * mtp_config.embed_dim
+                    read_floats(assistant_fd, mtp_layers[il].wq, q_proj_size)
+                    
+                    var o_proj_size = mtp_config.embed_dim * 16 * layer_head_dim
+                    read_floats(assistant_fd, mtp_layers[il].wo, o_proj_size)
+                    
+                    read_floats(assistant_fd, mtp_layers[il].q_norm_weight, layer_head_dim)
+                    read_floats(assistant_fd, mtp_layers[il].attn_post_norm_weight, mtp_config.embed_dim)
+                    
+                    # Layer scalar
+                    var temp_scalar = alloc[Float32](1)
+                    read_floats(assistant_fd, temp_scalar, 1)
+                    mtp_layers[il].out_scale = temp_scalar[0]
+                    temp_scalar.free()
+                    
+                    read_floats(assistant_fd, mtp_layers[il].ffn_norm_weight, mtp_config.embed_dim)
+                    read_floats(assistant_fd, mtp_layers[il].ffn_gate, 8192 * mtp_config.embed_dim)
+                    read_floats(assistant_fd, mtp_layers[il].ffn_up, 8192 * mtp_config.embed_dim)
+                    read_floats(assistant_fd, mtp_layers[il].ffn_down, mtp_config.embed_dim * 8192)
+                    read_floats(assistant_fd, mtp_layers[il].ffn_post_norm_weight, mtp_config.embed_dim)
                 
-                var layer_head_dim = 512 if is_global else 256
-                var q_proj_size = 16 * layer_head_dim * mtp_config.embed_dim
-                read_floats(assistant_fd, mtp_layers[il].wq, q_proj_size)
-                
-                var o_proj_size = mtp_config.embed_dim * 16 * layer_head_dim
-                read_floats(assistant_fd, mtp_layers[il].wo, o_proj_size)
-                
-                read_floats(assistant_fd, mtp_layers[il].q_norm_weight, layer_head_dim)
-                read_floats(assistant_fd, mtp_layers[il].attn_post_norm_weight, mtp_config.embed_dim)
-                
-                # Layer scalar
-                var temp_scalar = alloc[Float32](1)
-                read_floats(assistant_fd, temp_scalar, 1)
-                mtp_layers[il].out_scale = temp_scalar[0]
-                temp_scalar.free()
-                
-                read_floats(assistant_fd, mtp_layers[il].ffn_norm_weight, mtp_config.embed_dim)
-                read_floats(assistant_fd, mtp_layers[il].ffn_gate, 8192 * mtp_config.embed_dim)
-                read_floats(assistant_fd, mtp_layers[il].ffn_up, 8192 * mtp_config.embed_dim)
-                read_floats(assistant_fd, mtp_layers[il].ffn_down, mtp_config.embed_dim * 8192)
-                read_floats(assistant_fd, mtp_layers[il].ffn_post_norm_weight, mtp_config.embed_dim)
-            
-            print("Successfully loaded all real speculator weights into RAM!")
-        except err:
-            print("CRITICAL: Error loading speculator weights: " + String(err))
+                print("Successfully loaded all real speculator weights into RAM!")
+            except err:
+                print("CRITICAL: Error loading speculator weights: " + String(err))
+                _ = c_close(assistant_fd)
+                return
             _ = c_close(assistant_fd)
-            return
-        _ = c_close(assistant_fd)
-    else:
-        print("Populating parameters with deterministic non-zero weights...")
-        for i in range(mtp_config.vocab_size * mtp_config.embed_dim):
-            mtp_tok_embd[i] = Float32(0.005) * Float32((i + 13) % 47)
-        for i in range(mtp_config.get_pre_proj_size()):
-            mtp_pre_proj[i] = Float32(0.0001) * Float32((i + 5) % 113)
-        for i in range(mtp_config.get_post_proj_size()):
-            mtp_post_proj[i] = Float32(0.0001) * Float32((i + 7) % 79)
-        for i in range(mtp_config.embed_dim):
-            mtp_output_norm_weight[i] = Float32(1.0)
-        for i in range(mtp_config.get_lm_head_size()):
-            mtp_lm_head[i] = Float32(0.001) * Float32((i + 3) % 61)
+        else:
+            print("Populating parameters with deterministic non-zero weights...")
+            for i in range(mtp_config.vocab_size * mtp_config.embed_dim):
+                mtp_tok_embd[i] = Float32(0.005) * Float32((i + 13) % 47)
+            for i in range(mtp_config.get_pre_proj_size()):
+                mtp_pre_proj[i] = Float32(0.0001) * Float32((i + 5) % 113)
+            for i in range(mtp_config.get_post_proj_size()):
+                mtp_post_proj[i] = Float32(0.0001) * Float32((i + 7) % 79)
+            for i in range(mtp_config.embed_dim):
+                mtp_output_norm_weight[i] = Float32(1.0)
+            for i in range(mtp_config.get_lm_head_size()):
+                mtp_lm_head[i] = Float32(0.001) * Float32((i + 3) % 61)
 
-        for i in range(mtp_config.num_layers * mtp_config.embed_dim):
-            mtp_layer_attn_norm[i] = Float32(1.0)
-            mtp_layer_attn_post_norm[i] = Float32(1.0)
-            mtp_layer_ffn_norm[i] = Float32(1.0)
-            mtp_layer_ffn_post_norm[i] = Float32(1.0)
+            for i in range(mtp_config.num_layers * mtp_config.embed_dim):
+                mtp_layer_attn_norm[i] = Float32(1.0)
+                mtp_layer_attn_post_norm[i] = Float32(1.0)
+                mtp_layer_ffn_norm[i] = Float32(1.0)
+                mtp_layer_ffn_post_norm[i] = Float32(1.0)
 
-        for i in range(mtp_config.num_layers * 4096 * mtp_config.embed_dim):
-            mtp_layer_wq[i] = Float32(0.0002) * Float32(i % 103)
-            mtp_layer_wo[i] = Float32(0.0002) * Float32(i % 97)
+            for i in range(mtp_config.num_layers * 4096 * mtp_config.embed_dim):
+                mtp_layer_wq[i] = Float32(0.0002) * Float32(i % 103)
+                mtp_layer_wo[i] = Float32(0.0002) * Float32(i % 97)
 
-        for i in range(mtp_config.num_layers * 256):
-            mtp_layer_q_norm[i] = Float32(1.0)
+            for i in range(mtp_config.num_layers * 256):
+                mtp_layer_q_norm[i] = Float32(1.0)
 
-        for i in range(mtp_config.num_layers * 8192 * mtp_config.embed_dim):
-            mtp_layer_ffn_gate[i] = Float32(0.0001) * Float32(i % 83)
-            mtp_layer_ffn_up[i] = Float32(0.0001) * Float32(i % 89)
-            mtp_layer_ffn_down[i] = Float32(0.0001) * Float32(i % 73)
-        print("Populated all MTP arrays successfully.")
+            for i in range(mtp_config.num_layers * 8192 * mtp_config.embed_dim):
+                mtp_layer_ffn_gate[i] = Float32(0.0001) * Float32(i % 83)
+                mtp_layer_ffn_up[i] = Float32(0.0001) * Float32(i % 89)
+                mtp_layer_ffn_down[i] = Float32(0.0001) * Float32(i % 73)
+            print("Populated all MTP arrays successfully.")
 
     var mtp_weights = MTPWeights(mtp_tok_embd, mtp_pre_proj, mtp_post_proj, mtp_output_norm_weight, mtp_lm_head)
 
@@ -1831,7 +1858,9 @@ def main() raises:
 
         var iteration = 0
         var global_start_time = std.time.perf_counter()
-        var chat_generation_start_time: Float64 = 0.0
+        var chat_decode_start_time: Float64 = 0.0
+        var chat_prefill_ms: Float64 = 0.0
+        var chat_prefill_toks: Int = 0
         var chat_max_new_tokens = max_total_tokens if max_tokens_explicit else 512
 
         while True:
@@ -1839,8 +1868,13 @@ def main() raises:
                 if is_chat_mode:
                     print()
                     var py_builtins = Python.import_module("builtins")
-                    var user_input = py_builtins.input("User > ")
-                    var user_input_str = String(user_input).strip()
+                    var user_input_str = String("")
+                    try:
+                        var user_input = py_builtins.input("User > ")
+                        user_input_str = String(String(user_input).strip())
+                    except:
+                        print("\nExiting chat...")
+                        user_input_str = "exit"
                     if user_input_str == "exit" or user_input_str == "quit":
                         if len(pending_queue) > 0:
                             var c_ptr = pending_queue[0]
@@ -1929,10 +1963,10 @@ def main() raises:
                     print("  Prompt: \"" + seq_ptr[].prompt + "\"")
 
                 var t_pref_start = std.time.perf_counter()
-                if is_chat_mode:
-                    chat_generation_start_time = t_pref_start
                 var num_prompt_tokens = len(seq_ptr[].tokens)
                 var prefill_start_pos = seq_ptr[].pos
+                if is_chat_mode:
+                    chat_prefill_toks = num_prompt_tokens - prefill_start_pos
 
                 # Execute prefill pass for each new prompt token sequentially to build up the KV cache
                 for pos in range(prefill_start_pos, num_prompt_tokens):
@@ -2102,6 +2136,8 @@ def main() raises:
                 var t_pref_end = std.time.perf_counter()
                 var prefill_ms = (t_pref_end - t_pref_start) * 1000.0
                 if is_chat_mode:
+                    chat_prefill_ms = prefill_ms
+                    chat_decode_start_time = t_pref_end
                     if final_next_token == 1 or final_next_token == 106:
                         seq_ptr[].is_finished = True
                     else:
@@ -2433,15 +2469,18 @@ def main() raises:
                 if s_ptr[].is_finished:
                     if is_chat_mode:
                         var t_chat_end = std.time.perf_counter()
-                        var chat_dur_sec = t_chat_end - chat_generation_start_time
+                        var chat_decode_sec = t_chat_end - chat_decode_start_time
                         var chat_decode_tokens = len(s_ptr[].tokens) - s_ptr[].prompt_len
-                        var chat_tps = Float64(chat_decode_tokens) / (chat_dur_sec + 1e-10)
+                        var decode_steps = chat_decode_tokens - 1 if chat_decode_tokens > 1 else 1
+                        var chat_tps = Float64(decode_steps) / (chat_decode_sec + 1e-10)
                         var chat_tps_rounded = Float64(Int(chat_tps * 100.0 + 0.5)) / 100.0
+                        var pref_tps = Float64(chat_prefill_toks) / ((chat_prefill_ms / 1000.0) + 1e-10)
+                        var pref_tps_rounded = Float64(Int(pref_tps * 100.0 + 0.5)) / 100.0
                         var lsa_info = String("")
                         if use_lsa and s_ptr[].kv_slot >= 0:
                             var closed_b = lsa_indices[s_ptr[].kv_slot * 5].closed_blocks
                             lsa_info = " | LSA blocks: " + String(closed_b) + " (" + String(closed_b * 32) + " buckets)"
-                        print("\n\n [Generation Speed: " + String(chat_tps_rounded) + " tokens/sec | generated " + String(chat_decode_tokens) + " tokens | context: " + String(len(s_ptr[].tokens)) + " tokens" + lsa_info + "]")
+                        print("\n\n [Decode: " + String(chat_tps_rounded) + " tok/s (" + String(chat_decode_tokens) + " tok) | Prefill: " + String(pref_tps_rounded) + " tok/s (" + String(chat_prefill_toks) + " tok) | context: " + String(len(s_ptr[].tokens)) + " tok" + lsa_info + "]")
                     else:
                         print("\n[Scheduler] Request #" + String(s_ptr[].id) + " finished! Retiring and freeing " + String(len(s_ptr[].block_table)) + " blocks...")
                         for b in range(len(s_ptr[].block_table)):
