@@ -1120,6 +1120,7 @@ def main() raises:
     var lsa_window = 128
     var lsa_sinks = 4
     var lsa_proj_path = String("gemma4_lsa_projections.bin")
+    var max_kv_tokens = 8192
 
     var early_args = std.sys.argv()
     for ai in range(1, len(early_args)):
@@ -1141,6 +1142,8 @@ def main() raises:
             lsa_sinks = atol(String(early_args[ai + 1]))
         elif early_args[ai] == "--lsa-projections" and ai + 1 < len(early_args):
             lsa_proj_path = String(early_args[ai + 1])
+        elif early_args[ai] == "--max-kv-tokens" and ai + 1 < len(early_args):
+            max_kv_tokens = atol(String(early_args[ai + 1]))
     var sliding_window = 0 if legacy_attn else 1024
     # Ring holds exactly the window: every KV write is at the current pos (prefill, decode and MTP
     # verification are all sequential; the MTP drafter only reads), so a write at pos evicts
@@ -1243,8 +1246,8 @@ def main() raises:
     var embed = Q4Embedding("gemma4_moe_embed_q4.bin", CONFIG.vocab_size, CONFIG.embed_dim)
 
     # 4. Allocate Virtual Paged Attention block pools for 30 layers
-    var max_blocks = 128
     var block_size = 16
+    var max_blocks = (max_kv_tokens + block_size - 1) // block_size
     var block_manager = BlockManager(max_blocks, block_size)
 
     var k_block_pools = List[UnsafePointer[Float32, MutExternalOrigin]]()
@@ -1701,6 +1704,7 @@ def main() raises:
     var is_chat_mode = False
     var chat_use_mtp = True
     var max_total_tokens = 35          # total sequence length (prompt + generated) in batch mode
+    var max_tokens_explicit = False
     var prompt_file = String("")
     var positional_args = List[String]()
     var cmd_args = std.sys.argv()
@@ -1714,12 +1718,13 @@ def main() raises:
         elif a == "--max-tokens" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             max_total_tokens = atol(String(cmd_args[arg_i]))
+            max_tokens_explicit = True
         elif a == "--prompt-file" and arg_i + 1 < len(cmd_args):
             arg_i += 1
             prompt_file = String(cmd_args[arg_i])
         elif a == "--" or a == "--legacy-attn" or a == "--no-ring" or a == "--lsa":
             pass   # handled by the early parse
-        elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections") and arg_i + 1 < len(cmd_args):
+        elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections" or a == "--max-kv-tokens") and arg_i + 1 < len(cmd_args):
             arg_i += 1  # handled by early parse
         elif a == "--dump-qk" and arg_i + 1 < len(cmd_args):
             arg_i += 1
@@ -1808,10 +1813,11 @@ def main() raises:
             print("=========================================================")
             print("   GEMMA 4 SPECULATIVE MOE INTERACTIVE CHAT AGENT        ")
             print("=========================================================")
-            print("  Speculative Assistant:     Fully RAM-Resident MTP (4 draft tokens)")
-            print("  Continuous Batching:       Enabled (Paged Attention)")
+            print("  Speculative Assistant:     " + ("Fully RAM-Resident MTP (4 draft tokens)" if use_mtp else "Disabled (--no-mtp standard decode)"))
+            print("  Attention Mode:            " + ("LSA Sparse Global (k=" + String(lsa_k) + ", p=" + String(lsa_p) + ") + Ring SWA 1024" if use_lsa else "Dense Global + Ring SWA 1024"))
+            print("  Multi-Turn KV Capacity:    " + String(max_blocks * block_size) + " tokens")
             print("---------------------------------------------------------")
-            print("(Type 'exit' or 'quit' to end the conversation)")
+            print("(Type 'exit'/'quit' to end, or '/reset' to clear history)")
         else:
             print("=========================================================")
             if use_mtp:
@@ -1826,6 +1832,7 @@ def main() raises:
         var iteration = 0
         var global_start_time = std.time.perf_counter()
         var chat_generation_start_time: Float64 = 0.0
+        var chat_max_new_tokens = max_total_tokens if max_tokens_explicit else 512
 
         while True:
             if len(active_sequences) == 0 and pending_idx >= len(pending_queue):
@@ -1835,50 +1842,100 @@ def main() raises:
                     var user_input = py_builtins.input("User > ")
                     var user_input_str = String(user_input).strip()
                     if user_input_str == "exit" or user_input_str == "quit":
+                        if len(pending_queue) > 0:
+                            var c_ptr = pending_queue[0]
+                            for b in range(len(c_ptr[].block_table)):
+                                block_manager.free(c_ptr[].block_table[b])
+                            if c_ptr[].kv_slot >= 0:
+                                if use_lsa:
+                                    for li in range(5):
+                                        lsa_indices[c_ptr[].kv_slot * 5 + li].reset()
+                                free_kv_slots.append(c_ptr[].kv_slot)
+                            c_ptr[].recurrent_h.free()
+                            c_ptr.free()
+                            pending_queue.clear()
+                            pending_idx = 0
                         break
-                    
+
+                    if user_input_str == "/reset" or user_input_str == "/clear":
+                        if len(pending_queue) > 0:
+                            var c_ptr = pending_queue[0]
+                            for b in range(len(c_ptr[].block_table)):
+                                block_manager.free(c_ptr[].block_table[b])
+                            if c_ptr[].kv_slot >= 0:
+                                if use_lsa:
+                                    for li in range(5):
+                                        lsa_indices[c_ptr[].kv_slot * 5 + li].reset()
+                                free_kv_slots.append(c_ptr[].kv_slot)
+                            c_ptr[].recurrent_h.free()
+                            c_ptr.free()
+                            pending_queue.clear()
+                            pending_idx = 0
+                        print("[Chat history, KV cache, and LSA index cleared]")
+                        continue
+
                     if len(user_input_str) == 0:
                         continue
-                        
-                    # Format and encode prompt
-                    var formatted_prompt = "<bos><|turn>user\n" + user_input_str + "<turn|>\n<|turn>model\n"
-                    var encoded = tokenizer.encode(formatted_prompt, add_special_tokens=False)
-                    var num_encoded = len(encoded)
-                    if num_encoded == 0:
-                        continue
-                        
-                    var tokens = List[Int]()
-                    for j in range(num_encoded):
-                        tokens.append(Int(py=encoded[j]))
-                        
-                    var seq_ptr = alloc[Sequence](1)
-                    seq_ptr[] = Sequence(len(pending_queue) + 1, String(user_input_str), tokens^, 100) # Generate up to 100 tokens
-                    pending_queue.append(seq_ptr)
-                    
+
+                    if len(pending_queue) == 0:
+                        var formatted_prompt = "<bos><|turn>user\n" + user_input_str + "<turn|>\n<|turn>model\n"
+                        var encoded = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+                        var num_encoded = len(encoded)
+                        if num_encoded == 0:
+                            continue
+
+                        var tokens = List[Int]()
+                        for j in range(num_encoded):
+                            tokens.append(Int(py=encoded[j]))
+
+                        var seq_ptr = alloc[Sequence](1)
+                        seq_ptr[] = Sequence(1, String(user_input_str), tokens^, num_encoded + chat_max_new_tokens)
+                        pending_queue.append(seq_ptr)
+                        pending_idx = 0
+                    else:
+                        var c_ptr = pending_queue[0]
+                        var turn_prefix = "\n<|turn>user\n"
+                        if len(c_ptr[].tokens) > 0 and c_ptr[].tokens[len(c_ptr[].tokens) - 1] != 106:
+                            turn_prefix = "<turn|>\n<|turn>user\n"
+                        var formatted_turn = turn_prefix + user_input_str + "<turn|>\n<|turn>model\n"
+                        var encoded = tokenizer.encode(formatted_turn, add_special_tokens=False)
+                        var num_encoded = len(encoded)
+                        if num_encoded == 0:
+                            continue
+
+                        for j in range(num_encoded):
+                            c_ptr[].tokens.append(Int(py=encoded[j]))
+                        c_ptr[].prompt_len = len(c_ptr[].tokens)
+                        c_ptr[].max_gen = len(c_ptr[].tokens) + chat_max_new_tokens
+                        c_ptr[].is_finished = False
+                        pending_idx = 0
+
                     print("Agent > ", end="", flush=True)
                 else:
                     break
-                    
+
             # Step A: Dequeue and prefill if there are empty slots
             while True:
                 if len(active_sequences) >= max_active_slots or pending_idx >= len(pending_queue):
                     break
-                if len(free_kv_slots) == 0:
-                    break   # unreachable while num_kv_slots >= max_active_slots (asserted at startup)
                 var seq_ptr = pending_queue[pending_idx]
+                if seq_ptr[].kv_slot < 0:
+                    if len(free_kv_slots) == 0:
+                        break   # unreachable while num_kv_slots >= max_active_slots (asserted at startup)
+                    seq_ptr[].kv_slot = free_kv_slots.pop()
                 pending_idx += 1
-                seq_ptr[].kv_slot = free_kv_slots.pop()
                 if not is_chat_mode:
                     print("\n[Scheduler] Dequeuing prompt #" + String(seq_ptr[].id) + " to fill active slot...")
                     print("  Prompt: \"" + seq_ptr[].prompt + "\"")
-                
+
                 var t_pref_start = std.time.perf_counter()
                 if is_chat_mode:
                     chat_generation_start_time = t_pref_start
                 var num_prompt_tokens = len(seq_ptr[].tokens)
-                
-                # Execute prefill pass for each prompt token sequentially to build up the KV cache
-                for pos in range(num_prompt_tokens):
+                var prefill_start_pos = seq_ptr[].pos
+
+                # Execute prefill pass for each new prompt token sequentially to build up the KV cache
+                for pos in range(prefill_start_pos, num_prompt_tokens):
                     var current_token_id = seq_ptr[].tokens[pos]
                     embed.reconstruct(current_token_id, local_x)
                     for i in range(CONFIG.embed_dim):
@@ -2044,7 +2101,17 @@ def main() raises:
                 
                 var t_pref_end = std.time.perf_counter()
                 var prefill_ms = (t_pref_end - t_pref_start) * 1000.0
-                if not is_chat_mode:
+                if is_chat_mode:
+                    if final_next_token == 1 or final_next_token == 106:
+                        seq_ptr[].is_finished = True
+                    else:
+                        var first_tok_list = Python.list()
+                        first_tok_list.append(final_next_token)
+                        var first_decoded = tokenizer.decode(first_tok_list)
+                        print(first_decoded, end="", flush=True)
+                        if len(seq_ptr[].tokens) >= seq_ptr[].max_gen + (len(seq_ptr[].tokens) - seq_ptr[].pos):
+                            seq_ptr[].is_finished = True
+                else:
                     print("  Prefill completed in " + String(prefill_ms) + " ms (" + String(prefill_ms / Float64(num_prompt_tokens)) + " ms/tok).")
                     print("  Streaming output start:")
                 
@@ -2103,11 +2170,12 @@ def main() raises:
                         for i in range(mtp_config.backbone_dim):
                             cur_recurrent_h[i] = mtp_h_next[i]
                             
-                    var draft_token_list = Python.list()
-                    for t_idx in range(1, len(draft_tokens)):
-                        draft_token_list.append(draft_tokens[t_idx])
-                    var draft_decoded = tokenizer.decode(draft_token_list)
-                    print("[DEBUG Req #" + String(seq_ptr[].id) + "] Draft predicted: \"" + String(draft_decoded) + "\" (tokens: " + String(draft_token_list) + ")")
+                    if not is_chat_mode:
+                        var draft_token_list = Python.list()
+                        for t_idx in range(1, len(draft_tokens)):
+                            draft_token_list.append(draft_tokens[t_idx])
+                        var draft_decoded = tokenizer.decode(draft_token_list)
+                        print("[DEBUG Req #" + String(seq_ptr[].id) + "] Draft predicted: \"" + String(draft_decoded) + "\" (tokens: " + String(draft_token_list) + ")")
 
                     var verified_all = True
                     for j in range(1, num_steps + 1):
@@ -2129,7 +2197,8 @@ def main() raises:
                             accepted_token_list.append(draft_token_to_verify)
                             var decoded = tokenizer.decode(accepted_token_list)
                             if is_chat_mode:
-                                print(decoded, end="", flush=True)
+                                if draft_token_to_verify != 1 and draft_token_to_verify != 106:
+                                    print(decoded, end="", flush=True)
                             else:
                                 print("[Req #" + String(seq_ptr[].id) + " (" + String(seq_ptr[].pos) + " - spec accepted)]: \"" + String(decoded) + "\"")
                             
@@ -2148,7 +2217,8 @@ def main() raises:
                             corrected_token_list.append(target_next_token)
                             var decoded = tokenizer.decode(corrected_token_list)
                             if is_chat_mode:
-                                print(decoded, end="", flush=True)
+                                if target_next_token != 1 and target_next_token != 106:
+                                    print(decoded, end="", flush=True)
                             else:
                                 print("[Req #" + String(seq_ptr[].id) + " (" + String(seq_ptr[].pos) + " - spec corrected)]: \"" + String(decoded) + "\"")
                             
@@ -2167,7 +2237,8 @@ def main() raises:
                             bonus_token_list.append(bonus_token)
                             var decoded = tokenizer.decode(bonus_token_list)
                             if is_chat_mode:
-                                print(decoded, end="", flush=True)
+                                if bonus_token != 1 and bonus_token != 106:
+                                    print(decoded, end="", flush=True)
                             else:
                                 print("[Req #" + String(seq_ptr[].id) + " (" + String(seq_ptr[].pos) + " - spec bonus)]: \"" + String(decoded) + "\"")
                             
@@ -2347,7 +2418,8 @@ def main() raises:
                     next_token_list.append(next_token)
                     var decoded = tokenizer.decode(next_token_list)
                     if is_chat_mode:
-                        print(decoded, end="", flush=True)
+                        if next_token != 1 and next_token != 106:
+                            print(decoded, end="", flush=True)
                     else:
                         print("[Req #" + String(seq_ptr[].id) + " (" + String(seq_ptr[].pos) + ")]: \"" + String(decoded) + "\"")
                     
@@ -2365,18 +2437,22 @@ def main() raises:
                         var chat_decode_tokens = len(s_ptr[].tokens) - s_ptr[].prompt_len
                         var chat_tps = Float64(chat_decode_tokens) / (chat_dur_sec + 1e-10)
                         var chat_tps_rounded = Float64(Int(chat_tps * 100.0 + 0.5)) / 100.0
-                        print("\n\n [Generation Speed: " + String(chat_tps_rounded) + " tokens/sec | generated " + String(chat_decode_tokens) + " tokens]")
-                    if not is_chat_mode:
+                        var lsa_info = String("")
+                        if use_lsa and s_ptr[].kv_slot >= 0:
+                            var closed_b = lsa_indices[s_ptr[].kv_slot * 5].closed_blocks
+                            lsa_info = " | LSA blocks: " + String(closed_b) + " (" + String(closed_b * 32) + " buckets)"
+                        print("\n\n [Generation Speed: " + String(chat_tps_rounded) + " tokens/sec | generated " + String(chat_decode_tokens) + " tokens | context: " + String(len(s_ptr[].tokens)) + " tokens" + lsa_info + "]")
+                    else:
                         print("\n[Scheduler] Request #" + String(s_ptr[].id) + " finished! Retiring and freeing " + String(len(s_ptr[].block_table)) + " blocks...")
-                    for b in range(len(s_ptr[].block_table)):
-                        block_manager.free(s_ptr[].block_table[b])
-                    if s_ptr[].kv_slot >= 0:
-                        if use_lsa:
-                            for li in range(5):
-                                lsa_indices[s_ptr[].kv_slot * 5 + li].reset()
-                        free_kv_slots.append(s_ptr[].kv_slot)
-                    s_ptr[].recurrent_h.free()
-                    s_ptr.free()
+                        for b in range(len(s_ptr[].block_table)):
+                            block_manager.free(s_ptr[].block_table[b])
+                        if s_ptr[].kv_slot >= 0:
+                            if use_lsa:
+                                for li in range(5):
+                                    lsa_indices[s_ptr[].kv_slot * 5 + li].reset()
+                            free_kv_slots.append(s_ptr[].kv_slot)
+                        s_ptr[].recurrent_h.free()
+                        s_ptr.free()
                 else:
                     next_active_sequences.append(s_ptr)
             active_sequences = next_active_sequences^
