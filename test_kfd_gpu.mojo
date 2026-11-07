@@ -485,10 +485,196 @@ def test_lsa_f32_pca_and_gram(mut ctx: KFDContext) raises:
     print("  [PASS] LSA 512-token block PCA projection & [512, 512] Gram matrix verified on GPU!")
 
 
+def test_cdc6600_asymmetric_overlap(mut ctx: KFDContext) raises:
+    print("\n=== Test 5: CDC-6600 Asymmetric Co-Processor Overlap (Gemma-4 Decode Layer Shapes) ===")
+    var q4_kernel = ctx.get_kernel("q4_matmul", 1)
+
+    var c_in = 2816
+    var q_dim = 8192
+    var kv_dim = 2048
+    var num_blocks = c_in // 32
+    var wo_blocks = q_dim // 32
+
+    var wq_buf = ctx.alloc_gpu_buffer(q_dim * (c_in // 2))
+    var sq_buf = ctx.alloc_gpu_buffer(q_dim * num_blocks * 4)
+    var wk_buf = ctx.alloc_gpu_buffer(kv_dim * (c_in // 2))
+    var sk_buf = ctx.alloc_gpu_buffer(kv_dim * num_blocks * 4)
+    var wv_buf = ctx.alloc_gpu_buffer(kv_dim * (c_in // 2))
+    var sv_buf = ctx.alloc_gpu_buffer(kv_dim * num_blocks * 4)
+    var wo_buf = ctx.alloc_gpu_buffer(c_in * (q_dim // 2))
+    var so_buf = ctx.alloc_gpu_buffer(c_in * wo_blocks * 4)
+
+    var x_buf = ctx.alloc_gpu_buffer(c_in * 4)
+    var q_buf = ctx.alloc_gpu_buffer(q_dim * 4)
+    var k_buf = ctx.alloc_gpu_buffer(kv_dim * 4)
+    var v_buf = ctx.alloc_gpu_buffer(kv_dim * 4)
+    var o_buf = ctx.alloc_gpu_buffer(c_in * 4)
+
+    var wq_ptr = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wq_buf.cpu_addr)
+    var sq_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=sq_buf.cpu_addr)
+    var wk_ptr = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wk_buf.cpu_addr)
+    var sk_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=sk_buf.cpu_addr)
+    var wv_ptr = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wv_buf.cpu_addr)
+    var sv_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=sv_buf.cpu_addr)
+    var wo_ptr = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=wo_buf.cpu_addr)
+    var so_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=so_buf.cpu_addr)
+
+    var x_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=x_buf.cpu_addr)
+    var q_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=q_buf.cpu_addr)
+    var k_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=k_buf.cpu_addr)
+    var v_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=v_buf.cpu_addr)
+    var o_ptr = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=o_buf.cpu_addr)
+
+    for i in range(q_dim * (c_in // 2)):
+        wq_ptr[i] = UInt8(((i * 7 + 3) & 15) | (((i * 11 + 5) & 15) << 4))
+    for i in range(q_dim * num_blocks):
+        sq_ptr[i] = Float32(((i * 13 + 7) % 19) - 9) * 0.015625
+    for i in range(kv_dim * (c_in // 2)):
+        wk_ptr[i] = UInt8(((i * 5 + 1) & 15) | (((i * 9 + 3) & 15) << 4))
+        wv_ptr[i] = UInt8(((i * 3 + 7) & 15) | (((i * 13 + 2) & 15) << 4))
+    for i in range(kv_dim * num_blocks):
+        sk_ptr[i] = Float32(((i * 11 + 3) % 17) - 8) * 0.015625
+        sv_ptr[i] = Float32(((i * 7 + 5) % 23) - 11) * 0.015625
+    for i in range(c_in * (q_dim // 2)):
+        wo_ptr[i] = UInt8(((i * 9 + 1) & 15) | (((i * 5 + 4) & 15) << 4))
+    for i in range(c_in * wo_blocks):
+        so_ptr[i] = Float32(((i * 17 + 9) % 21) - 10) * 0.015625
+    for i in range(c_in):
+        x_ptr[i] = Float32(((i * 19 + 3) % 27) - 13) * 0.03125
+
+    ctx.flush_cache_range(wq_buf.cpu_addr, q_dim * (c_in // 2))
+    ctx.flush_cache_range(sq_buf.cpu_addr, q_dim * num_blocks * 4)
+    ctx.flush_cache_range(wk_buf.cpu_addr, kv_dim * (c_in // 2))
+    ctx.flush_cache_range(sk_buf.cpu_addr, kv_dim * num_blocks * 4)
+    ctx.flush_cache_range(wv_buf.cpu_addr, kv_dim * (c_in // 2))
+    ctx.flush_cache_range(sv_buf.cpu_addr, kv_dim * num_blocks * 4)
+    ctx.flush_cache_range(wo_buf.cpu_addr, c_in * (q_dim // 2))
+    ctx.flush_cache_range(so_buf.cpu_addr, c_in * wo_blocks * 4)
+    ctx.flush_cache_range(x_buf.cpu_addr, c_in * 4)
+
+    # 1. All-iGPU 3-packet QKV dispatch (batch=1)
+    var t0 = std.time.perf_counter()
+    var sq0 = ctx.enqueue_kernel_matmul(
+        q4_kernel, wq_buf.va_addr, sq_buf.va_addr, x_buf.va_addr, q_buf.va_addr,
+        c_in, q_dim, batch_size=1, flush_input=True, barrier=False, ring_doorbell_now=False,
+    )
+    var sk0 = ctx.enqueue_kernel_matmul(
+        q4_kernel, wk_buf.va_addr, sk_buf.va_addr, x_buf.va_addr, k_buf.va_addr,
+        c_in, kv_dim, batch_size=1, flush_input=False, barrier=False, ring_doorbell_now=False,
+    )
+    var sv0 = ctx.enqueue_kernel_matmul(
+        q4_kernel, wv_buf.va_addr, sv_buf.va_addr, x_buf.va_addr, v_buf.va_addr,
+        c_in, kv_dim, batch_size=1, flush_input=False, barrier=False, ring_doorbell_now=False,
+    )
+    ctx.ring_doorbell()
+    ctx.wait_matmul(sq0, q_buf.cpu_addr, q_dim, batch_size=1)
+    ctx.wait_matmul(sk0, k_buf.cpu_addr, kv_dim, batch_size=1)
+    ctx.wait_matmul(sv0, v_buf.cpu_addr, kv_dim, batch_size=1)
+    var t_igpu_qkv_ms = (std.time.perf_counter() - t0) * 1000.0
+
+    # 2. Wo (8192 -> 2816, batch=1) on iGPU
+    var t1 = std.time.perf_counter()
+    var so0 = ctx.enqueue_kernel_matmul(
+        q4_kernel, wo_buf.va_addr, so_buf.va_addr, q_buf.va_addr, o_buf.va_addr,
+        q_dim, c_in, batch_size=1, flush_input=True, barrier=False, ring_doorbell_now=True,
+    )
+    ctx.wait_matmul(so0, o_buf.cpu_addr, c_in, batch_size=1)
+    var t_igpu_wo_ms = (std.time.perf_counter() - t1) * 1000.0
+
+    # Verify accuracy against CPU reference
+    var ref_q = alloc[Float32](q_dim)
+    var ref_k = alloc[Float32](kv_dim)
+    var ref_v = alloc[Float32](kv_dim)
+    var ref_o = alloc[Float32](c_in)
+    cpu_q4_matmul_ref(wq_ptr, sq_ptr, x_ptr, ref_q, c_in, q_dim, 1, q_dim)
+    cpu_q4_matmul_ref(wk_ptr, sk_ptr, x_ptr, ref_k, c_in, kv_dim, 1, kv_dim)
+    cpu_q4_matmul_ref(wv_ptr, sv_ptr, x_ptr, ref_v, c_in, kv_dim, 1, kv_dim)
+    cpu_q4_matmul_ref(wo_ptr, so_ptr, q_ptr, ref_o, q_dim, c_in, 1, c_in)
+
+    var max_err: Float32 = 0.0
+    for i in range(kv_dim):
+        var ek = abs(k_ptr[i] - ref_k[i])
+        var ev = abs(v_ptr[i] - ref_v[i])
+        if ek > max_err:
+            max_err = ek
+        if ev > max_err:
+            max_err = ev
+    for i in range(c_in):
+        var err = abs(o_ptr[i] - ref_o[i])
+        if err > max_err:
+            max_err = err
+
+    # 3. Test CDC-6600 Co-Processor Split on Wo (960 rows on iGPU || 1856 rows on CPU)
+    var gpu_wo_rows = 960
+    var cpu_wo_rows = c_in - gpu_wo_rows
+    for i in range(c_in):
+        o_ptr[i] = -999.0
+    var t2 = std.time.perf_counter()
+    var slot_wo_split = ctx.enqueue_kernel_matmul(
+        q4_kernel, wo_buf.va_addr, so_buf.va_addr, q_buf.va_addr, o_buf.va_addr,
+        q_dim, gpu_wo_rows, batch_size=1, flush_input=True, barrier=False, ring_doorbell_now=True,
+    )
+    # CPU concurrently computes rows [960..2816) on disjoint 64-byte cache lines
+    cpu_q4_matmul_ref(
+        wo_ptr + gpu_wo_rows * (q_dim // 2),
+        so_ptr + gpu_wo_rows * wo_blocks,
+        q_ptr,
+        o_ptr + gpu_wo_rows,
+        q_dim,
+        cpu_wo_rows,
+        1,
+        cpu_wo_rows,
+    )
+    ctx.wait_matmul(slot_wo_split, o_buf.cpu_addr, gpu_wo_rows, batch_size=1)
+    var t_split_wo_ms = (std.time.perf_counter() - t2) * 1000.0
+
+    var max_split_err: Float32 = 0.0
+    for i in range(c_in):
+        var err = abs(o_ptr[i] - ref_o[i])
+        if err > max_split_err:
+            max_split_err = err
+
+    ref_q.free()
+    ref_k.free()
+    ref_v.free()
+    ref_o.free()
+
+    print(
+        "  [Gemma-4 Layer Shapes] iGPU QKV:",
+        t_igpu_qkv_ms,
+        "ms | iGPU Wo:",
+        t_igpu_wo_ms,
+        "ms | Split CPU+iGPU Wo:",
+        t_split_wo_ms,
+        "ms | max_err =",
+        max_err,
+        "| max_split_err =",
+        max_split_err,
+    )
+    if max_err > 1e-4 or max_split_err > 1e-4:
+        raise Error("Wo mismatch on iGPU: " + String(max_err) + " / " + String(max_split_err))
+
+    ctx.free_gpu_buffer(o_buf)
+    ctx.free_gpu_buffer(v_buf)
+    ctx.free_gpu_buffer(k_buf)
+    ctx.free_gpu_buffer(q_buf)
+    ctx.free_gpu_buffer(x_buf)
+    ctx.free_gpu_buffer(so_buf)
+    ctx.free_gpu_buffer(wo_buf)
+    ctx.free_gpu_buffer(sv_buf)
+    ctx.free_gpu_buffer(wv_buf)
+    ctx.free_gpu_buffer(sk_buf)
+    ctx.free_gpu_buffer(wk_buf)
+    ctx.free_gpu_buffer(sq_buf)
+    ctx.free_gpu_buffer(wq_buf)
+    print("  [PASS] Gemma-4 decode layer shapes verified on KFD iGPU!")
+
+
 def main() raises:
     var ctx = KFDContext(init_queue=True)
     test_dynamic_elf_loader(ctx)
     test_q4_matmul_kernel(ctx)
     test_multi_packet_batching_and_stride(ctx)
     test_lsa_f32_pca_and_gram(ctx)
+    test_cdc6600_asymmetric_overlap(ctx)
     print("\nALL KFD GPU RUNTIME, Q4 SHADER & LSA F32 SHADER TESTS PASSED!")
