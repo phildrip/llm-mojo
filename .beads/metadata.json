@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "llm_mojo",
+  "project_id": "408bf896-2a13-4b86-8dbd-0d98c35b8a6e"
+}
