@@ -20,7 +20,9 @@ from lsa_core import (
 from lsa_pca import load_projections_file
 from kfd_gpu import KFDContext, GPUMemoryBuffer, HSACOKernel
 from moe_kernels import (
+    quantize_fp32_to_q4_0,
     q4_matmul_vec,
+    q4_matmul_batch5,
     compute_moe_lod_weights,
     run_moe_experts_stage1_8core,
     run_moe_experts_stage2_8core,
@@ -366,63 +368,78 @@ struct MTPConfig:
         return self.vocab_size * self.embed_dim
 
 struct MTPWeights(Copyable, Movable):
-    var tok_embd: UnsafePointer[Float32, MutExternalOrigin]
-    var pre_proj: UnsafePointer[Float32, MutExternalOrigin]
-    var post_proj: UnsafePointer[Float32, MutExternalOrigin]
+    var pre_proj_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var pre_proj_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var post_proj_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var post_proj_scales: UnsafePointer[Float32, MutExternalOrigin]
     var output_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var lm_head: UnsafePointer[Float32, MutExternalOrigin]
 
     def __init__(
         out self,
-        tok_embd: UnsafePointer[Float32, MutExternalOrigin],
-        pre_proj: UnsafePointer[Float32, MutExternalOrigin],
-        post_proj: UnsafePointer[Float32, MutExternalOrigin],
+        pre_proj_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        pre_proj_scales: UnsafePointer[Float32, MutExternalOrigin],
+        post_proj_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        post_proj_scales: UnsafePointer[Float32, MutExternalOrigin],
         output_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
-        lm_head: UnsafePointer[Float32, MutExternalOrigin]
     ):
-        self.tok_embd = tok_embd
-        self.pre_proj = pre_proj
-        self.post_proj = post_proj
+        self.pre_proj_packed = pre_proj_packed
+        self.pre_proj_scales = pre_proj_scales
+        self.post_proj_packed = post_proj_packed
+        self.post_proj_scales = post_proj_scales
         self.output_norm_weight = output_norm_weight
-        self.lm_head = lm_head
 
 struct AssistantLayerWeights(Copyable, Movable):
     var attn_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var wq: UnsafePointer[Float32, MutExternalOrigin]
-    var wo: UnsafePointer[Float32, MutExternalOrigin]
+    var wq_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var wq_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var wo_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var wo_scales: UnsafePointer[Float32, MutExternalOrigin]
     var q_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
     var attn_post_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
     var out_scale: Float32
     var ffn_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var ffn_gate: UnsafePointer[Float32, MutExternalOrigin]
-    var ffn_up: UnsafePointer[Float32, MutExternalOrigin]
-    var ffn_down: UnsafePointer[Float32, MutExternalOrigin]
+    var ffn_gate_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var ffn_gate_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var ffn_up_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var ffn_up_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var ffn_down_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var ffn_down_scales: UnsafePointer[Float32, MutExternalOrigin]
     var ffn_post_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
 
     def __init__(
         out self,
         attn_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
-        wq: UnsafePointer[Float32, MutExternalOrigin],
-        wo: UnsafePointer[Float32, MutExternalOrigin],
+        wq_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        wq_scales: UnsafePointer[Float32, MutExternalOrigin],
+        wo_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        wo_scales: UnsafePointer[Float32, MutExternalOrigin],
         q_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
         attn_post_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
         out_scale: Float32,
         ffn_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
-        ffn_gate: UnsafePointer[Float32, MutExternalOrigin],
-        ffn_up: UnsafePointer[Float32, MutExternalOrigin],
-        ffn_down: UnsafePointer[Float32, MutExternalOrigin],
-        ffn_post_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
+        ffn_gate_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        ffn_gate_scales: UnsafePointer[Float32, MutExternalOrigin],
+        ffn_up_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        ffn_up_scales: UnsafePointer[Float32, MutExternalOrigin],
+        ffn_down_packed: UnsafePointer[UInt8, MutExternalOrigin],
+        ffn_down_scales: UnsafePointer[Float32, MutExternalOrigin],
+        ffn_post_norm_weight: UnsafePointer[Float32, MutExternalOrigin],
     ):
         self.attn_norm_weight = attn_norm_weight
-        self.wq = wq
-        self.wo = wo
+        self.wq_packed = wq_packed
+        self.wq_scales = wq_scales
+        self.wo_packed = wo_packed
+        self.wo_scales = wo_scales
         self.q_norm_weight = q_norm_weight
         self.attn_post_norm_weight = attn_post_norm_weight
         self.out_scale = out_scale
         self.ffn_norm_weight = ffn_norm_weight
-        self.ffn_gate = ffn_gate
-        self.ffn_up = ffn_up
-        self.ffn_down = ffn_down
+        self.ffn_gate_packed = ffn_gate_packed
+        self.ffn_gate_scales = ffn_gate_scales
+        self.ffn_up_packed = ffn_up_packed
+        self.ffn_up_scales = ffn_up_scales
+        self.ffn_down_packed = ffn_down_packed
+        self.ffn_down_scales = ffn_down_scales
         self.ffn_post_norm_weight = ffn_post_norm_weight
 
 @always_inline
@@ -515,18 +532,17 @@ def mtp_gelu_and_mul(
     out_ptr: UnsafePointer[Float32, MutExternalOrigin],
     size: Int,
 ):
-    for i in range(size):
-        var x1 = h1[i]
-        var x2 = h2[i]
+    for i in range(0, size, 16):
+        var x1 = h1.load[16](i)
+        var x2 = h2.load[16](i)
         var inner = Float32(0.79788456) * (x1 + Float32(0.044715) * x1 * x1 * x1)
         var g = Float32(0.5) * x1 * (Float32(1.0) + tanh(inner))
-        out_ptr[i] = g * x2
+        out_ptr.store[16](i, g * x2)
 
 @always_inline
 def mtp_embed_and_concat(
     token_id: Int,
     recurrent_h: UnsafePointer[Float32, _],
-    embd_matrix: UnsafePointer[Float32, _],
     out_concat: UnsafePointer[Float32, MutExternalOrigin],
     backbone_dim: Int,
     vocab_size: Int,
@@ -545,9 +561,8 @@ def mtp_embed_and_concat(
         if safe_token_id < 0:
             safe_token_id = 0
         var embd_offset = safe_token_id * backbone_dim
-        for i in range(0, backbone_dim, 16):
-            var emb_v = embd_matrix.load[16](embd_offset + i) * scale
-            out_concat.store[16](i, emb_v)
+        for i in range(backbone_dim):
+            out_concat[i] = Float32(0.005) * Float32(((embd_offset + i) + 13) % 47) * scale
 
     for i in range(0, backbone_dim, 16):
         var rec_v = recurrent_h.load[16](i)
@@ -663,12 +678,12 @@ def run_assistant_layer(
     swa_ring_size: Int,
     swa_ring_base: Int,
 ):
-    var is_global = (layer_idx == 3)   # assistant layer 3 reads global pool 29; layers 0-2 read sliding pool 27
+    var is_global = (layer_idx == 3)   # assistant layer 3 reads global pool 29; layers 0-2 read sliding pool 28
     var num_heads = 16
     var head_dim = 512 if is_global else 256
 
     mtp_rms_norm(x, weights.attn_norm_weight, norm_x, embed_dim)
-    mtp_gemv(weights.wq, norm_x, q, num_heads * head_dim, embed_dim, num_tasks)
+    q4_matmul_vec(weights.wq_packed, weights.wq_scales, norm_x, q, embed_dim, num_heads * head_dim, num_tasks)
 
     for h in range(num_heads):
         var head_ptr = q + h * head_dim
@@ -676,27 +691,28 @@ def run_assistant_layer(
 
     mtp_apply_rope(q, num_heads, head_dim, rope_pos, is_global)
     mtp_paged_attention(q, k_pool, v_pool, block_table, block_size, kv_pos, not is_global, attn_scores, attn_rows, attn_out, swa_ring_size, swa_ring_base)
-    mtp_gemv(weights.wo, attn_out, proj_attn_out, embed_dim, num_heads * head_dim, num_tasks)
+    q4_matmul_vec(weights.wo_packed, weights.wo_scales, attn_out, proj_attn_out, num_heads * head_dim, embed_dim, num_tasks)
     mtp_rms_norm(proj_attn_out, weights.attn_post_norm_weight, proj_attn_out, embed_dim)
 
-    for i in range(embed_dim):
-        x[i] += proj_attn_out[i]
+    for i in range(0, embed_dim, 16):
+        x.store[16](i, x.load[16](i) + proj_attn_out.load[16](i))
 
     mtp_rms_norm(x, weights.ffn_norm_weight, norm_x, embed_dim)
-    mtp_gemv(weights.ffn_gate, norm_x, ffn_h1, intermediate_dim, embed_dim, num_tasks)
-    mtp_gemv(weights.ffn_up, norm_x, ffn_h2, intermediate_dim, embed_dim, num_tasks)
+    q4_matmul_vec(weights.ffn_gate_packed, weights.ffn_gate_scales, norm_x, ffn_h1, embed_dim, intermediate_dim, num_tasks)
+    q4_matmul_vec(weights.ffn_up_packed, weights.ffn_up_scales, norm_x, ffn_h2, embed_dim, intermediate_dim, num_tasks)
     mtp_gelu_and_mul(ffn_h1, ffn_h2, ffn_out_gate, intermediate_dim)
-    mtp_gemv(weights.ffn_down, ffn_out_gate, ffn_out, embed_dim, intermediate_dim, num_tasks)
+    q4_matmul_vec(weights.ffn_down_packed, weights.ffn_down_scales, ffn_out_gate, ffn_out, intermediate_dim, embed_dim, num_tasks)
     mtp_rms_norm(ffn_out, weights.ffn_post_norm_weight, ffn_out, embed_dim)
 
-    for i in range(embed_dim):
-        x[i] = (x[i] + ffn_out[i]) * weights.out_scale
+    for i in range(0, embed_dim, 16):
+        x.store[16](i, (x.load[16](i) + ffn_out.load[16](i)) * weights.out_scale)
 
 def mtp_generate_step(
     token_id: Int,
     recurrent_h: UnsafePointer[Float32, MutExternalOrigin],
     weights: MTPWeights,
     layers: List[AssistantLayerWeights],
+    mtp_lm_head_q4: Q4Embedding,
     block_table: List[Int],
     block_size: Int,
     k_block_pools: List[UnsafePointer[Float32, MutExternalOrigin]],
@@ -704,40 +720,39 @@ def mtp_generate_step(
     rope_pos: Int,
     kv_pos: Int,
     out_h_next: UnsafePointer[Float32, MutExternalOrigin],
-    out_logits: UnsafePointer[Float32, MutExternalOrigin],
     CONFIG: MTPConfig,
     num_tasks: Int,
     embed: Q4Embedding,
     real_weights_loaded: Bool,
     swa_ring_size: Int,
     swa_ring_base: Int,
-) raises:
+    x_concat: UnsafePointer[Float32, MutExternalOrigin],
+    x_assistant: UnsafePointer[Float32, MutExternalOrigin],
+    norm_x: UnsafePointer[Float32, MutExternalOrigin],
+    q: UnsafePointer[Float32, MutExternalOrigin],
+    attn_scores: UnsafePointer[Float32, MutExternalOrigin],
+    attn_rows: UnsafePointer[Int, MutExternalOrigin],
+    attn_out: UnsafePointer[Float32, MutExternalOrigin],
+    proj_attn_out: UnsafePointer[Float32, MutExternalOrigin],
+    ffn_h1: UnsafePointer[Float32, MutExternalOrigin],
+    ffn_h2: UnsafePointer[Float32, MutExternalOrigin],
+    ffn_out_gate: UnsafePointer[Float32, MutExternalOrigin],
+    ffn_out: UnsafePointer[Float32, MutExternalOrigin],
+    local_max_logits: UnsafePointer[Float32, MutExternalOrigin],
+    local_next_tokens: UnsafePointer[Int, MutExternalOrigin],
+) raises -> Int:
     var concat_dim = 2 * CONFIG.backbone_dim
-    var x_concat = alloc[Float32](concat_dim)
-    var x_assistant = alloc[Float32](CONFIG.embed_dim)
-
-    var norm_x = alloc[Float32](CONFIG.embed_dim)
-    var q = alloc[Float32](16 * 512)
-    var attn_scores = alloc[Float32](16 * (kv_pos + 1))
-    var attn_rows = alloc[Int](kv_pos + 1)
-    var attn_out = alloc[Float32](16 * 512)
-    var proj_attn_out = alloc[Float32](CONFIG.embed_dim)
-    
     var intermediate_dim = 8192
-    var ffn_h1 = alloc[Float32](intermediate_dim)
-    var ffn_h2 = alloc[Float32](intermediate_dim)
-    var ffn_out_gate = alloc[Float32](intermediate_dim)
-    var ffn_out = alloc[Float32](CONFIG.embed_dim)
 
-    mtp_embed_and_concat(token_id, recurrent_h, weights.tok_embd, x_concat, CONFIG.backbone_dim, CONFIG.vocab_size, embed, real_weights_loaded)
-    mtp_gemv(weights.pre_proj, x_concat, x_assistant, CONFIG.embed_dim, concat_dim, num_tasks)
+    mtp_embed_and_concat(token_id, recurrent_h, x_concat, CONFIG.backbone_dim, CONFIG.vocab_size, embed, real_weights_loaded)
+    q4_matmul_vec(weights.pre_proj_packed, weights.pre_proj_scales, x_concat, x_assistant, concat_dim, CONFIG.embed_dim, num_tasks)
 
     var cur = x_assistant
-    # Pool routing below assumes exactly 4 assistant layers (0-2 -> sliding 27, 3 -> global 29),
+    # Pool routing below assumes exactly 4 assistant layers (0-2 -> sliding 28, 3 -> global 29),
     # matching run_assistant_layer's `is_global = (layer_idx == 3)`.
     debug_assert(CONFIG.num_layers == 4, "MTP pool routing assumes 4 assistant layers")
     for il in range(CONFIG.num_layers):
-        var pool_idx = 27 if il < 3 else 29
+        var pool_idx = 28 if il < 3 else 29
         var k_pool = k_block_pools[pool_idx]
         var v_pool = v_block_pools[pool_idx]
 
@@ -749,21 +764,16 @@ def mtp_generate_step(
         )
 
     mtp_rms_norm(cur, weights.output_norm_weight, cur, CONFIG.embed_dim)
-    mtp_gemv(weights.post_proj, cur, out_h_next, CONFIG.backbone_dim, CONFIG.embed_dim, num_tasks)
-    mtp_gemv(weights.lm_head, cur, out_logits, CONFIG.vocab_size, CONFIG.embed_dim, num_tasks)
+    q4_matmul_vec(weights.post_proj_packed, weights.post_proj_scales, cur, out_h_next, CONFIG.embed_dim, CONFIG.backbone_dim, num_tasks)
+    mtp_lm_head_q4.project_logits_parallel(cur, local_max_logits, local_next_tokens, num_tasks, softcap=False)
 
-    x_concat.free()
-    x_assistant.free()
-    norm_x.free()
-    q.free()
-    attn_scores.free()
-    attn_rows.free()
-    attn_out.free()
-    proj_attn_out.free()
-    ffn_h1.free()
-    ffn_h2.free()
-    ffn_out_gate.free()
-    ffn_out.free()
+    var max_logit: Float32 = -1e30
+    var sampled_tok = 0
+    for t in range(num_tasks):
+        if local_max_logits[t] > max_logit:
+            max_logit = local_max_logits[t]
+            sampled_tok = local_next_tokens[t]
+    return sampled_tok
 
 
 
@@ -1436,172 +1446,263 @@ def main() raises:
                 raise Error("Error reading assistant weights from file!")
             total_bytes_read += r
 
-    var mtp_tok_embd: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_pre_proj: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_post_proj: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_lm_head_q4 = Q4Embedding(
+        1 if early_no_mtp else mtp_config.vocab_size,
+        32 if early_no_mtp else mtp_config.embed_dim,
+    )
+    var mtp_pre_proj_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_pre_proj_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_post_proj_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_post_proj_scales: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_output_norm_weight: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_lm_head: UnsafePointer[Float32, MutExternalOrigin]
 
     var mtp_layer_attn_norm: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_layer_wq: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_layer_wo: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_layer_wq_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_layer_wq_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_layer_wo_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_layer_wo_scales: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_layer_q_norm: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_layer_attn_post_norm: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_layer_ffn_norm: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_layer_ffn_gate: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_layer_ffn_up: UnsafePointer[Float32, MutExternalOrigin]
-    var mtp_layer_ffn_down: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_layer_ffn_gate_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_layer_ffn_gate_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_layer_ffn_up_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_layer_ffn_up_scales: UnsafePointer[Float32, MutExternalOrigin]
+    var mtp_layer_ffn_down_packed: UnsafePointer[UInt8, MutExternalOrigin]
+    var mtp_layer_ffn_down_scales: UnsafePointer[Float32, MutExternalOrigin]
     var mtp_layer_ffn_post_norm: UnsafePointer[Float32, MutExternalOrigin]
 
     var mtp_layers = List[AssistantLayerWeights]()
 
     if early_no_mtp:
-        print("Skipping MTP Assistant weight allocation (--no-mtp enabled, saving 4.5 GB RAM).")
-        mtp_tok_embd = alloc[Float32](1)
-        mtp_pre_proj = alloc[Float32](1)
-        mtp_post_proj = alloc[Float32](1)
+        print("Skipping MTP Assistant weight allocation (--no-mtp enabled).")
+        mtp_pre_proj_packed = alloc[UInt8](1)
+        mtp_pre_proj_scales = alloc[Float32](1)
+        mtp_post_proj_packed = alloc[UInt8](1)
+        mtp_post_proj_scales = alloc[Float32](1)
         mtp_output_norm_weight = alloc[Float32](1)
-        mtp_lm_head = mtp_tok_embd
         mtp_layer_attn_norm = alloc[Float32](1)
-        mtp_layer_wq = alloc[Float32](1)
-        mtp_layer_wo = alloc[Float32](1)
+        mtp_layer_wq_packed = alloc[UInt8](1)
+        mtp_layer_wq_scales = alloc[Float32](1)
+        mtp_layer_wo_packed = alloc[UInt8](1)
+        mtp_layer_wo_scales = alloc[Float32](1)
         mtp_layer_q_norm = alloc[Float32](1)
         mtp_layer_attn_post_norm = alloc[Float32](1)
         mtp_layer_ffn_norm = alloc[Float32](1)
-        mtp_layer_ffn_gate = alloc[Float32](1)
-        mtp_layer_ffn_up = alloc[Float32](1)
-        mtp_layer_ffn_down = alloc[Float32](1)
+        mtp_layer_ffn_gate_packed = alloc[UInt8](1)
+        mtp_layer_ffn_gate_scales = alloc[Float32](1)
+        mtp_layer_ffn_up_packed = alloc[UInt8](1)
+        mtp_layer_ffn_up_scales = alloc[Float32](1)
+        mtp_layer_ffn_down_packed = alloc[UInt8](1)
+        mtp_layer_ffn_down_scales = alloc[Float32](1)
         mtp_layer_ffn_post_norm = alloc[Float32](1)
     else:
-        print("Allocating MTP Assistant model and layer weights...")
-        if real_weights_loaded:
-            mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
-            mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
-            mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
-            mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
-            # Tie lm_head with tok_embd to save 1 GB RAM
-            mtp_lm_head = mtp_tok_embd
-        else:
-            mtp_tok_embd = alloc[Float32](mtp_config.vocab_size * mtp_config.embed_dim)
-            mtp_pre_proj = alloc[Float32](mtp_config.get_pre_proj_size())
-            mtp_post_proj = alloc[Float32](mtp_config.get_post_proj_size())
-            mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
-            mtp_lm_head = alloc[Float32](mtp_config.get_lm_head_size())
+        print("Allocating Q4_0 MTP Assistant model and layer weights (228 MB total vs 1.68 GB FP32)...")
+        var pre_size = mtp_config.get_pre_proj_size()
+        var post_size = mtp_config.get_post_proj_size()
+        mtp_pre_proj_packed = alloc[UInt8](pre_size // 2)
+        mtp_pre_proj_scales = alloc[Float32](pre_size // 32)
+        mtp_post_proj_packed = alloc[UInt8](post_size // 2)
+        mtp_post_proj_scales = alloc[Float32](post_size // 32)
+        mtp_output_norm_weight = alloc[Float32](mtp_config.embed_dim)
 
         mtp_layer_attn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-        
+
         var wq_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * 4096 * mtp_config.embed_dim
-        mtp_layer_wq = alloc[Float32](wq_size)
+        mtp_layer_wq_packed = alloc[UInt8](wq_size // 2)
+        mtp_layer_wq_scales = alloc[Float32](wq_size // 32)
 
         var wo_size = (3 * 4096 + 8192) * mtp_config.embed_dim if real_weights_loaded else mtp_config.num_layers * mtp_config.embed_dim * 4096
-        mtp_layer_wo = alloc[Float32](wo_size)
+        mtp_layer_wo_packed = alloc[UInt8](wo_size // 2)
+        mtp_layer_wo_scales = alloc[Float32](wo_size // 32)
 
         var q_norm_size = (3 * 256 + 512) if real_weights_loaded else mtp_config.num_layers * 256
         mtp_layer_q_norm = alloc[Float32](q_norm_size)
 
+        var ffn_total_size = mtp_config.num_layers * 8192 * mtp_config.embed_dim
         mtp_layer_attn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
         mtp_layer_ffn_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
-        mtp_layer_ffn_gate = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-        mtp_layer_ffn_up = alloc[Float32](mtp_config.num_layers * 8192 * mtp_config.embed_dim)
-        mtp_layer_ffn_down = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim * 8192)
+        mtp_layer_ffn_gate_packed = alloc[UInt8](ffn_total_size // 2)
+        mtp_layer_ffn_gate_scales = alloc[Float32](ffn_total_size // 32)
+        mtp_layer_ffn_up_packed = alloc[UInt8](ffn_total_size // 2)
+        mtp_layer_ffn_up_scales = alloc[Float32](ffn_total_size // 32)
+        mtp_layer_ffn_down_packed = alloc[UInt8](ffn_total_size // 2)
+        mtp_layer_ffn_down_scales = alloc[Float32](ffn_total_size // 32)
         mtp_layer_ffn_post_norm = alloc[Float32](mtp_config.num_layers * mtp_config.embed_dim)
 
         for il in range(mtp_config.num_layers):
-            var wq_offset = il * 4096 * mtp_config.embed_dim if (not real_weights_loaded) else (il * 4096 * mtp_config.embed_dim if il < 3 else 3 * 4096 * mtp_config.embed_dim)
-            var wo_offset = il * mtp_config.embed_dim * 4096 if (not real_weights_loaded) else (il * mtp_config.embed_dim * 4096 if il < 3 else 3 * mtp_config.embed_dim * 4096)
+            var wq_elem_off = il * 4096 * mtp_config.embed_dim if (not real_weights_loaded) else (il * 4096 * mtp_config.embed_dim if il < 3 else 3 * 4096 * mtp_config.embed_dim)
+            var wo_elem_off = il * mtp_config.embed_dim * 4096 if (not real_weights_loaded) else (il * mtp_config.embed_dim * 4096 if il < 3 else 3 * mtp_config.embed_dim * 4096)
             var q_norm_offset = il * 256 if (not real_weights_loaded) else (il * 256 if il < 3 else 3 * 256)
+            var ffn_elem_off = il * 8192 * mtp_config.embed_dim
 
             mtp_layers.append(
                 AssistantLayerWeights(
                     mtp_layer_attn_norm + il * mtp_config.embed_dim,
-                    mtp_layer_wq + wq_offset,
-                    mtp_layer_wo + wo_offset,
+                    mtp_layer_wq_packed + wq_elem_off // 2,
+                    mtp_layer_wq_scales + wq_elem_off // 32,
+                    mtp_layer_wo_packed + wo_elem_off // 2,
+                    mtp_layer_wo_scales + wo_elem_off // 32,
                     mtp_layer_q_norm + q_norm_offset,
                     mtp_layer_attn_post_norm + il * mtp_config.embed_dim,
                     Float32(0.95),
                     mtp_layer_ffn_norm + il * mtp_config.embed_dim,
-                    mtp_layer_ffn_gate + il * 8192 * mtp_config.embed_dim,
-                    mtp_layer_ffn_up + il * 8192 * mtp_config.embed_dim,
-                    mtp_layer_ffn_down + mtp_config.embed_dim * (il * 8192),
-                    mtp_layer_ffn_post_norm + il * mtp_config.embed_dim
+                    mtp_layer_ffn_gate_packed + ffn_elem_off // 2,
+                    mtp_layer_ffn_gate_scales + ffn_elem_off // 32,
+                    mtp_layer_ffn_up_packed + ffn_elem_off // 2,
+                    mtp_layer_ffn_up_scales + ffn_elem_off // 32,
+                    mtp_layer_ffn_down_packed + ffn_elem_off // 2,
+                    mtp_layer_ffn_down_scales + ffn_elem_off // 32,
+                    mtp_layer_ffn_post_norm + il * mtp_config.embed_dim,
                 )
             )
 
+        var stage_max_elems = 8192 * mtp_config.embed_dim
+        var stage_fp32 = alloc[Float32](stage_max_elems)
+
         if real_weights_loaded:
             try:
-                print("Reading real weights from assistant_weights.bin...")
-                read_floats(assistant_fd, mtp_tok_embd, mtp_config.vocab_size * mtp_config.embed_dim)
-                read_floats(assistant_fd, mtp_pre_proj, mtp_config.get_pre_proj_size())
-                read_floats(assistant_fd, mtp_post_proj, mtp_config.get_post_proj_size())
+                print("Streaming and quantizing real weights from assistant_weights.bin to Q4_0...")
+                var chunk_rows = 8192
+                var r_cursor = 0
+                while r_cursor < mtp_config.vocab_size:
+                    var rows_now = mtp_config.vocab_size - r_cursor
+                    if rows_now > chunk_rows:
+                        rows_now = chunk_rows
+                    var elems_now = rows_now * mtp_config.embed_dim
+                    var elem_off = r_cursor * mtp_config.embed_dim
+                    read_floats(assistant_fd, stage_fp32, elems_now)
+                    quantize_fp32_to_q4_0(
+                        stage_fp32,
+                        mtp_lm_head_q4.packed_weights + elem_off // 2,
+                        mtp_lm_head_q4.scales + elem_off // 32,
+                        elems_now,
+                        num_tasks,
+                    )
+                    r_cursor += rows_now
+                mtp_lm_head_q4.finalize_tail_bounds()
+
+                read_floats(assistant_fd, stage_fp32, pre_size)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_pre_proj_packed, mtp_pre_proj_scales, pre_size, num_tasks)
+
+                read_floats(assistant_fd, stage_fp32, post_size)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_post_proj_packed, mtp_post_proj_scales, post_size, num_tasks)
+
                 read_floats(assistant_fd, mtp_output_norm_weight, mtp_config.embed_dim)
 
-                # Read layer weights for 4 layers
+                # Read and quantize layer weights for 4 layers
                 for il in range(mtp_config.num_layers):
                     var is_global = (il == 3)
-                    print("  Loading real weights for Layer " + String(il) + "...")
+                    print("  Loading & Q4_0 quantizing weights for Layer " + String(il) + "...")
                     read_floats(assistant_fd, mtp_layers[il].attn_norm_weight, mtp_config.embed_dim)
-                    
+
                     var layer_head_dim = 512 if is_global else 256
                     var q_proj_size = 16 * layer_head_dim * mtp_config.embed_dim
-                    read_floats(assistant_fd, mtp_layers[il].wq, q_proj_size)
-                    
+                    read_floats(assistant_fd, stage_fp32, q_proj_size)
+                    quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].wq_packed, mtp_layers[il].wq_scales, q_proj_size, num_tasks)
+
                     var o_proj_size = mtp_config.embed_dim * 16 * layer_head_dim
-                    read_floats(assistant_fd, mtp_layers[il].wo, o_proj_size)
-                    
+                    read_floats(assistant_fd, stage_fp32, o_proj_size)
+                    quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].wo_packed, mtp_layers[il].wo_scales, o_proj_size, num_tasks)
+
                     read_floats(assistant_fd, mtp_layers[il].q_norm_weight, layer_head_dim)
                     read_floats(assistant_fd, mtp_layers[il].attn_post_norm_weight, mtp_config.embed_dim)
-                    
+
                     # Layer scalar
                     var temp_scalar = alloc[Float32](1)
                     read_floats(assistant_fd, temp_scalar, 1)
                     mtp_layers[il].out_scale = temp_scalar[0]
                     temp_scalar.free()
-                    
+
+                    var ffn_mat_size = 8192 * mtp_config.embed_dim
                     read_floats(assistant_fd, mtp_layers[il].ffn_norm_weight, mtp_config.embed_dim)
-                    read_floats(assistant_fd, mtp_layers[il].ffn_gate, 8192 * mtp_config.embed_dim)
-                    read_floats(assistant_fd, mtp_layers[il].ffn_up, 8192 * mtp_config.embed_dim)
-                    read_floats(assistant_fd, mtp_layers[il].ffn_down, mtp_config.embed_dim * 8192)
+                    read_floats(assistant_fd, stage_fp32, ffn_mat_size)
+                    quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_gate_packed, mtp_layers[il].ffn_gate_scales, ffn_mat_size, num_tasks)
+                    read_floats(assistant_fd, stage_fp32, ffn_mat_size)
+                    quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_up_packed, mtp_layers[il].ffn_up_scales, ffn_mat_size, num_tasks)
+                    read_floats(assistant_fd, stage_fp32, ffn_mat_size)
+                    quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_down_packed, mtp_layers[il].ffn_down_scales, ffn_mat_size, num_tasks)
                     read_floats(assistant_fd, mtp_layers[il].ffn_post_norm_weight, mtp_config.embed_dim)
-                
-                print("Successfully loaded all real speculator weights into RAM!")
+
+                print("Successfully quantized all speculator weights to Q4_0 in RAM!")
             except err:
+                stage_fp32.free()
                 print("CRITICAL: Error loading speculator weights: " + String(err))
                 _ = c_close(assistant_fd)
                 return
             _ = c_close(assistant_fd)
         else:
-            print("Populating parameters with deterministic non-zero weights...")
-            for i in range(mtp_config.vocab_size * mtp_config.embed_dim):
-                mtp_tok_embd[i] = Float32(0.005) * Float32((i + 13) % 47)
-            for i in range(mtp_config.get_pre_proj_size()):
-                mtp_pre_proj[i] = Float32(0.0001) * Float32((i + 5) % 113)
-            for i in range(mtp_config.get_post_proj_size()):
-                mtp_post_proj[i] = Float32(0.0001) * Float32((i + 7) % 79)
+            print("Populating Q4_0 MTP parameters with deterministic non-zero weights...")
+            var r_cursor = 0
+            while r_cursor < mtp_config.vocab_size:
+                var rows_now = mtp_config.vocab_size - r_cursor
+                if rows_now > 8192:
+                    rows_now = 8192
+                var elems_now = rows_now * mtp_config.embed_dim
+                var elem_off = r_cursor * mtp_config.embed_dim
+                for i in range(elems_now):
+                    stage_fp32[i] = Float32(0.001) * Float32(((elem_off + i) + 3) % 61)
+                quantize_fp32_to_q4_0(
+                    stage_fp32,
+                    mtp_lm_head_q4.packed_weights + elem_off // 2,
+                    mtp_lm_head_q4.scales + elem_off // 32,
+                    elems_now,
+                    num_tasks,
+                )
+                r_cursor += rows_now
+            mtp_lm_head_q4.finalize_tail_bounds()
+
+            for i in range(pre_size):
+                stage_fp32[i] = Float32(0.0001) * Float32((i + 5) % 113)
+            quantize_fp32_to_q4_0(stage_fp32, mtp_pre_proj_packed, mtp_pre_proj_scales, pre_size, num_tasks)
+
+            for i in range(post_size):
+                stage_fp32[i] = Float32(0.0001) * Float32((i + 7) % 79)
+            quantize_fp32_to_q4_0(stage_fp32, mtp_post_proj_packed, mtp_post_proj_scales, post_size, num_tasks)
+
             for i in range(mtp_config.embed_dim):
                 mtp_output_norm_weight[i] = Float32(1.0)
-            for i in range(mtp_config.get_lm_head_size()):
-                mtp_lm_head[i] = Float32(0.001) * Float32((i + 3) % 61)
-
             for i in range(mtp_config.num_layers * mtp_config.embed_dim):
                 mtp_layer_attn_norm[i] = Float32(1.0)
                 mtp_layer_attn_post_norm[i] = Float32(1.0)
                 mtp_layer_ffn_norm[i] = Float32(1.0)
                 mtp_layer_ffn_post_norm[i] = Float32(1.0)
-
-            for i in range(mtp_config.num_layers * 4096 * mtp_config.embed_dim):
-                mtp_layer_wq[i] = Float32(0.0002) * Float32(i % 103)
-                mtp_layer_wo[i] = Float32(0.0002) * Float32(i % 97)
-
             for i in range(mtp_config.num_layers * 256):
                 mtp_layer_q_norm[i] = Float32(1.0)
+            for il in range(mtp_config.num_layers):
+                var q_sz = 4096 * mtp_config.embed_dim
+                for i in range(q_sz):
+                    stage_fp32[i] = Float32(0.0002) * Float32(i % 103)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].wq_packed, mtp_layers[il].wq_scales, q_sz, num_tasks)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].wo_packed, mtp_layers[il].wo_scales, q_sz, num_tasks)
+                var f_sz = 8192 * mtp_config.embed_dim
+                for i in range(f_sz):
+                    stage_fp32[i] = Float32(0.0001) * Float32(i % 83)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_gate_packed, mtp_layers[il].ffn_gate_scales, f_sz, num_tasks)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_up_packed, mtp_layers[il].ffn_up_scales, f_sz, num_tasks)
+                quantize_fp32_to_q4_0(stage_fp32, mtp_layers[il].ffn_down_packed, mtp_layers[il].ffn_down_scales, f_sz, num_tasks)
+            print("Populated all Q4_0 MTP arrays successfully.")
+        stage_fp32.free()
 
-            for i in range(mtp_config.num_layers * 8192 * mtp_config.embed_dim):
-                mtp_layer_ffn_gate[i] = Float32(0.0001) * Float32(i % 83)
-                mtp_layer_ffn_up[i] = Float32(0.0001) * Float32(i % 89)
-                mtp_layer_ffn_down[i] = Float32(0.0001) * Float32(i % 73)
-            print("Populated all MTP arrays successfully.")
-
-    var mtp_weights = MTPWeights(mtp_tok_embd, mtp_pre_proj, mtp_post_proj, mtp_output_norm_weight, mtp_lm_head)
+    var mtp_weights = MTPWeights(
+        mtp_pre_proj_packed,
+        mtp_pre_proj_scales,
+        mtp_post_proj_packed,
+        mtp_post_proj_scales,
+        mtp_output_norm_weight,
+    )
+    var mtp_cur_recurrent_h = alloc[Float32](mtp_config.backbone_dim)
+    var mtp_h_next = alloc[Float32](mtp_config.backbone_dim)
+    var mtp_x_concat = alloc[Float32](2 * mtp_config.backbone_dim)
+    var mtp_x_assistant = alloc[Float32](mtp_config.embed_dim)
+    var mtp_norm_x = alloc[Float32](mtp_config.embed_dim)
+    var mtp_q = alloc[Float32](16 * 512)
+    var mtp_attn_out = alloc[Float32](16 * 512)
+    var mtp_proj_attn_out = alloc[Float32](mtp_config.embed_dim)
+    var mtp_ffn_h1 = alloc[Float32](8192)
+    var mtp_ffn_h2 = alloc[Float32](8192)
+    var mtp_ffn_out_gate = alloc[Float32](8192)
+    var mtp_ffn_out = alloc[Float32](mtp_config.embed_dim)
 
     print("---------------------------------------------------------")
     print("   Continuous Batching scheduler initialized!")
@@ -2022,7 +2123,7 @@ def main() raises:
             prompt_file = String(cmd_args[arg_i])
         elif a == "--" or a == "--legacy-attn" or a == "--no-ring" or a == "--lsa" or a == "--gpu" or a == "--kfd" or a == "--no-gpu" or a == "--cpu":
             pass   # handled by the early parse
-        elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections" or a == "--max-kv-tokens") and arg_i + 1 < len(cmd_args):
+        elif (a == "--lsa-k" or a == "--lsa-p" or a == "--lsa-window" or a == "--lsa-sinks" or a == "--lsa-projections" or a == "--max-kv-tokens" or a == "--moe-top-p" or a == "--temp") and arg_i + 1 < len(cmd_args):
             arg_i += 1  # handled by early parse
         elif a == "--dump-qk" and arg_i + 1 < len(cmd_args):
             arg_i += 1
@@ -2706,37 +2807,30 @@ def main() raises:
                     var draft_tokens = List[Int]()
                     draft_tokens.append(current_token_id)
                     
-                    var cur_recurrent_h = alloc[Float32](mtp_config.backbone_dim)
-                    for i in range(mtp_config.backbone_dim):
-                        cur_recurrent_h[i] = seq_ptr[].recurrent_h[i]
+                    for i in range(0, mtp_config.backbone_dim, 16):
+                        mtp_cur_recurrent_h.store[16](i, seq_ptr[].recurrent_h.load[16](i))
                         
-                    var mtp_h_next = alloc[Float32](mtp_config.backbone_dim)
-                    var mtp_logits = alloc[Float32](mtp_config.vocab_size)
-                    
                     var draft_active_token = current_token_id
                     for step_idx in range(num_steps):
                         var rope_pos = pos + step_idx
                         var kv_pos = pos - 1
-                        mtp_generate_step(
-                            draft_active_token, cur_recurrent_h, mtp_weights, mtp_layers,
+                        var sampled_tok = mtp_generate_step(
+                            draft_active_token, mtp_cur_recurrent_h, mtp_weights, mtp_layers, mtp_lm_head_q4,
                             seq_ptr[].block_table, block_size, k_block_pools, v_block_pools,
-                            rope_pos, kv_pos, mtp_h_next, mtp_logits, mtp_config, num_tasks,
+                            rope_pos, kv_pos, mtp_h_next, mtp_config, num_tasks,
                             embed, real_weights_loaded,
-                            ring_size, (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0)
+                            ring_size, (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0),
+                            mtp_x_concat, mtp_x_assistant, mtp_norm_x, mtp_q,
+                            attn_scores, attn_rows, mtp_attn_out, mtp_proj_attn_out,
+                            mtp_ffn_h1, mtp_ffn_h2, mtp_ffn_out_gate, mtp_ffn_out,
+                            local_max_logits, local_next_tokens,
                         )
-                        
-                        var sampled_tok = 0
-                        var max_logit = mtp_logits[0]
-                        for i in range(1, mtp_config.vocab_size):
-                            if mtp_logits[i] > max_logit:
-                                max_logit = mtp_logits[i]
-                                sampled_tok = i
                                 
                         draft_active_token = sampled_tok
                         draft_tokens.append(draft_active_token)
                         
-                        for i in range(mtp_config.backbone_dim):
-                            cur_recurrent_h[i] = mtp_h_next[i]
+                        for i in range(0, mtp_config.backbone_dim, 16):
+                            mtp_cur_recurrent_h.store[16](i, mtp_h_next.load[16](i))
                             
                     if not is_chat_mode:
                         var draft_token_list = Python.list()
@@ -2793,18 +2887,6 @@ def main() raises:
 
                             if use_gpu:
                                 gpu_ctx.flush_cache_range(pref_norm_x.__int__(), verify_b * CONFIG.embed_dim * 4)
-                                var slot_q = gpu_ctx.enqueue_matmul(
-                                    weights.wq_packed.__int__(),
-                                    weights.wq_scales.__int__(),
-                                    pref_norm_x.__int__(),
-                                    pref_q.__int__(),
-                                    CONFIG.embed_dim,
-                                    q_dim,
-                                    batch_size=verify_b,
-                                    flush_cache=False,
-                                    barrier=False,
-                                    ring_doorbell_now=False,
-                                )
                                 var slot_k = gpu_ctx.enqueue_matmul(
                                     weights.wk_packed.__int__(),
                                     weights.wk_scales.__int__(),
@@ -2832,17 +2914,28 @@ def main() raises:
                                         ring_doorbell_now=False,
                                     )
                                 gpu_ctx.ring_doorbell()
-                                gpu_ctx.wait_matmul(slot_q, pref_q.__int__(), q_dim, batch_size=verify_b)
+                                # CDC-6600 Asymmetric Overlap: 8-core CPU computes 5-token Wq while iGPU computes Wk + Wv!
+                                if verify_b == 5:
+                                    q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
+                                else:
+                                    for b in range(verify_b):
+                                        q4_matmul_vec(weights.wq_packed, weights.wq_scales, pref_norm_x + b * CONFIG.embed_dim, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
                                 gpu_ctx.wait_matmul(slot_k, pref_k.__int__(), kv_stride, batch_size=verify_b)
                                 if not is_global:
                                     gpu_ctx.wait_matmul(slot_v, pref_v.__int__(), kv_stride, batch_size=verify_b)
                             else:
-                                for b in range(verify_b):
-                                    var nx_b = pref_norm_x + b * CONFIG.embed_dim
-                                    q4_matmul_vec(weights.wq_packed, weights.wq_scales, nx_b, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
-                                    q4_matmul_vec(weights.wk_packed, weights.wk_scales, nx_b, pref_k + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                if verify_b == 5:
+                                    q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
+                                    q4_matmul_batch5(weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
                                     if not is_global:
-                                        q4_matmul_vec(weights.wv_packed, weights.wv_scales, nx_b, pref_v + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                        q4_matmul_batch5(weights.wv_packed, weights.wv_scales, pref_norm_x, pref_v, CONFIG.embed_dim, kv_stride, num_tasks)
+                                else:
+                                    for b in range(verify_b):
+                                        var nx_b = pref_norm_x + b * CONFIG.embed_dim
+                                        q4_matmul_vec(weights.wq_packed, weights.wq_scales, nx_b, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
+                                        q4_matmul_vec(weights.wk_packed, weights.wk_scales, nx_b, pref_k + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                        if not is_global:
+                                            q4_matmul_vec(weights.wv_packed, weights.wv_scales, nx_b, pref_v + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
 
                             for b in range(verify_b):
                                 var v_pos = pos + b
@@ -2878,7 +2971,9 @@ def main() raises:
                                     lsa_k, lsa_p, lsa_sinks, lsa_window,
                                 )
 
-                            if use_gpu:
+                            if verify_b == 5:
+                                q4_matmul_batch5(weights.wo_packed, weights.wo_scales, pref_attn_out, pref_proj_out, q_dim, CONFIG.embed_dim, num_tasks)
+                            elif use_gpu:
                                 var slot_wo = gpu_ctx.enqueue_matmul(
                                     weights.wo_packed.__int__(),
                                     weights.wo_scales.__int__(),
@@ -2972,29 +3067,38 @@ def main() raises:
                                 gpu_ctx.wait_matmul(slot_gate, pref_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=verify_b)
                                 gpu_ctx.wait_matmul(slot_up, pref_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=verify_b)
                                 gelu_and_mul(pref_h1, pref_h2, pref_gate, verify_b * CONFIG.standard_mlp_dim)
-                                var slot_down = gpu_ctx.enqueue_matmul(
-                                    weights.w_down_packed.__int__(),
-                                    weights.w_down_scales.__int__(),
-                                    pref_gate.__int__(),
-                                    pref_mlp_out.__int__(),
-                                    CONFIG.standard_mlp_dim,
-                                    CONFIG.embed_dim,
-                                    batch_size=verify_b,
-                                    flush_cache=True,
-                                    barrier=False,
-                                    ring_doorbell_now=True,
-                                )
-                                gpu_ctx.wait_matmul(slot_down, pref_mlp_out.__int__(), CONFIG.embed_dim, batch_size=verify_b)
+                                if verify_b == 5:
+                                    q4_matmul_batch5(weights.w_down_packed, weights.w_down_scales, pref_gate, pref_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                                else:
+                                    var slot_down = gpu_ctx.enqueue_matmul(
+                                        weights.w_down_packed.__int__(),
+                                        weights.w_down_scales.__int__(),
+                                        pref_gate.__int__(),
+                                        pref_mlp_out.__int__(),
+                                        CONFIG.standard_mlp_dim,
+                                        CONFIG.embed_dim,
+                                        batch_size=verify_b,
+                                        flush_cache=True,
+                                        barrier=False,
+                                        ring_doorbell_now=True,
+                                    )
+                                    gpu_ctx.wait_matmul(slot_down, pref_mlp_out.__int__(), CONFIG.embed_dim, batch_size=verify_b)
                             else:
-                                for b in range(verify_b):
-                                    var nx_b = pref_norm_x + b * CONFIG.embed_dim
-                                    var h1_b = pref_h1 + b * CONFIG.standard_mlp_dim
-                                    var h2_b = pref_h2 + b * CONFIG.standard_mlp_dim
-                                    var g_b = pref_gate + b * CONFIG.standard_mlp_dim
-                                    q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, nx_b, h1_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                    q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, nx_b, h2_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                    gelu_and_mul(h1_b, h2_b, g_b, CONFIG.standard_mlp_dim)
-                                    q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, g_b, pref_mlp_out + b * CONFIG.embed_dim, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                                if verify_b == 5:
+                                    q4_matmul_batch5(weights.w_gate_packed, weights.w_gate_scales, pref_norm_x, pref_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                    q4_matmul_batch5(weights.w_up_packed, weights.w_up_scales, pref_norm_x, pref_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                    gelu_and_mul(pref_h1, pref_h2, pref_gate, verify_b * CONFIG.standard_mlp_dim)
+                                    q4_matmul_batch5(weights.w_down_packed, weights.w_down_scales, pref_gate, pref_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                                else:
+                                    for b in range(verify_b):
+                                        var nx_b = pref_norm_x + b * CONFIG.embed_dim
+                                        var h1_b = pref_h1 + b * CONFIG.standard_mlp_dim
+                                        var h2_b = pref_h2 + b * CONFIG.standard_mlp_dim
+                                        var g_b = pref_gate + b * CONFIG.standard_mlp_dim
+                                        q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, nx_b, h1_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                        q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, nx_b, h2_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                        gelu_and_mul(h1_b, h2_b, g_b, CONFIG.standard_mlp_dim)
+                                        q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, g_b, pref_mlp_out + b * CONFIG.embed_dim, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
 
                             var scalar = weights.layer_scalar[0]
                             for b in range(verify_b):
@@ -3008,22 +3112,42 @@ def main() raises:
                                 for i in range(CONFIG.embed_dim):
                                     x_b[i] = (x_b[i] + ffn_out[i]) * scalar
 
-                        # Evaluate logits with early-exit on first rejected draft token!
+                        # Coalesced 5-Token Final Norm + Single-Pass PVS Logit Verification!
+                        for b in range(verify_b):
+                            rms_norm(
+                                pref_x + b * CONFIG.embed_dim,
+                                final_norm_weight,
+                                pref_norm_x + b * CONFIG.embed_dim,
+                                CONFIG.embed_dim,
+                            )
+                        var stack_seed_toks = InlineArray[Int, 5](uninitialized=True)
+                        var stack_verified_toks = InlineArray[Int, 5](uninitialized=True)
+                        var seed_toks_ptr = UnsafePointer[Int, MutUntrackedOrigin](
+                            unsafe_from_address=Int(UnsafePointer(to=stack_seed_toks))
+                        )
+                        var verified_toks_ptr = UnsafePointer[Int, MutUntrackedOrigin](
+                            unsafe_from_address=Int(UnsafePointer(to=stack_verified_toks))
+                        )
+                        for j in range(1, num_steps + 1):
+                            seed_toks_ptr[j - 1] = draft_tokens[j]
+                        seed_toks_ptr[num_steps] = embed.last_winner_tok[0]
+                        embed.project_logits_batch5_parallel(
+                            pref_norm_x,
+                            seed_toks_ptr,
+                            verified_toks_ptr,
+                            num_tasks,
+                            softcap=True,
+                        )
+
                         var verified_all = True
                         for j in range(1, num_steps + 1):
                             var b_idx = j - 1
-                            rms_norm(pref_x + b_idx * CONFIG.embed_dim, final_norm_weight, target_final_norm_x, CONFIG.embed_dim)
+                            var norm_b = pref_norm_x + b_idx * CONFIG.embed_dim
                             for i in range(CONFIG.embed_dim):
-                                seq_ptr[].recurrent_h[i] = target_final_norm_x[i]
-                            embed.project_logits_parallel(target_final_norm_x, local_max_logits, local_next_tokens, num_tasks)
-                            var d_max_l: Float32 = -999999.0
-                            var target_next_token = 0
-                            for t in range(num_tasks):
-                                if local_max_logits[t] > d_max_l:
-                                    d_max_l = local_max_logits[t]
-                                    target_next_token = local_next_tokens[t]
-
+                                seq_ptr[].recurrent_h[i] = norm_b[i]
                             var draft_token_to_verify = draft_tokens[j]
+                            var target_next_token = verified_toks_ptr[b_idx]
+
                             run_draft_proposed_ptr[0] += 1
                             if target_next_token == draft_token_to_verify:
                                 run_draft_accepted_ptr[0] += 1
@@ -3064,16 +3188,10 @@ def main() raises:
                                 break
 
                         if verified_all and not seq_ptr[].is_finished:
-                            rms_norm(pref_x + num_steps * CONFIG.embed_dim, final_norm_weight, target_final_norm_x, CONFIG.embed_dim)
+                            var norm_bonus = pref_norm_x + num_steps * CONFIG.embed_dim
                             for i in range(CONFIG.embed_dim):
-                                seq_ptr[].recurrent_h[i] = target_final_norm_x[i]
-                            embed.project_logits_parallel(target_final_norm_x, local_max_logits, local_next_tokens, num_tasks)
-                            var b_max_l: Float32 = -999999.0
-                            var bonus_token = 0
-                            for t in range(num_tasks):
-                                if local_max_logits[t] > b_max_l:
-                                    b_max_l = local_max_logits[t]
-                                    bonus_token = local_next_tokens[t]
+                                seq_ptr[].recurrent_h[i] = norm_bonus[i]
+                            var bonus_token = verified_toks_ptr[num_steps]
 
                             seq_ptr[].tokens.append(bonus_token)
                             run_tokens_generated_ptr[0] += 1
@@ -3095,10 +3213,6 @@ def main() raises:
                         if use_lsa:
                             for g in range(5):
                                 lsa_indices[seq_ptr[].kv_slot * 5 + g].rollback_to(seq_ptr[].pos)
-                                
-                    cur_recurrent_h.free()
-                    mtp_h_next.free()
-                    mtp_logits.free()
                 elif not qk_dump_active_for_run:
                     var next_token = run_target_step(seq_ptr)
                     if next_token < 0:
@@ -3350,7 +3464,11 @@ def main() raises:
                         if use_lsa and s_ptr[].kv_slot >= 0:
                             var closed_b = lsa_indices[s_ptr[].kv_slot * 5].closed_blocks
                             lsa_info = " | LSA blocks: " + String(closed_b) + " (" + String(closed_b * 32) + " buckets)"
-                        print("\n\n [Decode: " + String(chat_tps_rounded) + " tok/s (" + String(chat_decode_tokens) + " tok) | Prefill: " + String(pref_tps_rounded) + " tok/s (" + String(chat_prefill_toks) + " tok) | context: " + String(len(s_ptr[].tokens)) + " tok" + lsa_info + "]")
+                        var mtp_info = String("")
+                        if use_mtp and run_draft_proposed_ptr[0] > 0:
+                            var acc_pct = Float64(Int(Float64(run_draft_accepted_ptr[0]) * 1000.0 / Float64(run_draft_proposed_ptr[0]) + 0.5)) / 10.0
+                            mtp_info = " | MTP accept: " + String(run_draft_accepted_ptr[0]) + "/" + String(run_draft_proposed_ptr[0]) + " (" + String(acc_pct) + "%)"
+                        print("\n\n [Decode: " + String(chat_tps_rounded) + " tok/s (" + String(chat_decode_tokens) + " tok) | Prefill: " + String(pref_tps_rounded) + " tok/s (" + String(chat_prefill_toks) + " tok) | context: " + String(len(s_ptr[].tokens)) + " tok" + mtp_info + lsa_info + "]")
                     else:
                         print("\n[Scheduler] Request #" + String(s_ptr[].id) + " finished! Retiring and freeing " + String(len(s_ptr[].block_table)) + " blocks...")
                         for b in range(len(s_ptr[].block_table)):
@@ -3524,23 +3642,41 @@ def main() raises:
     embed.free()
 
     # Free MTP weights and pointers
-    mtp_tok_embd.free()
-    mtp_pre_proj.free()
-    mtp_post_proj.free()
+    mtp_lm_head_q4.free()
+    mtp_pre_proj_packed.free()
+    mtp_pre_proj_scales.free()
+    mtp_post_proj_packed.free()
+    mtp_post_proj_scales.free()
     mtp_output_norm_weight.free()
-    if mtp_lm_head.__int__() != mtp_tok_embd.__int__():
-        mtp_lm_head.free()
 
     mtp_layer_attn_norm.free()
-    mtp_layer_wq.free()
-    mtp_layer_wo.free()
+    mtp_layer_wq_packed.free()
+    mtp_layer_wq_scales.free()
+    mtp_layer_wo_packed.free()
+    mtp_layer_wo_scales.free()
     mtp_layer_q_norm.free()
     mtp_layer_attn_post_norm.free()
     mtp_layer_ffn_norm.free()
-    mtp_layer_ffn_gate.free()
-    mtp_layer_ffn_up.free()
-    mtp_layer_ffn_down.free()
+    mtp_layer_ffn_gate_packed.free()
+    mtp_layer_ffn_gate_scales.free()
+    mtp_layer_ffn_up_packed.free()
+    mtp_layer_ffn_up_scales.free()
+    mtp_layer_ffn_down_packed.free()
+    mtp_layer_ffn_down_scales.free()
     mtp_layer_ffn_post_norm.free()
+
+    mtp_cur_recurrent_h.free()
+    mtp_h_next.free()
+    mtp_x_concat.free()
+    mtp_x_assistant.free()
+    mtp_norm_x.free()
+    mtp_q.free()
+    mtp_attn_out.free()
+    mtp_proj_attn_out.free()
+    mtp_ffn_h1.free()
+    mtp_ffn_h2.free()
+    mtp_ffn_out_gate.free()
+    mtp_ffn_out.free()
 
     if use_lsa:
         for i in range(num_kv_slots * 5):

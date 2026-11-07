@@ -159,13 +159,56 @@ struct Q4Embedding:
         _ = c_close(fd)
         self._libc = libc^
 
-        # Precompute exact Euclidean tail L2 norm ||W_{r, tail}||_2 after prefix_blocks (25% of row)
+        # Precompute exact Euclidean tail L2 norm ||W_{r, tail}||_2 after prefix_blocks (50% of row)
         self.row_tail_bound_11 = alloc[Float32](self.vocab_size)
         self.last_winner_tok = alloc[Int](1)
         self.last_winner_tok[0] = 0
         self.scratch_x_even = alloc[Float32](self.embed_dim // 2)
         self.scratch_x_odd = alloc[Float32](self.embed_dim // 2)
         self.scratch_shared_best = alloc[Float32](1)
+        self.finalize_tail_bounds()
+
+        print("Q4 Embedding Loaded successfully:")
+        print("  Vocab:     ", self.vocab_size)
+        print("  Dimension: ", self.embed_dim)
+        print("  RAM:       ", (packed_size_bytes + scales_size_bytes) // 1024 // 1024, "MB")
+
+    def __init__(out self, vocab_size: Int, embed_dim: Int) raises:
+        """Allocate an in-memory Q4Embedding table to be populated via quantize_fp32_to_q4_0 + finalize_tail_bounds()."""
+        var libc = OwnedDLHandle("libc.so.6")
+        var posix_memalign = libc.get_function[def(Int, Int, Int) thin abi("C") -> Int32]("posix_memalign")
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        var packed_size_bytes = max(4096, self.vocab_size * (self.embed_dim // 2))
+        var scales_size_bytes = max(4096, self.vocab_size * (self.embed_dim // 32) * 4)
+
+        var memptr_W = alloc[Int](1)
+        var err_W = posix_memalign(memptr_W.__int__(), 4096, packed_size_bytes)
+        if err_W != 0:
+            memptr_W.free()
+            raise Error("CRITICAL: Failed to allocate aligned memory for Q4 packed weights")
+        var W_addr = memptr_W[0]
+        memptr_W.free()
+        self.packed_weights = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=W_addr)
+
+        var memptr_S = alloc[Int](1)
+        var err_S = posix_memalign(memptr_S.__int__(), 4096, scales_size_bytes)
+        if err_S != 0:
+            memptr_S.free()
+            raise Error("CRITICAL: Failed to allocate aligned memory for Q4 scales")
+        var S_addr = memptr_S[0]
+        memptr_S.free()
+        self.scales = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=S_addr)
+
+        self._libc = libc^
+        self.row_tail_bound_11 = alloc[Float32](max(1, self.vocab_size))
+        self.last_winner_tok = alloc[Int](1)
+        self.last_winner_tok[0] = 0
+        self.scratch_x_even = alloc[Float32](max(16, self.embed_dim // 2))
+        self.scratch_x_odd = alloc[Float32](max(16, self.embed_dim // 2))
+        self.scratch_shared_best = alloc[Float32](1)
+
+    def finalize_tail_bounds(mut self):
         var num_blocks_init = self.embed_dim // 32
         var b_pref = num_blocks_init // 2
         var packed_init_ptr = self.packed_weights
@@ -174,6 +217,8 @@ struct Q4Embedding:
         var half_dim_init = self.embed_dim // 2
         var vs_init = self.vocab_size
         var init_tasks = max(1, num_physical_cores())
+        if vs_init < init_tasks:
+            init_tasks = max(1, vs_init)
 
         def init_tail_bounds_worker(t: Int) capturing -> None:
             var chunk = vs_init // init_tasks
@@ -192,12 +237,10 @@ struct Q4Embedding:
                     tail_norm_sq += (sc * sc) * blk_sq
                 bound_ptr[r] = sqrt(tail_norm_sq)
 
-        parallelize[init_tail_bounds_worker](init_tasks)
-
-        print("Q4 Embedding Loaded successfully:")
-        print("  Vocab:     ", self.vocab_size)
-        print("  Dimension: ", self.embed_dim)
-        print("  RAM:       ", (packed_size_bytes + scales_size_bytes) // 1024 // 1024, "MB")
+        if init_tasks == 1:
+            init_tail_bounds_worker(0)
+        else:
+            parallelize[init_tail_bounds_worker](init_tasks)
 
     def free(mut self):
         var c_free = self._libc.get_function[def(Int) thin abi("C") -> None]("free")
@@ -314,6 +357,7 @@ struct Q4Embedding:
         local_max_logits: UnsafePointer[Float32, MutExternalOrigin],
         local_next_tokens: UnsafePointer[Int, MutExternalOrigin],
         num_tasks: Int,
+        softcap: Bool = True,
     ) -> None:
         """Fast Dual-Space Deinterleaved + Early-Z PVS logit projection with monotonic tanh hoisting."""
         var chunk_size = self.vocab_size // num_tasks
@@ -472,10 +516,16 @@ struct Q4Embedding:
                 r += 1
 
             # Monotonic tanh soft-cap applied ONCE per worker thread instead of 262,144 times!
-            local_max_logits[t] = Float32(30.0) * tanh(local_max_sum / Float32(30.0))
+            if softcap:
+                local_max_logits[t] = Float32(30.0) * tanh(local_max_sum / Float32(30.0))
+            else:
+                local_max_logits[t] = local_max_sum
             local_next_tokens[t] = local_tok
 
-        parallelize[initial_proj_worker](num_tasks)
+        if num_tasks == 1:
+            initial_proj_worker(0)
+        else:
+            parallelize[initial_proj_worker](num_tasks)
 
         var overall_best_l: Float32 = -1e30
         var overall_best_tok: Int = 0
@@ -486,6 +536,272 @@ struct Q4Embedding:
                 overall_best_l = local_max_logits[t]
                 overall_best_tok = local_next_tokens[t]
         self.last_winner_tok[0] = overall_best_tok
+
+    @always_inline
+    def project_logits_batch5_parallel(
+        self,
+        x_batch: UnsafePointer[Float32, _],
+        seed_tokens: UnsafePointer[Int, _],
+        out_next_tokens: UnsafePointer[Int, MutUntrackedOrigin],
+        num_tasks: Int,
+        softcap: Bool = True,
+    ) -> None:
+        """5-token coalesced Dual-Space Deinterleaved + Early-Z PVS logit projection.
+        Reads the 391 MB Q4_0 vocabulary table ONLY ONCE across all 5 speculative verification
+        positions, seeding Cauchy-Schwarz PVS bounds with the draft candidate tokens.
+        """
+        var chunk_size = self.vocab_size // num_tasks
+        var num_blocks = self.embed_dim // 32
+        var prefix_blocks = num_blocks // 2
+        var half_dim = self.embed_dim // 2
+
+        var stack_deint = InlineArray[Float32, 5 * 2816](uninitialized=True)
+        var x_deint: UnsafePointer[Float32, MutUntrackedOrigin]
+        if self.embed_dim <= 2816:
+            x_deint = UnsafePointer[Float32, MutUntrackedOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=stack_deint))
+            )
+        else:
+            x_deint = alloc[Float32](5 * self.embed_dim)
+
+        var stack_rms = InlineArray[Float32, 5](uninitialized=True)
+        for tok in range(5):
+            var x_src = x_batch + tok * self.embed_dim
+            var xe_dst = x_deint + tok * self.embed_dim
+            var xo_dst = xe_dst + half_dim
+            var x_tail_sq = SIMD[DType.float32, 16](0.0)
+            for b in range(num_blocks):
+                var v0 = x_src.load[16](b * 32)
+                var v1 = x_src.load[16](b * 32 + 16)
+                var ev = v0.deinterleave()[0].join(v1.deinterleave()[0])
+                var od = v0.deinterleave()[1].join(v1.deinterleave()[1])
+                xe_dst.store[16](b * 16, ev)
+                xo_dst.store[16](b * 16, od)
+                if b >= prefix_blocks:
+                    x_tail_sq = x_tail_sq + ev * ev + od * od
+            stack_rms[tok] = sqrt(x_tail_sq.reduce_add())
+
+        var xe0 = x_deint + 0 * self.embed_dim
+        var xo0 = xe0 + half_dim
+        var xe1 = x_deint + 1 * self.embed_dim
+        var xo1 = xe1 + half_dim
+        var xe2 = x_deint + 2 * self.embed_dim
+        var xo2 = xe2 + half_dim
+        var xe3 = x_deint + 3 * self.embed_dim
+        var xo3 = xe3 + half_dim
+        var xe4 = x_deint + 4 * self.embed_dim
+        var xo4 = xe4 + half_dim
+
+        var rms0 = stack_rms[0]
+        var rms1 = stack_rms[1]
+        var rms2 = stack_rms[2]
+        var rms3 = stack_rms[3]
+        var rms4 = stack_rms[4]
+
+        var seed_count = 256 if self.vocab_size >= 256 else self.vocab_size
+        var stack_seed_sum = InlineArray[Float32, 5](uninitialized=True)
+        var stack_seed_tok = InlineArray[Int, 5](uninitialized=True)
+        var stack_shared_best = InlineArray[Float32, 5](uninitialized=True)
+        var shared_best_ptr = UnsafePointer[Float32, MutUntrackedOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_shared_best))
+        )
+
+        for tok in range(5):
+            var xe_t = x_deint + tok * self.embed_dim
+            var xo_t = xe_t + half_dim
+            var best_s: Float32 = -1e30
+            var best_i: Int = 0
+            var cand = seed_tokens[tok]
+            if cand >= seed_count and cand < self.vocab_size:
+                best_s = self._eval_row_full(cand, xe_t, xo_t, num_blocks)
+                best_i = cand
+            for r in range(seed_count):
+                var s = self._eval_row_full(r, xe_t, xo_t, num_blocks)
+                if s > best_s or (s == best_s and r < best_i):
+                    best_s = s
+                    best_i = r
+            stack_seed_sum[tok] = best_s
+            stack_seed_tok[tok] = best_i
+            shared_best_ptr[tok] = best_s
+
+        var stack_thread_sum = InlineArray[Float32, 64 * 5](uninitialized=True)
+        var stack_thread_tok = InlineArray[Int, 64 * 5](uninitialized=True)
+        var thread_sum_ptr = UnsafePointer[Float32, MutUntrackedOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_thread_sum))
+        )
+        var thread_tok_ptr = UnsafePointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_thread_tok))
+        )
+
+        var s_sum0 = stack_seed_sum[0]
+        var s_sum1 = stack_seed_sum[1]
+        var s_sum2 = stack_seed_sum[2]
+        var s_sum3 = stack_seed_sum[3]
+        var s_sum4 = stack_seed_sum[4]
+        var s_tok0 = stack_seed_tok[0]
+        var s_tok1 = stack_seed_tok[1]
+        var s_tok2 = stack_seed_tok[2]
+        var s_tok3 = stack_seed_tok[3]
+        var s_tok4 = stack_seed_tok[4]
+
+        def batch5_proj_worker(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            if start_r < seed_count:
+                start_r = seed_count
+            var end_r = (t + 1) * chunk_size if t < num_tasks - 1 else self.vocab_size
+
+            var lmax0: Float32 = s_sum0 if t == 0 else -1e30
+            var lmax1: Float32 = s_sum1 if t == 0 else -1e30
+            var lmax2: Float32 = s_sum2 if t == 0 else -1e30
+            var lmax3: Float32 = s_sum3 if t == 0 else -1e30
+            var lmax4: Float32 = s_sum4 if t == 0 else -1e30
+
+            var ltok0: Int = s_tok0 if t == 0 else start_r
+            var ltok1: Int = s_tok1 if t == 0 else start_r
+            var ltok2: Int = s_tok2 if t == 0 else start_r
+            var ltok3: Int = s_tok3 if t == 0 else start_r
+            var ltok4: Int = s_tok4 if t == 0 else start_r
+
+            var pth0: Float32 = shared_best_ptr[0]
+            var pth1: Float32 = shared_best_ptr[1]
+            var pth2: Float32 = shared_best_ptr[2]
+            var pth3: Float32 = shared_best_ptr[3]
+            var pth4: Float32 = shared_best_ptr[4]
+
+            for r in range(start_r, end_r):
+                if (r & 63) == 0:
+                    if shared_best_ptr[0] > pth0:
+                        pth0 = shared_best_ptr[0]
+                    if shared_best_ptr[1] > pth1:
+                        pth1 = shared_best_ptr[1]
+                    if shared_best_ptr[2] > pth2:
+                        pth2 = shared_best_ptr[2]
+                    if shared_best_ptr[3] > pth3:
+                        pth3 = shared_best_ptr[3]
+                    if shared_best_ptr[4] > pth4:
+                        pth4 = shared_best_ptr[4]
+
+                var r_pack = r * half_dim
+                var r_sc = r * num_blocks
+                var acc0 = SIMD[DType.float32, 16](0.0)
+                var acc1 = SIMD[DType.float32, 16](0.0)
+                var acc2 = SIMD[DType.float32, 16](0.0)
+                var acc3 = SIMD[DType.float32, 16](0.0)
+                var acc4 = SIMD[DType.float32, 16](0.0)
+
+                for b in range(prefix_blocks):
+                    var sc = self.scales[r_sc + b]
+                    var bytes = self.packed_weights.load[16](r_pack + b * 16)
+                    var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
+                    acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
+                    acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
+                    acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
+                    acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+
+                var tb = self.row_tail_bound_11[r]
+                var p0 = acc0.reduce_add()
+                var p1 = acc1.reduce_add()
+                var p2 = acc2.reduce_add()
+                var p3 = acc3.reduce_add()
+                var p4 = acc4.reduce_add()
+
+                if (
+                    (p0 + tb * rms0 >= pth0)
+                    or (p1 + tb * rms1 >= pth1)
+                    or (p2 + tb * rms2 >= pth2)
+                    or (p3 + tb * rms3 >= pth3)
+                    or (p4 + tb * rms4 >= pth4)
+                ):
+                    for b in range(prefix_blocks, num_blocks):
+                        var sc = self.scales[r_sc + b]
+                        var bytes = self.packed_weights.load[16](r_pack + b * 16)
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
+                        acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
+                        acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
+                        acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
+                        acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+
+                    var sum0 = acc0.reduce_add()
+                    if sum0 > lmax0:
+                        lmax0 = sum0
+                        ltok0 = r
+                        if sum0 > pth0:
+                            pth0 = sum0
+                            shared_best_ptr[0] = sum0
+                    var sum1 = acc1.reduce_add()
+                    if sum1 > lmax1:
+                        lmax1 = sum1
+                        ltok1 = r
+                        if sum1 > pth1:
+                            pth1 = sum1
+                            shared_best_ptr[1] = sum1
+                    var sum2 = acc2.reduce_add()
+                    if sum2 > lmax2:
+                        lmax2 = sum2
+                        ltok2 = r
+                        if sum2 > pth2:
+                            pth2 = sum2
+                            shared_best_ptr[2] = sum2
+                    var sum3 = acc3.reduce_add()
+                    if sum3 > lmax3:
+                        lmax3 = sum3
+                        ltok3 = r
+                        if sum3 > pth3:
+                            pth3 = sum3
+                            shared_best_ptr[3] = sum3
+                    var sum4 = acc4.reduce_add()
+                    if sum4 > lmax4:
+                        lmax4 = sum4
+                        ltok4 = r
+                        if sum4 > pth4:
+                            pth4 = sum4
+                            shared_best_ptr[4] = sum4
+
+            var base = t * 5
+            if softcap:
+                thread_sum_ptr[base + 0] = Float32(30.0) * tanh(lmax0 / Float32(30.0))
+                thread_sum_ptr[base + 1] = Float32(30.0) * tanh(lmax1 / Float32(30.0))
+                thread_sum_ptr[base + 2] = Float32(30.0) * tanh(lmax2 / Float32(30.0))
+                thread_sum_ptr[base + 3] = Float32(30.0) * tanh(lmax3 / Float32(30.0))
+                thread_sum_ptr[base + 4] = Float32(30.0) * tanh(lmax4 / Float32(30.0))
+            else:
+                thread_sum_ptr[base + 0] = lmax0
+                thread_sum_ptr[base + 1] = lmax1
+                thread_sum_ptr[base + 2] = lmax2
+                thread_sum_ptr[base + 3] = lmax3
+                thread_sum_ptr[base + 4] = lmax4
+            thread_tok_ptr[base + 0] = ltok0
+            thread_tok_ptr[base + 1] = ltok1
+            thread_tok_ptr[base + 2] = ltok2
+            thread_tok_ptr[base + 3] = ltok3
+            thread_tok_ptr[base + 4] = ltok4
+
+        if num_tasks == 1:
+            batch5_proj_worker(0)
+        else:
+            parallelize[batch5_proj_worker](num_tasks)
+
+        for tok in range(5):
+            var best_l: Float32 = -1e30
+            var best_i: Int = 0
+            for t in range(num_tasks):
+                var tl = thread_sum_ptr[t * 5 + tok]
+                var ti = thread_tok_ptr[t * 5 + tok]
+                if tl > best_l or (tl == best_l and ti < best_i):
+                    best_l = tl
+                    best_i = ti
+            out_next_tokens[tok] = best_i
+
+        self.last_winner_tok[0] = out_next_tokens[4]
+        var _keep_alive = stack_deint[0] + stack_shared_best[0] + stack_thread_sum[0] + Float32(stack_thread_tok[0])
+        if _keep_alive > 1e38:
+            out_next_tokens[0] += 0
+        if self.embed_dim > 2816:
+            x_deint.free()
 
     @always_inline
     def project_full_logits(
