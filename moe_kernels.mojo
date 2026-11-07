@@ -1,5 +1,112 @@
 from std.algorithm import parallelize
+from std.collections import InlineArray
+from std.memory import alloc
 from std.math import exp
+
+
+def q4_matmul_vec(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    x: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutUntrackedOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+):
+    """
+    Zero-alloc Dual-Space Deinterleaved Q4_0 matrix-vector multiplication with 4-row register blocking.
+    Uses a stack InlineArray[Float32, 8192] for c_in <= 8192 (zero heap alloc/free per call).
+    """
+    debug_assert(c_in % 32 == 0, "q4_matmul_vec requires c_in to be a multiple of 32")
+    if c_out <= 0:
+        return
+    var tasks = num_tasks
+    if c_out <= 256:
+        tasks = 1
+    elif c_out <= 1024:
+        tasks = 2 if tasks >= 2 else 1
+    elif c_out <= 2048:
+        tasks = 4 if tasks >= 4 else tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var chunk_size = c_out // tasks
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    var stack_deint = InlineArray[Float32, 8192](uninitialized=True)
+    stack_deint[0] = 0.0
+    var x_deint = UnsafePointer[Float32, MutUntrackedOrigin](
+        unsafe_from_address=Int(stack_deint.unsafe_ptr())
+    ) if c_in <= 8192 else alloc[Float32](c_in)
+    var x_even = x_deint
+    var x_odd = x_deint + c_in_packed
+    for b in range(c_in_blocks):
+        var v0 = x.load[16](b * 32)
+        var v1 = x.load[16](b * 32 + 16)
+        x_even.store[16](b * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
+        x_odd.store[16](b * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+
+        var r = start_r
+        while r + 1 < end_r:
+            var acc0 = SIMD[DType.float32, 16](0.0)
+            var acc1 = SIMD[DType.float32, 16](0.0)
+
+            var rp0 = r * c_in_packed
+            var rs0 = r * c_in_blocks
+            var rp1 = (r + 1) * c_in_packed
+            var rs1 = (r + 1) * c_in_blocks
+
+            for b in range(c_in_blocks):
+                var xe = x_even.load[16](b * 16)
+                var xo = x_odd.load[16](b * 16)
+
+                var sc0 = scales[rs0 + b]
+                var b0 = W_packed.load[16](rp0 + b * 16)
+                var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+
+                var sc1 = scales[rs1 + b]
+                var b1 = W_packed.load[16](rp1 + b * 16)
+                var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+
+            out_ptr[r] = acc0.reduce_add()
+            out_ptr[r + 1] = acc1.reduce_add()
+            r += 2
+
+        while r < end_r:
+            var acc = SIMD[DType.float32, 16](0.0)
+            var r_offset_packed = r * c_in_packed
+            var r_offset_scales = r * c_in_blocks
+            for b in range(c_in_blocks):
+                var scale = scales[r_offset_scales + b]
+                var bytes = W_packed.load[16](r_offset_packed + b * 16)
+                var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * scale
+            out_ptr[r] = acc.reduce_add()
+            r += 1
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+    # Pin stack_deint lifetime past parallelize[worker] so Mojo's ASAP destructor cannot
+    # reclaim the 32 KB stack buffer while worker threads are reading from x_even/x_odd.
+    var _keep_alive = stack_deint[0]
+    if _keep_alive > 1e38:
+        out_ptr[0] += 0.0
+    if c_in > 8192:
+        x_deint.free()
 
 
 @always_inline
@@ -92,7 +199,7 @@ def run_moe_experts_stage1_8core(
         xo_ptr.store[16](b * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
 
     var gate_up_rows = expert_mlp_dim * 2
-    var tasks = max(1, num_tasks)
+    var tasks = max(1, min(num_tasks, gate_up_rows))
 
     def stage1_worker(t: Int) capturing -> None:
         var chunk = gate_up_rows // tasks
@@ -105,7 +212,7 @@ def run_moe_experts_stage1_8core(
             var gu_out = gate_up_out_all + exp_slot * gate_up_rows
 
             var r = sr
-            while r < er - 1:
+            while r + 1 < er:
                 var acc0 = SIMD[DType.float32, 16](0.0)
                 var acc1 = SIMD[DType.float32, 16](0.0)
                 var rp0 = r * half_in
@@ -168,7 +275,7 @@ def run_moe_experts_stage2_8core(
     """Row-sliced Stage 2 MoE execution: computes experts_down and fuses weighted accumulation into moe_out."""
     var c_in_packed = expert_mlp_dim // 2
     var c_in_blocks = expert_mlp_dim // 32
-    var tasks = max(1, num_tasks)
+    var tasks = max(1, min(num_tasks, embed_dim))
 
     for exp_slot in range(active_count):
         var act_ptr = act_all + exp_slot * expert_mlp_dim
@@ -194,7 +301,7 @@ def run_moe_experts_stage2_8core(
             var ad_e = act_deint + exp_slot * expert_mlp_dim
             var ad_o = ad_e + c_in_packed
             var r = sr
-            while r < er - 1:
+            while r + 1 < er:
                 var acc0 = SIMD[DType.float32, 16](0.0)
                 var acc1 = SIMD[DType.float32, 16](0.0)
                 var rp0 = r * c_in_packed

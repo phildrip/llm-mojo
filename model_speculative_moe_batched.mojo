@@ -1,5 +1,6 @@
 from std.ffi import OwnedDLHandle
 from std.memory import alloc
+from std.collections import InlineArray
 from std.math import sqrt, exp, cos, sin, tanh
 from std.python import Python, PythonObject
 import std.os
@@ -19,6 +20,7 @@ from lsa_core import (
 from lsa_pca import load_projections_file
 from kfd_gpu import KFDContext, GPUMemoryBuffer, HSACOKernel
 from moe_kernels import (
+    q4_matmul_vec,
     compute_moe_lod_weights,
     run_moe_experts_stage1_8core,
     run_moe_experts_stage2_8core,
@@ -909,99 +911,6 @@ def unpack_16bytes(
     w2 = masked_23.slice[8]().cast[DType.float32]()
     w3 = masked_23.shift_left[8]().slice[8]().cast[DType.float32]()
 
-
-@always_inline
-def q4_matmul_vec(
-    W_packed: UnsafePointer[UInt8, _],
-    scales: UnsafePointer[Float32, _],
-    x: UnsafePointer[Float32, _],
-    out_ptr: UnsafePointer[Float32, MutExternalOrigin],
-    c_in: Int,
-    c_out: Int,
-    num_tasks: Int,
-):
-    var tasks = num_tasks
-    if c_out <= 256:
-        tasks = 1
-    elif c_out <= 1024:
-        tasks = 2 if tasks >= 2 else 1
-    elif c_out <= 2048:
-        tasks = 4 if tasks >= 4 else tasks
-        
-    if tasks > c_out:
-        tasks = c_out
-    if tasks < 1:
-        tasks = 1
-        
-    var chunk_size = c_out // tasks
-    var c_in_packed = c_in // 2
-    var c_in_blocks = c_in // 32
-
-    # Dual-Space Deinterleaving (1970s Loop-Invariant Permutation):
-    # Permute x ONCE into even (low-nibble) and odd (high-nibble) SIMD[float32, 16] streams
-    # so the inner row loop executes ZERO byte shuffles or emulated variable shifts!
-    var x_deint = alloc[Float32](c_in)
-    var x_even = x_deint
-    var x_odd = x_deint + c_in_packed
-    for b in range(c_in_blocks):
-        var v0 = x.load[16](b * 32)
-        var v1 = x.load[16](b * 32 + 16)
-        x_even.store[16](b * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
-        x_odd.store[16](b * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
-    
-    def worker(t: Int) capturing -> None:
-        var start_r = t * chunk_size
-        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
-        
-        var r = start_r
-        while r < end_r - 1:
-            var acc0 = SIMD[DType.float32, 16](0.0)
-            var acc1 = SIMD[DType.float32, 16](0.0)
-            
-            var r_offset_packed0 = r * c_in_packed
-            var r_offset_scales0 = r * c_in_blocks
-            var r_offset_packed1 = (r + 1) * c_in_packed
-            var r_offset_scales1 = (r + 1) * c_in_blocks
-            
-            for b in range(c_in_blocks):
-                var xe = x_even.load[16](b * 16)
-                var xo = x_odd.load[16](b * 16)
-                
-                # Row 0
-                var scale0 = scales[r_offset_scales0 + b]
-                var bytes0 = W_packed.load[16](r_offset_packed0 + b * 16)
-                var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc0 = acc0 + (we0 * xe + wo0 * xo) * scale0
-                
-                # Row 1
-                var scale1 = scales[r_offset_scales1 + b]
-                var bytes1 = W_packed.load[16](r_offset_packed1 + b * 16)
-                var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc1 = acc1 + (we1 * xe + wo1 * xo) * scale1
-                
-            out_ptr[r] = acc0.reduce_add()
-            out_ptr[r + 1] = acc1.reduce_add()
-            r += 2
-            
-        if r < end_r:
-            var acc = SIMD[DType.float32, 16](0.0)
-            var r_offset_packed = r * c_in_packed
-            var r_offset_scales = r * c_in_blocks
-            for b in range(c_in_blocks):
-                var scale = scales[r_offset_scales + b]
-                var bytes = W_packed.load[16](r_offset_packed + b * 16)
-                var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * scale
-            out_ptr[r] = acc.reduce_add()
-            
-    if tasks == 1:
-        worker(0)
-    else:
-        parallelize[worker](tasks)
-    x_deint.free()
 
 @always_inline
 def gelu_and_mul(h1: UnsafePointer[Float32, _], h2: UnsafePointer[Float32, _], out_ptr: UnsafePointer[Float32, MutExternalOrigin], size: Int):
