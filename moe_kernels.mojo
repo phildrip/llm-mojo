@@ -607,12 +607,10 @@ def run_moe_experts_stage2_8core(
 
 
 @always_inline
-def run_moe_coalesced_core(
+def run_moe_coalesced_stage1(
     sub_b: Int,
     experts_gate_up_packed: UnsafePointer[UInt8, _],
     experts_gate_up_scales: UnsafePointer[Float32, _],
-    experts_down_packed: UnsafePointer[UInt8, _],
-    experts_down_scales: UnsafePointer[Float32, _],
     batch_in_deint: UnsafePointer[Float32, _],
     tok_active_count: UnsafePointer[Int, _],
     tok_active_idx: UnsafePointer[Int, _],
@@ -625,17 +623,13 @@ def run_moe_coalesced_core(
     gu_out_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
     act_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
     act_deint_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
-    batch_moe_out: UnsafePointer[Float32, MutUntrackedOrigin],
     embed_dim: Int = 2816,
     expert_mlp_dim: Int = 704,
     num_experts: Int = 128,
     num_tasks: Int = 8,
-):
-    """
-    Hoare (1961) Bucket-Sorted Coalesced MoE evaluation across 1..5 tokens simultaneously.
-    Uses identical (we * xe + wo * xo) * sc FP32 association to single-token MoE kernels.
-    """
-    debug_assert(sub_b >= 1 and sub_b <= 5, "run_moe_coalesced_core requires 1 <= sub_b <= 5")
+) -> Int:
+    """Coalesced MoE Stage 1: Hoare Bucket-Sort + Gate/Up Q4_0 matmul + GeGLU + Dual-Space Deinterleave."""
+    debug_assert(sub_b >= 1 and sub_b <= 5, "run_moe_coalesced_stage1 requires 1 <= sub_b <= 5")
     var half_in = embed_dim // 2
     var c_in_blocks = embed_dim // 32
     var gate_up_rows = expert_mlp_dim * 2
@@ -850,6 +844,30 @@ def run_moe_coalesced_core(
             var v1 = act_ptr.load[16](blk * 32 + 16)
             ad_e.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
             ad_o.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+    return num_unique
+
+
+@always_inline
+def run_moe_coalesced_stage2(
+    sub_b: Int,
+    num_unique: Int,
+    experts_down_packed: UnsafePointer[UInt8, _],
+    experts_down_scales: UnsafePointer[Float32, _],
+    bucket_counts: UnsafePointer[Int, _],
+    bucket_toks: UnsafePointer[Int, _],
+    bucket_weights: UnsafePointer[Float32, _],
+    unique_experts: UnsafePointer[Int, _],
+    unique_base_slot: UnsafePointer[Int, _],
+    act_deint_scratch: UnsafePointer[Float32, _],
+    batch_moe_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    embed_dim: Int = 2816,
+    expert_mlp_dim: Int = 704,
+    num_tasks: Int = 8,
+):
+    """Coalesced MoE Stage 2: Load each unique expert's down weights ONCE from RAM and accumulate."""
+    var down_half_in = expert_mlp_dim // 2
+    var down_blocks = expert_mlp_dim // 32
+    var tasks = max(1, num_tasks)
 
     # 3. Coalesced Stage 2: Load each unique expert's down weights ONCE from RAM
     def coal_s2(t: Int) capturing -> None:
@@ -1039,3 +1057,68 @@ def run_moe_coalesced_core(
                     batch_moe_out[b_t4 * embed_dim + r] += acc4.reduce_add() * w4
 
     parallelize[coal_s2](tasks)
+
+
+@always_inline
+def run_moe_coalesced_core(
+    sub_b: Int,
+    experts_gate_up_packed: UnsafePointer[UInt8, _],
+    experts_gate_up_scales: UnsafePointer[Float32, _],
+    experts_down_packed: UnsafePointer[UInt8, _],
+    experts_down_scales: UnsafePointer[Float32, _],
+    batch_in_deint: UnsafePointer[Float32, _],
+    tok_active_count: UnsafePointer[Int, _],
+    tok_active_idx: UnsafePointer[Int, _],
+    tok_active_weights: UnsafePointer[Float32, _],
+    bucket_counts: UnsafePointer[Int, MutUntrackedOrigin],
+    bucket_toks: UnsafePointer[Int, MutUntrackedOrigin],
+    bucket_weights: UnsafePointer[Float32, MutUntrackedOrigin],
+    unique_experts: UnsafePointer[Int, MutUntrackedOrigin],
+    unique_base_slot: UnsafePointer[Int, MutUntrackedOrigin],
+    gu_out_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
+    act_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
+    act_deint_scratch: UnsafePointer[Float32, MutUntrackedOrigin],
+    batch_moe_out: UnsafePointer[Float32, MutUntrackedOrigin],
+    embed_dim: Int = 2816,
+    expert_mlp_dim: Int = 704,
+    num_experts: Int = 128,
+    num_tasks: Int = 8,
+):
+    """Hoare (1961) Bucket-Sorted Coalesced MoE evaluation across 1..5 tokens simultaneously."""
+    var num_unique = run_moe_coalesced_stage1(
+        sub_b,
+        experts_gate_up_packed,
+        experts_gate_up_scales,
+        batch_in_deint,
+        tok_active_count,
+        tok_active_idx,
+        tok_active_weights,
+        bucket_counts,
+        bucket_toks,
+        bucket_weights,
+        unique_experts,
+        unique_base_slot,
+        gu_out_scratch,
+        act_scratch,
+        act_deint_scratch,
+        embed_dim,
+        expert_mlp_dim,
+        num_experts,
+        num_tasks,
+    )
+    run_moe_coalesced_stage2(
+        sub_b,
+        num_unique,
+        experts_down_packed,
+        experts_down_scales,
+        bucket_counts,
+        bucket_toks,
+        bucket_weights,
+        unique_experts,
+        unique_base_slot,
+        act_deint_scratch,
+        batch_moe_out,
+        embed_dim,
+        expert_mlp_dim,
+        num_tasks,
+    )

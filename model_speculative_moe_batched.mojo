@@ -28,6 +28,8 @@ from moe_kernels import (
     run_moe_experts_stage1_8core,
     run_moe_experts_stage2_8core,
     run_moe_coalesced_core,
+    run_moe_coalesced_stage1,
+    run_moe_coalesced_stage2,
 )
 import std.time
 
@@ -950,10 +952,9 @@ def get_top_k[k: Int](probs: UnsafePointer[Float32, _], top_idx: UnsafePointer[I
 
 
 @always_inline
-def run_moe_coalesced_subbatch(
+def run_moe_coalesced_subbatch_stage1(
     sub_b: Int,
     x_sub: UnsafePointer[Float32, _],
-    moe_norm_sub: UnsafePointer[Float32, MutExternalOrigin],
     weights: MoELayerWeights,
     r_scale_factor: Float32,
     moe_top_p: Float32,
@@ -964,7 +965,6 @@ def run_moe_coalesced_subbatch(
     top_idx: UnsafePointer[Int, MutExternalOrigin],
     top_val: UnsafePointer[Float32, MutExternalOrigin],
     moe_in: UnsafePointer[Float32, MutExternalOrigin],
-    moe_out: UnsafePointer[Float32, MutExternalOrigin],
     batch_in_deint: UnsafePointer[Float32, MutExternalOrigin],
     tok_active_count: UnsafePointer[Int, MutExternalOrigin],
     tok_active_idx: UnsafePointer[Int, MutExternalOrigin],
@@ -977,14 +977,13 @@ def run_moe_coalesced_subbatch(
     gu_out_scratch: UnsafePointer[Float32, MutExternalOrigin],
     act_scratch: UnsafePointer[Float32, MutExternalOrigin],
     act_deint_scratch: UnsafePointer[Float32, MutExternalOrigin],
-    batch_moe_out: UnsafePointer[Float32, MutExternalOrigin],
     embed_dim: Int = 2816,
     expert_mlp_dim: Int = 704,
     num_experts: Int = 128,
     use_set_cover: Bool = False,
-):
-    """Hoare (1961) Bucket-Sorted Coalesced MoE evaluation across 1..5 tokens simultaneously."""
-    debug_assert(sub_b >= 1 and sub_b <= 5, "run_moe_coalesced_subbatch requires 1 <= sub_b <= 5")
+) -> Int:
+    """Stage 1 of Coalesced MoE across 1..5 tokens: Router + Set-Cover + Hoare Bucket-Sort + Gate/Up + GeGLU."""
+    debug_assert(sub_b >= 1 and sub_b <= 5, "run_moe_coalesced_subbatch_stage1 requires 1 <= sub_b <= 5")
     var half_in = embed_dim // 2
     var c_in_blocks = embed_dim // 32
 
@@ -1083,12 +1082,10 @@ def run_moe_coalesced_subbatch(
     if _keep_top > 1e38:
         tok_active_count[0] += 0
 
-    run_moe_coalesced_core(
+    return run_moe_coalesced_stage1(
         sub_b,
         weights.experts_gate_up_packed,
         weights.experts_gate_up_scales,
-        weights.experts_down_packed,
-        weights.experts_down_scales,
         batch_in_deint,
         tok_active_count,
         tok_active_idx,
@@ -1101,13 +1098,47 @@ def run_moe_coalesced_subbatch(
         gu_out_scratch,
         act_scratch,
         act_deint_scratch,
-        batch_moe_out,
         embed_dim,
         expert_mlp_dim,
         num_experts,
         num_tasks,
     )
 
+
+@always_inline
+def run_moe_coalesced_subbatch_stage2(
+    sub_b: Int,
+    num_unique: Int,
+    moe_norm_sub: UnsafePointer[Float32, MutExternalOrigin],
+    weights: MoELayerWeights,
+    num_tasks: Int,
+    bucket_counts: UnsafePointer[Int, MutExternalOrigin],
+    bucket_toks: UnsafePointer[Int, MutExternalOrigin],
+    bucket_weights: UnsafePointer[Float32, MutExternalOrigin],
+    unique_experts: UnsafePointer[Int, MutExternalOrigin],
+    unique_base_slot: UnsafePointer[Int, MutExternalOrigin],
+    act_deint_scratch: UnsafePointer[Float32, MutExternalOrigin],
+    batch_moe_out: UnsafePointer[Float32, MutExternalOrigin],
+    embed_dim: Int = 2816,
+    expert_mlp_dim: Int = 704,
+):
+    """Stage 2 of Coalesced MoE across 1..5 tokens: Down-Projection + weighted accumulation + post-MoE RMSNorm."""
+    run_moe_coalesced_stage2(
+        sub_b,
+        num_unique,
+        weights.experts_down_packed,
+        weights.experts_down_scales,
+        bucket_counts,
+        bucket_toks,
+        bucket_weights,
+        unique_experts,
+        unique_base_slot,
+        act_deint_scratch,
+        batch_moe_out,
+        embed_dim,
+        expert_mlp_dim,
+        num_tasks,
+    )
     for b in range(sub_b):
         rms_norm(
             batch_moe_out + b * embed_dim,
@@ -1115,6 +1146,55 @@ def run_moe_coalesced_subbatch(
             moe_norm_sub + b * embed_dim,
             embed_dim,
         )
+
+
+@always_inline
+def run_moe_coalesced_subbatch(
+    sub_b: Int,
+    x_sub: UnsafePointer[Float32, _],
+    moe_norm_sub: UnsafePointer[Float32, MutExternalOrigin],
+    weights: MoELayerWeights,
+    r_scale_factor: Float32,
+    moe_top_p: Float32,
+    num_tasks: Int,
+    norm_x: UnsafePointer[Float32, MutExternalOrigin],
+    scaled_norm_x: UnsafePointer[Float32, MutExternalOrigin],
+    scores: UnsafePointer[Float32, MutExternalOrigin],
+    top_idx: UnsafePointer[Int, MutExternalOrigin],
+    top_val: UnsafePointer[Float32, MutExternalOrigin],
+    moe_in: UnsafePointer[Float32, MutExternalOrigin],
+    moe_out: UnsafePointer[Float32, MutExternalOrigin],
+    batch_in_deint: UnsafePointer[Float32, MutExternalOrigin],
+    tok_active_count: UnsafePointer[Int, MutExternalOrigin],
+    tok_active_idx: UnsafePointer[Int, MutExternalOrigin],
+    tok_active_weights: UnsafePointer[Float32, MutExternalOrigin],
+    bucket_counts: UnsafePointer[Int, MutExternalOrigin],
+    bucket_toks: UnsafePointer[Int, MutExternalOrigin],
+    bucket_weights: UnsafePointer[Float32, MutExternalOrigin],
+    unique_experts: UnsafePointer[Int, MutExternalOrigin],
+    unique_base_slot: UnsafePointer[Int, MutExternalOrigin],
+    gu_out_scratch: UnsafePointer[Float32, MutExternalOrigin],
+    act_scratch: UnsafePointer[Float32, MutExternalOrigin],
+    act_deint_scratch: UnsafePointer[Float32, MutExternalOrigin],
+    batch_moe_out: UnsafePointer[Float32, MutExternalOrigin],
+    embed_dim: Int = 2816,
+    expert_mlp_dim: Int = 704,
+    num_experts: Int = 128,
+    use_set_cover: Bool = False,
+):
+    var num_unique = run_moe_coalesced_subbatch_stage1(
+        sub_b, x_sub, weights, r_scale_factor, moe_top_p, num_tasks,
+        norm_x, scaled_norm_x, scores, top_idx, top_val, moe_in,
+        batch_in_deint, tok_active_count, tok_active_idx, tok_active_weights,
+        bucket_counts, bucket_toks, bucket_weights, unique_experts, unique_base_slot,
+        gu_out_scratch, act_scratch, act_deint_scratch,
+        embed_dim, expert_mlp_dim, num_experts, use_set_cover,
+    )
+    run_moe_coalesced_subbatch_stage2(
+        sub_b, num_unique, moe_norm_sub, weights, num_tasks,
+        bucket_counts, bucket_toks, bucket_weights, unique_experts, unique_base_slot,
+        act_deint_scratch, batch_moe_out, embed_dim, expert_mlp_dim,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -2644,11 +2724,9 @@ def main() raises:
                                 )
                                 b_off += sub_b
 
-                            # Wait for iGPU w_gate & w_up, apply GeLU, and dispatch batched w_down on iGPU!
                             gpu_ctx.wait_matmul(slot_gate, pref_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=chunk_b)
                             gpu_ctx.wait_matmul(slot_up, pref_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=chunk_b)
                             gelu_and_mul(pref_h1, pref_h2, pref_gate, chunk_b * CONFIG.standard_mlp_dim)
-
                             var slot_down = gpu_ctx.enqueue_matmul(
                                 weights.w_down_packed.__int__(),
                                 weights.w_down_scales.__int__(),
@@ -3107,11 +3185,11 @@ def main() raises:
                                 )
                                 gpu_ctx.ring_doorbell()
 
-                            # Coalesced Hoare Bucket-Sorted MoE across all 5 verification tokens!
-                            run_moe_coalesced_subbatch(
+                            # Two-Phase FFN/MoE Split Overlap (llm-mojo-xr6.3):
+                            # Stage A: CPU runs Coalesced MoE Stage 1 while iGPU runs w_gate + w_up!
+                            var num_unique = run_moe_coalesced_subbatch_stage1(
                                 verify_b,
                                 pref_x,
-                                pref_moe_out_norm,
                                 weights,
                                 r_scale_factor,
                                 moe_top_p,
@@ -3122,7 +3200,6 @@ def main() raises:
                                 top_idx,
                                 top_val,
                                 moe_in,
-                                moe_out,
                                 coal_batch_in_deint,
                                 coal_tok_active_count,
                                 coal_tok_active_idx,
@@ -3135,7 +3212,6 @@ def main() raises:
                                 coal_gu_out_scratch,
                                 coal_act_scratch,
                                 coal_act_deint_scratch,
-                                coal_batch_moe_out,
                                 CONFIG.embed_dim,
                                 CONFIG.expert_mlp_dim,
                                 CONFIG.num_experts,
@@ -3143,26 +3219,57 @@ def main() raises:
                             )
 
                             if use_gpu:
+                                # Midpoint Sync: Wait for w_gate + w_up, run GeGLU, and immediately dispatch w_down on iGPU!
                                 gpu_ctx.wait_matmul(slot_gate, pref_h1.__int__(), CONFIG.standard_mlp_dim, batch_size=verify_b)
                                 gpu_ctx.wait_matmul(slot_up, pref_h2.__int__(), CONFIG.standard_mlp_dim, batch_size=verify_b)
                                 gelu_and_mul(pref_h1, pref_h2, pref_gate, verify_b * CONFIG.standard_mlp_dim)
-                                if verify_b == 5:
-                                    q4_matmul_batch5(weights.w_down_packed, weights.w_down_scales, pref_gate, pref_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-                                else:
-                                    var slot_down = gpu_ctx.enqueue_matmul(
-                                        weights.w_down_packed.__int__(),
-                                        weights.w_down_scales.__int__(),
-                                        pref_gate.__int__(),
-                                        pref_mlp_out.__int__(),
-                                        CONFIG.standard_mlp_dim,
-                                        CONFIG.embed_dim,
-                                        batch_size=verify_b,
-                                        flush_cache=True,
-                                        barrier=False,
-                                        ring_doorbell_now=True,
-                                    )
-                                    gpu_ctx.wait_matmul(slot_down, pref_mlp_out.__int__(), CONFIG.embed_dim, batch_size=verify_b)
+                                var slot_down = gpu_ctx.enqueue_matmul(
+                                    weights.w_down_packed.__int__(),
+                                    weights.w_down_scales.__int__(),
+                                    pref_gate.__int__(),
+                                    pref_mlp_out.__int__(),
+                                    CONFIG.standard_mlp_dim,
+                                    CONFIG.embed_dim,
+                                    batch_size=verify_b,
+                                    flush_cache=True,
+                                    barrier=False,
+                                    ring_doorbell_now=True,
+                                )
+                                # Stage B: CPU runs Coalesced MoE Stage 2 concurrently with iGPU 5-token w_down!
+                                run_moe_coalesced_subbatch_stage2(
+                                    verify_b,
+                                    num_unique,
+                                    pref_moe_out_norm,
+                                    weights,
+                                    num_tasks,
+                                    coal_bucket_counts,
+                                    coal_bucket_toks,
+                                    coal_bucket_weights,
+                                    coal_unique_experts,
+                                    coal_unique_base_slot,
+                                    coal_act_deint_scratch,
+                                    coal_batch_moe_out,
+                                    CONFIG.embed_dim,
+                                    CONFIG.expert_mlp_dim,
+                                )
+                                gpu_ctx.wait_matmul(slot_down, pref_mlp_out.__int__(), CONFIG.embed_dim, batch_size=verify_b)
                             else:
+                                run_moe_coalesced_subbatch_stage2(
+                                    verify_b,
+                                    num_unique,
+                                    pref_moe_out_norm,
+                                    weights,
+                                    num_tasks,
+                                    coal_bucket_counts,
+                                    coal_bucket_toks,
+                                    coal_bucket_weights,
+                                    coal_unique_experts,
+                                    coal_unique_base_slot,
+                                    coal_act_deint_scratch,
+                                    coal_batch_moe_out,
+                                    CONFIG.embed_dim,
+                                    CONFIG.expert_mlp_dim,
+                                )
                                 if verify_b == 5:
                                     q4_matmul_batch5(weights.w_gate_packed, weights.w_gate_scales, pref_norm_x, pref_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
                                     q4_matmul_batch5(weights.w_up_packed, weights.w_up_scales, pref_norm_x, pref_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
