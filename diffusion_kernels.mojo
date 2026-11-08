@@ -2535,6 +2535,100 @@ def adacache_filter_after_layer1(
     return write_idx
 
 
+# ==============================================================================
+# 8. Block-Diffusion Canvas Mode (BD3-LM / Fast-dLLM v2) & 2nd-Order Latent
+#    Velocity Extrapolation (llm-mojo-2tc.6)
+# ==============================================================================
+
+
+@always_inline
+def build_block_active_canvas_map(
+    locked_mask: UnsafePointer[Bool, _],
+    active_canvas_idx: UnsafePointer[Int, MutAnyOrigin],
+    block_start: Int,
+    block_end: Int,
+) -> Int:
+    """Builds the active canvas index map `active_canvas_idx[0..active_len-1]` restricted
+    to unlocked positions within the semi-autoregressive block `[block_start, block_end)`."""
+    var active_len = 0
+    for t in range(block_start, block_end):
+        if not locked_mask[t]:
+            active_canvas_idx[active_len] = t
+            active_len += 1
+    return active_len
+
+
+@always_inline
+def extrapolate_sc_velocity_batch(
+    sc_embeds: UnsafePointer[Float32, MutAnyOrigin],
+    prev_sc_embeds: UnsafePointer[Float32, MutAnyOrigin],
+    locked_mask: UnsafePointer[Bool, _],
+    block_start: Int,
+    block_end: Int,
+    embed_dim: Int,
+    steps_executed: Int,
+    skip_amount: Int,
+    max_vel_ratio: Float32 = 0.85,
+):
+    """Applies 2nd-order Adams-Bashforth latent velocity extrapolation on `sc_embeds`:
+        `s_extrap = normalize_norm(s_curr + beta * (s_curr - s_prev))`
+    with a discontinuous-flip trust-region guard (`||s_curr - s_prev||_2 <= max_vel_ratio * ||s_curr||_2`)
+    and exact L2 norm conservation (`||s_extrap||_2 == ||s_curr||_2`)."""
+    if steps_executed <= 1:
+        for t in range(block_start, block_end):
+            var s_ptr = sc_embeds + t * embed_dim
+            var p_ptr = prev_sc_embeds + t * embed_dim
+            for i in range(0, embed_dim, 8):
+                p_ptr.store[8](i, s_ptr.load[8](i))
+        return
+
+    var beta = Float32(0.12) * Float32(skip_amount)
+    if beta > Float32(0.35):
+        beta = Float32(0.35)
+    var max_vel_sq = max_vel_ratio * max_vel_ratio
+    var beta_vec = SIMD[DType.float32, 8](beta)
+
+    for t in range(block_start, block_end):
+        var s_ptr = sc_embeds + t * embed_dim
+        var p_ptr = prev_sc_embeds + t * embed_dim
+        if locked_mask[t] or beta <= Float32(0.0):
+            for i in range(0, embed_dim, 8):
+                p_ptr.store[8](i, s_ptr.load[8](i))
+            continue
+
+        var norm_s_sq_vec = SIMD[DType.float32, 8](0.0)
+        var norm_v_sq_vec = SIMD[DType.float32, 8](0.0)
+        for i in range(0, embed_dim, 8):
+            var s_v = s_ptr.load[8](i)
+            var p_v = p_ptr.load[8](i)
+            var v_v = s_v - p_v
+            norm_s_sq_vec = s_v.fma(s_v, norm_s_sq_vec)
+            norm_v_sq_vec = v_v.fma(v_v, norm_v_sq_vec)
+
+        var norm_s_sq = norm_s_sq_vec.reduce_add()
+        var norm_v_sq = norm_v_sq_vec.reduce_add()
+
+        if norm_s_sq > Float32(1e-8) and norm_v_sq <= max_vel_sq * norm_s_sq:
+            var norm_ext_sq_vec = SIMD[DType.float32, 8](0.0)
+            for i in range(0, embed_dim, 8):
+                var s_v = s_ptr.load[8](i)
+                var p_v = p_ptr.load[8](i)
+                var ext_v = s_v + beta_vec * (s_v - p_v)
+                norm_ext_sq_vec = ext_v.fma(ext_v, norm_ext_sq_vec)
+            var rescale = sqrt(norm_s_sq / (norm_ext_sq_vec.reduce_add() + Float32(1e-10)))
+            var rescale_vec = SIMD[DType.float32, 8](rescale)
+            for i in range(0, embed_dim, 8):
+                var s_v = s_ptr.load[8](i)
+                var p_v = p_ptr.load[8](i)
+                var ext_v = (s_v + beta_vec * (s_v - p_v)) * rescale_vec
+                p_ptr.store[8](i, s_v)
+                s_ptr.store[8](i, ext_v)
+        else:
+            for i in range(0, embed_dim, 8):
+                p_ptr.store[8](i, s_ptr.load[8](i))
+
+
+
 
 
 

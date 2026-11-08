@@ -27,6 +27,8 @@ from diffusion_kernels import (
     prep_qkv_norm_rope_kvq_batch,
     flash_dllm_bidirectional_attn,
     adacache_filter_after_layer1,
+    build_block_active_canvas_map,
+    extrapolate_sc_velocity_batch,
 )
 import std.time
 
@@ -1027,6 +1029,8 @@ def main() raises:
     var use_gpu = True
     var bench_mode = False
     var bench_steps = 2
+    var block_size = 256
+    var bench_single_block = False
     var cmd_args = std.sys.argv()
     for idx in range(1, len(cmd_args)):
         if cmd_args[idx] == "--cpu":
@@ -1037,6 +1041,13 @@ def main() raises:
         elif cmd_args[idx] == "--bench4":
             bench_mode = True
             bench_steps = 4
+        elif cmd_args[idx] == "--block64":
+            block_size = 64
+        elif cmd_args[idx] == "--bench-block":
+            bench_mode = True
+            bench_steps = 4
+            block_size = 64
+            bench_single_block = True
 
     var num_tasks = num_physical_cores()
     print("=========================================================")
@@ -1372,6 +1383,8 @@ def main() raises:
     # AdaCache + dLLM-Cache per-token partial canvas update buffers (llm-mojo-2tc.8)
     var adacache_h1_prev = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
     var adacache_skip_streak = alloc[Int](CANVAS_LEN)
+    # 2nd-Order Latent Velocity Extrapolation buffer (llm-mojo-2tc.6)
+    var prev_sc_embeds = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
 
     print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
           (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
@@ -1689,6 +1702,7 @@ def main() raises:
             canvas_tokens[t] = Int(rnd_u64 % UInt64(CONFIG.vocab_size))
         for i in range(CANVAS_LEN * CONFIG.embed_dim):
             sc_embeds[i] = 0.0
+            prev_sc_embeds[i] = 0.0
 
         # --- Sampler state ---
         var denoise_step: Int = 0
@@ -1696,11 +1710,15 @@ def main() raises:
         var hist_len: Int = 0
         var prev_mean_ent: Float32 = 0.0
         var steps_executed: Int = 0
-        var max_steps_this_turn = bench_steps if bench_mode else MAX_DENOISE_STEPS
+        var num_blocks = (CANVAS_LEN + block_size - 1) // block_size
+        var blocks_to_run = 1 if bench_single_block else num_blocks
+        var max_steps_this_turn = bench_steps if bench_mode else (MAX_DENOISE_STEPS // num_blocks)
+        var blk_idx: Int = 0
+        var block_steps_executed: Int = 0
 
         t_decode_start = std.time.perf_counter()
 
-        # --- Denoise loop ---
+        # --- Denoise loop (supports Monolithic 256-token or Semi-Autoregressive 64-token Block-Diffusion) ---
         var t_max: Float32 = 0.8
         var t_min: Float32 = 0.4
         var entropy_bound: Float32 = 0.1
@@ -1708,19 +1726,36 @@ def main() raises:
         for t in range(CANVAS_LEN):
             locked_mask[t] = False
             adacache_skip_streak[t] = 0
+            token_entropy[t] = 10.4
+            argmax_tokens[t] = canvas_tokens[t]
+            new_tokens[t] = canvas_tokens[t]
         var full_steps_count = 0
         var consec_skips = 0
         teacache_accum[0] = 0.0
 
-        while denoise_step < max_steps_this_turn:
-            var active_len = build_active_canvas_map(locked_mask, active_canvas_idx, CANVAS_LEN)
+        while blk_idx < blocks_to_run:
+            var block_start = blk_idx * block_size
+            var block_end = block_start + block_size if block_start + block_size <= CANVAS_LEN else CANVAS_LEN
+            if block_steps_executed == 0:
+                full_steps_count = 0
+                consec_skips = 0
+                hist_len = 0
+                prev_mean_ent = 0.0
+                teacache_accum[0] = 0.0
+                for t in range(block_start, block_end):
+                    adacache_skip_streak[t] = 0
+            var active_len = build_block_active_canvas_map(locked_mask, active_canvas_idx, block_start, block_end)
             if active_len == 0:
-                print("  [denoise ", denoise_step, "] all 256 tokens locked — early exit!")
-                break
+                print("  [block ", blk_idx, " denoise ", denoise_step, "] all block tokens locked — early exit!")
+                blk_idx += 1
+                denoise_step = 0
+                block_steps_executed = 0
+                continue
             var active_top_k = compute_moe_lod_k(denoise_step, prev_mean_ent)
             var moe_top_p = compute_moe_lod_top_p(denoise_step, prev_mean_ent)
-            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", CANVAS_LEN, " moe_lod_k=", active_top_k)
+            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", block_end - block_start, " moe_lod_k=", active_top_k)
             steps_executed += 1
+            block_steps_executed += 1
 
             # Temperature schedule (computed up front for TeaCache polynomial modulation & Sampler)
             var remaining = MAX_DENOISE_STEPS - denoise_step
@@ -1769,7 +1804,7 @@ def main() raises:
                 var kv_stride = layer_kv_heads * layer_head_dim
                 var ratio = layer_heads // layer_kv_heads
                 var layer_cache_offset = kv_cache_offsets[l]
-                var seq_len = num_prompt_tokens + CANVAS_LEN
+                var seq_len = num_prompt_tokens + block_end
                 var q_size = layer_heads * layer_head_dim
 
                 var tl_qkv = std.time.perf_counter()
@@ -2297,19 +2332,31 @@ def main() raises:
             prev_mean_ent = mean_ent
 
             # Update argmax_canvas
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 argmax_canvas[t] = argmax_tokens[t]
 
-            # If converged: snap canvas to argmax and break
-            if converged:
-                for t in range(CANVAS_LEN):
-                    canvas_tokens[t] = argmax_canvas[t]
-                break
-
-            # Zero out sc_embeds for positions that will commit (none in denoise-only mode)
-            # All positions continue denoising, so sc_embeds stays
+            # 2nd-Order Latent Velocity Extrapolation on sc_embeds (llm-mojo-2tc.6)
+            extrapolate_sc_velocity_batch(
+                sc_embeds,
+                prev_sc_embeds,
+                locked_mask,
+                block_start,
+                block_end,
+                CONFIG.embed_dim,
+                block_steps_executed,
+                skip_amount,
+            )
 
             denoise_step += skip_amount
+
+            # If block converged or reached max_steps_this_turn: lock block tokens and advance to next block
+            if converged or denoise_step >= max_steps_this_turn:
+                for t in range(block_start, block_end):
+                    canvas_tokens[t] = argmax_canvas[t]
+                    locked_mask[t] = True
+                blk_idx += 1
+                denoise_step = 0
+                block_steps_executed = 0
 
         var t_end = std.time.perf_counter()
         var denoise_duration = t_end - t_decode_start
@@ -2427,4 +2474,5 @@ def main() raises:
     teacache_accum.free()
     adacache_h1_prev.free()
     adacache_skip_streak.free()
+    prev_sc_embeds.free()
     gpu_ctx.close()
