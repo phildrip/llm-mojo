@@ -49,6 +49,684 @@ def rms_norm_noscale[
 
 
 @always_inline
+def deinterleave_batch_to_f32[
+    in_type: DType = DType.float16
+](
+    src: UnsafePointer[Scalar[in_type], _],
+    dst_deint: UnsafePointer[Float32, MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    in_stride: Int = -1,
+):
+    """Converts [B, c_in] activations (Float16 or Float32) into Dual-Space Deinterleaved Float32 layout
+    where each 32-element block is stored as [16 even floats, 16 odd floats]."""
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var c_in_blocks = c_in // 32
+    for b in range(B):
+        var src_b = src + b * x_stride
+        var dst_b = dst_deint + b * c_in
+        for blk in range(c_in_blocks):
+            var v0 = src_b.load[16](blk * 32).cast[DType.float32]()
+            var v1 = src_b.load[16](blk * 32 + 16).cast[DType.float32]()
+            var ev = v0.deinterleave()[0].join(v1.deinterleave()[0])
+            var od = v0.deinterleave()[1].join(v1.deinterleave()[1])
+            dst_b.store[16](blk * 32, ev)
+            dst_b.store[16](blk * 32 + 16, od)
+
+
+@always_inline
+def gelu_and_mul_to_deinterleaved_f32[
+    in_type: DType = DType.float32
+](
+    gate_up: UnsafePointer[Scalar[in_type], _],
+    dst_deint: UnsafePointer[Float32, MutAnyOrigin],
+    B: Int,
+    dim: Int,
+):
+    """Computes GeGLU on [B, 2*dim] (gate = [0..dim-1], up = [dim..2*dim-1]) and writes
+    directly into Dual-Space Deinterleaved Float32 [B, dim] in a single pass."""
+    var num_blocks = dim // 32
+    for b in range(B):
+        var g_ptr = gate_up + b * (dim * 2)
+        var u_ptr = g_ptr + dim
+        var d_ptr = dst_deint + b * dim
+        for blk in range(num_blocks):
+            var off = blk * 32
+            var g0 = g_ptr.load[16](off).cast[DType.float32]()
+            var u0 = u_ptr.load[16](off).cast[DType.float32]()
+            var sig0 = 1.0 / (1.0 + exp(SIMD[DType.float32, 16](-1.702) * g0))
+            var act0 = g0 * sig0 * u0
+
+            var g1 = g_ptr.load[16](off + 16).cast[DType.float32]()
+            var u1 = u_ptr.load[16](off + 16).cast[DType.float32]()
+            var sig1 = 1.0 / (1.0 + exp(SIMD[DType.float32, 16](-1.702) * g1))
+            var act1 = g1 * sig1 * u1
+
+            d_ptr.store[16](off, act0.deinterleave()[0].join(act1.deinterleave()[0]))
+            d_ptr.store[16](off + 16, act0.deinterleave()[1].join(act1.deinterleave()[1]))
+
+
+@always_inline
+def q4_moe_expert_single_thread(
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X_deint: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    w_deint_scratch: UnsafePointer[Float32, MutAnyOrigin],
+):
+    """Single-thread L1-resident Dual-Space Deinterleaved Q4 GEMM for one MoE expert.
+    Uses SIMD[DType.float32, 8] (1 YMM register per accumulator) with 2-row x 4-token
+    register blocking (8 acc + 2 weight + 4 input = 14 YMM registers, zero spills!)."""
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+    var w_deint0 = w_deint_scratch
+    var w_deint1 = w_deint_scratch + c_in
+
+    var r = 0
+    while r + 1 < c_out:
+        var rp0 = r * c_in_packed
+        var rs0 = r * c_in_blocks
+        var rp1 = (r + 1) * c_in_packed
+        var rs1 = (r + 1) * c_in_blocks
+
+        if B <= 4:
+            # Direct in-register deinterleaved unpacking without L1 scratch roundtrip
+            var a0_0 = SIMD[DType.float32, 8](0.0)
+            var a0_1 = SIMD[DType.float32, 8](0.0)
+            var a0_2 = SIMD[DType.float32, 8](0.0)
+            var a0_3 = SIMD[DType.float32, 8](0.0)
+            var a1_0 = SIMD[DType.float32, 8](0.0)
+            var a1_1 = SIMD[DType.float32, 8](0.0)
+            var a1_2 = SIMD[DType.float32, 8](0.0)
+            var a1_3 = SIMD[DType.float32, 8](0.0)
+
+            for blk in range(c_in_blocks):
+                var sc0 = scales[rs0 + blk]
+                var sc1 = scales[rs1 + blk]
+                var x_off = blk * 32
+
+                # Sub-block 0 (first 8 bytes = 8 even + 8 odd)
+                var b0_lo = W_packed.load[8](rp0 + blk * 16)
+                var we0 = ((b0_lo & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                var wo0 = ((b0_lo >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+
+                var b1_lo = W_packed.load[8](rp1 + blk * 16)
+                var we1 = ((b1_lo & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                var wo1 = ((b1_lo >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+
+                var xe0 = X_deint.load[8](0 * c_in + x_off)
+                var xo0 = X_deint.load[8](0 * c_in + x_off + 16)
+                a0_0 = we0.fma(xe0, wo0.fma(xo0, a0_0))
+                a1_0 = we1.fma(xe0, wo1.fma(xo0, a1_0))
+                if B > 1:
+                    var xe1 = X_deint.load[8](1 * c_in + x_off)
+                    var xo1 = X_deint.load[8](1 * c_in + x_off + 16)
+                    a0_1 = we0.fma(xe1, wo0.fma(xo1, a0_1))
+                    a1_1 = we1.fma(xe1, wo1.fma(xo1, a1_1))
+                if B > 2:
+                    var xe2 = X_deint.load[8](2 * c_in + x_off)
+                    var xo2 = X_deint.load[8](2 * c_in + x_off + 16)
+                    a0_2 = we0.fma(xe2, wo0.fma(xo2, a0_2))
+                    a1_2 = we1.fma(xe2, wo1.fma(xo2, a1_2))
+                if B > 3:
+                    var xe3 = X_deint.load[8](3 * c_in + x_off)
+                    var xo3 = X_deint.load[8](3 * c_in + x_off + 16)
+                    a0_3 = we0.fma(xe3, wo0.fma(xo3, a0_3))
+                    a1_3 = we1.fma(xe3, wo1.fma(xo3, a1_3))
+
+                # Sub-block 1 (second 8 bytes = 8 even + 8 odd)
+                var b0_hi = W_packed.load[8](rp0 + blk * 16 + 8)
+                we0 = ((b0_hi & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                wo0 = ((b0_hi >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+
+                var b1_hi = W_packed.load[8](rp1 + blk * 16 + 8)
+                we1 = ((b1_hi & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                wo1 = ((b1_hi >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+
+                xe0 = X_deint.load[8](0 * c_in + x_off + 8)
+                xo0 = X_deint.load[8](0 * c_in + x_off + 24)
+                a0_0 = we0.fma(xe0, wo0.fma(xo0, a0_0))
+                a1_0 = we1.fma(xe0, wo1.fma(xo0, a1_0))
+                if B > 1:
+                    var xe1 = X_deint.load[8](1 * c_in + x_off + 8)
+                    var xo1 = X_deint.load[8](1 * c_in + x_off + 24)
+                    a0_1 = we0.fma(xe1, wo0.fma(xo1, a0_1))
+                    a1_1 = we1.fma(xe1, wo1.fma(xo1, a1_1))
+                if B > 2:
+                    var xe2 = X_deint.load[8](2 * c_in + x_off + 8)
+                    var xo2 = X_deint.load[8](2 * c_in + x_off + 24)
+                    a0_2 = we0.fma(xe2, wo0.fma(xo2, a0_2))
+                    a1_2 = we1.fma(xe2, wo1.fma(xo2, a1_2))
+                if B > 3:
+                    var xe3 = X_deint.load[8](3 * c_in + x_off + 8)
+                    var xo3 = X_deint.load[8](3 * c_in + x_off + 24)
+                    a0_3 = we0.fma(xe3, wo0.fma(xo3, a0_3))
+                    a1_3 = we1.fma(xe3, wo1.fma(xo3, a1_3))
+
+            out_ptr[0 * c_out + r] = a0_0.reduce_add()
+            out_ptr[0 * c_out + r + 1] = a1_0.reduce_add()
+            if B > 1:
+                out_ptr[1 * c_out + r] = a0_1.reduce_add()
+                out_ptr[1 * c_out + r + 1] = a1_1.reduce_add()
+            if B > 2:
+                out_ptr[2 * c_out + r] = a0_2.reduce_add()
+                out_ptr[2 * c_out + r + 1] = a1_2.reduce_add()
+            if B > 3:
+                out_ptr[3 * c_out + r] = a0_3.reduce_add()
+                out_ptr[3 * c_out + r + 1] = a1_3.reduce_add()
+        else:
+            # Unpack 2 rows into L1 scratch once, then 2x4 SIMD8 FMA (14 YMM regs, 0 spills!)
+            for blk in range(c_in_blocks):
+                var sc0 = scales[rs0 + blk]
+                var b0 = W_packed.load[16](rp0 + blk * 16)
+                w_deint0.store[16](blk * 32, ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+                w_deint0.store[16](blk * 32 + 16, ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+
+                var sc1 = scales[rs1 + blk]
+                var b1 = W_packed.load[16](rp1 + blk * 16)
+                w_deint1.store[16](blk * 32, ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+                w_deint1.store[16](blk * 32 + 16, ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+
+            var b = 0
+            while b + 3 < B:
+                var a0_0 = SIMD[DType.float32, 8](0.0)
+                var a0_1 = SIMD[DType.float32, 8](0.0)
+                var a0_2 = SIMD[DType.float32, 8](0.0)
+                var a0_3 = SIMD[DType.float32, 8](0.0)
+                var a1_0 = SIMD[DType.float32, 8](0.0)
+                var a1_1 = SIMD[DType.float32, 8](0.0)
+                var a1_2 = SIMD[DType.float32, 8](0.0)
+                var a1_3 = SIMD[DType.float32, 8](0.0)
+                var xb0 = (b + 0) * c_in
+                var xb1 = (b + 1) * c_in
+                var xb2 = (b + 2) * c_in
+                var xb3 = (b + 3) * c_in
+                for k in range(0, c_in, 8):
+                    var w0 = w_deint0.load[8](k)
+                    var w1 = w_deint1.load[8](k)
+                    var x0 = X_deint.load[8](xb0 + k)
+                    var x1 = X_deint.load[8](xb1 + k)
+                    var x2 = X_deint.load[8](xb2 + k)
+                    var x3 = X_deint.load[8](xb3 + k)
+                    a0_0 = w0.fma(x0, a0_0)
+                    a0_1 = w0.fma(x1, a0_1)
+                    a0_2 = w0.fma(x2, a0_2)
+                    a0_3 = w0.fma(x3, a0_3)
+                    a1_0 = w1.fma(x0, a1_0)
+                    a1_1 = w1.fma(x1, a1_1)
+                    a1_2 = w1.fma(x2, a1_2)
+                    a1_3 = w1.fma(x3, a1_3)
+                out_ptr[(b + 0) * c_out + r] = a0_0.reduce_add()
+                out_ptr[(b + 1) * c_out + r] = a0_1.reduce_add()
+                out_ptr[(b + 2) * c_out + r] = a0_2.reduce_add()
+                out_ptr[(b + 3) * c_out + r] = a0_3.reduce_add()
+                out_ptr[(b + 0) * c_out + r + 1] = a1_0.reduce_add()
+                out_ptr[(b + 1) * c_out + r + 1] = a1_1.reduce_add()
+                out_ptr[(b + 2) * c_out + r + 1] = a1_2.reduce_add()
+                out_ptr[(b + 3) * c_out + r + 1] = a1_3.reduce_add()
+                b += 4
+            while b < B:
+                var a0 = SIMD[DType.float32, 8](0.0)
+                var a1 = SIMD[DType.float32, 8](0.0)
+                var xb = b * c_in
+                for k in range(0, c_in, 8):
+                    var x0 = X_deint.load[8](xb + k)
+                    a0 = w_deint0.load[8](k).fma(x0, a0)
+                    a1 = w_deint1.load[8](k).fma(x0, a1)
+                out_ptr[b * c_out + r] = a0.reduce_add()
+                out_ptr[b * c_out + r + 1] = a1.reduce_add()
+                b += 1
+        r += 2
+
+
+def run_diffusion_moe_experts_parallel(
+    experts_gate_up_packed: UnsafePointer[UInt8, _],
+    experts_gate_up_scales: UnsafePointer[Float32, _],
+    experts_down_packed: UnsafePointer[UInt8, _],
+    experts_down_scales: UnsafePointer[Float32, _],
+    canvas_moe_in: UnsafePointer[Float16, _],
+    canvas_top_idx: UnsafePointer[Int, _],
+    canvas_top_weights: UnsafePointer[Float32, _],
+    canvas_moe_out: UnsafePointer[Float16, MutAnyOrigin],
+    B: Int,
+    embed_dim: Int,
+    expert_mlp_dim: Int,
+    top_k_experts: Int,
+    num_tasks: Int,
+    prealloc_deint_x: UnsafePointer[Float32, MutAnyOrigin],
+    prealloc_work_buf: UnsafePointer[Float32, MutAnyOrigin],
+    prealloc_down_out: UnsafePointer[Float32, MutAnyOrigin],
+):
+    """Expert-parallel Dual-Space Deinterleaved MoE execution for diffusion canvas.
+    Replaces 256 per-expert thread-pool barriers and single-threaded gather/GeGLU/scatter
+    with a single parallel dispatch across experts + parallel token accumulation.
+    Uses caller-provided pre-allocated buffers for zero heap allocations (PASID safety)."""
+    var expert_counts = InlineArray[Int, 128](uninitialized=True)
+    for e in range(128):
+        expert_counts[e] = 0
+
+    for t in range(B):
+        var top_w = canvas_top_weights + t * top_k_experts
+        var top_i = canvas_top_idx + t * top_k_experts
+        for s in range(top_k_experts):
+            if top_w[s] > 0.0:
+                expert_counts[top_i[s]] += 1
+
+    var expert_offsets = InlineArray[Int, 128](uninitialized=True)
+    var write_offsets = InlineArray[Int, 128](uninitialized=True)
+    var active_experts = InlineArray[Int, 128](uninitialized=True)
+    var num_active_experts = 0
+    var total_assignments = 0
+    for e in range(128):
+        expert_offsets[e] = total_assignments
+        write_offsets[e] = total_assignments
+        var cnt = expert_counts[e]
+        if cnt > 0:
+            active_experts[num_active_experts] = e
+            num_active_experts += 1
+            total_assignments += cnt
+
+    var assignments_t = InlineArray[Int, 2048](uninitialized=True)
+    var assignments_slot = InlineArray[Int, 2048](uninitialized=True)
+    for i in range(B * top_k_experts):
+        assignments_slot[i] = -1
+
+    for t in range(B):
+        var top_w = canvas_top_weights + t * top_k_experts
+        var top_i = canvas_top_idx + t * top_k_experts
+        for s in range(top_k_experts):
+            if top_w[s] > 0.0:
+                var e = top_i[s]
+                var wp = write_offsets[e]
+                assignments_t[wp] = t
+                assignments_slot[t * top_k_experts + s] = wp
+                write_offsets[e] = wp + 1
+
+    # 1. Pre-deinterleave all B token inputs in Float32 once
+    var canvas_in_deint = prealloc_deint_x
+    deinterleave_batch_to_f32[DType.float16](canvas_moe_in, canvas_in_deint, B, embed_dim)
+
+    # 2. Flat output buffer for all active assignments [total_assignments, embed_dim]
+    var all_down_out = prealloc_down_out
+
+    var gate_up_dim = expert_mlp_dim * 2
+    var gu_packed_stride = gate_up_dim * embed_dim // 2
+    var gu_scales_stride = gate_up_dim * embed_dim // 32
+    var dn_packed_stride = embed_dim * expert_mlp_dim // 2
+    var dn_scales_stride = embed_dim * expert_mlp_dim // 32
+
+    var tasks = num_tasks
+    if tasks > num_active_experts:
+        tasks = num_active_experts
+    if tasks < 1:
+        tasks = 1
+
+    var work_stride = B * embed_dim + B * gate_up_dim + B * expert_mlp_dim + embed_dim * 2
+    var work_base = prealloc_work_buf
+
+    def expert_worker(worker_id: Int) capturing -> None:
+        var w_base = work_base + worker_id * work_stride
+        var local_x = w_base
+        var local_gu = local_x + B * embed_dim
+        var local_act_deint = local_gu + B * gate_up_dim
+        var local_w_scratch = local_act_deint + B * expert_mlp_dim
+
+        # Interleaved stride scheduling across active experts for load balance
+        var idx = worker_id
+        while idx < num_active_experts:
+            var e = active_experts[idx]
+            var cnt = expert_counts[e]
+            var off = expert_offsets[e]
+
+            # Gather deinterleaved inputs for expert e
+            for i in range(cnt):
+                var t = assignments_t[off + i]
+                var src = canvas_in_deint + t * embed_dim
+                var dst = local_x + i * embed_dim
+                for j in range(0, embed_dim, 8):
+                    dst.store[8](j, src.load[8](j))
+
+            # Gate + Up projection
+            q4_moe_expert_single_thread(
+                experts_gate_up_packed + e * gu_packed_stride,
+                experts_gate_up_scales + e * gu_scales_stride,
+                local_x,
+                local_gu,
+                cnt,
+                embed_dim,
+                gate_up_dim,
+                local_w_scratch,
+            )
+
+            # Fused GeGLU + deinterleave
+            gelu_and_mul_to_deinterleaved_f32[DType.float32](
+                local_gu,
+                local_act_deint,
+                cnt,
+                expert_mlp_dim,
+            )
+
+            # Down projection directly into all_down_out[off .. off + cnt]
+            q4_moe_expert_single_thread(
+                experts_down_packed + e * dn_packed_stride,
+                experts_down_scales + e * dn_scales_stride,
+                local_act_deint,
+                all_down_out + off * embed_dim,
+                cnt,
+                expert_mlp_dim,
+                embed_dim,
+                local_w_scratch,
+            )
+
+            idx += tasks
+
+    if num_active_experts > 0:
+        if tasks == 1:
+            expert_worker(0)
+        else:
+            parallelize[expert_worker](tasks)
+
+    # 3. Accumulate weighted expert outputs per token in Float32, then cast once to Float16
+    for t in range(B):
+        var dst = canvas_moe_out + t * embed_dim
+        var top_w = canvas_top_weights + t * top_k_experts
+        for j in range(0, embed_dim, 8):
+            var sum_vec = SIMD[DType.float32, 8](0.0)
+            for s in range(top_k_experts):
+                var wp = assignments_slot[t * top_k_experts + s]
+                if wp >= 0:
+                    var w_vec = SIMD[DType.float32, 8](top_w[s])
+                    var src = all_down_out + wp * embed_dim
+                    sum_vec = src.load[8](j).fma(w_vec, sum_vec)
+            dst.store[8](j, sum_vec.cast[DType.float16]())
+
+
+def run_diffusion_moe_experts_parallel(
+    experts_gate_up_packed: UnsafePointer[UInt8, _],
+    experts_gate_up_scales: UnsafePointer[Float32, _],
+    experts_down_packed: UnsafePointer[UInt8, _],
+    experts_down_scales: UnsafePointer[Float32, _],
+    canvas_moe_in: UnsafePointer[Float16, _],
+    canvas_top_idx: UnsafePointer[Int, _],
+    canvas_top_weights: UnsafePointer[Float32, _],
+    canvas_moe_out: UnsafePointer[Float16, MutAnyOrigin],
+    B: Int,
+    embed_dim: Int,
+    expert_mlp_dim: Int,
+    top_k_experts: Int,
+    num_tasks: Int,
+):
+    """Convenience overload that allocates temporary scratch buffers when KFD waves are not active."""
+    var gate_up_dim = expert_mlp_dim * 2
+    var work_stride = B * embed_dim + B * gate_up_dim + B * expert_mlp_dim + embed_dim * 2
+    var tasks = num_tasks if num_tasks >= 1 else 1
+    var deint_x = alloc[Float32](B * embed_dim)
+    var work_buf = alloc[Float32](tasks * work_stride)
+    var down_out = alloc[Float32]((B * top_k_experts if B * top_k_experts > 0 else 1) * embed_dim)
+    run_diffusion_moe_experts_parallel(
+        experts_gate_up_packed,
+        experts_gate_up_scales,
+        experts_down_packed,
+        experts_down_scales,
+        canvas_moe_in,
+        canvas_top_idx,
+        canvas_top_weights,
+        canvas_moe_out,
+        B,
+        embed_dim,
+        expert_mlp_dim,
+        top_k_experts,
+        num_tasks,
+        deint_x,
+        work_buf,
+        down_out,
+    )
+    down_out.free()
+    work_buf.free()
+    deint_x.free()
+
+
+@always_inline
+def q4_moe_gemm_deinterleaved_small_b[
+    MAX_B: Int,
+    out_type: DType = DType.float32,
+](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X_deint: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    out_stride: Int = -1,
+):
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var o_stride = out_stride if out_stride >= 0 else c_out
+    var chunk_size = ((c_out // tasks + 1) // 2) * 2
+    if chunk_size < 2:
+        chunk_size = 2
+    var c_in_packed = c_in // 2
+    var c_in_blocks = c_in // 32
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        if start_r >= c_out:
+            return
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        if end_r > c_out:
+            end_r = c_out
+
+        var acc0 = InlineArray[SIMD[DType.float32, 16], MAX_B](uninitialized=True)
+        var acc1 = InlineArray[SIMD[DType.float32, 16], MAX_B](uninitialized=True)
+
+        var r = start_r
+        while r + 1 < end_r:
+            var rp0 = r * c_in_packed
+            var rs0 = r * c_in_blocks
+            var rp1 = (r + 1) * c_in_packed
+            var rs1 = (r + 1) * c_in_blocks
+
+            comptime for i in range(MAX_B):
+                acc0[i] = SIMD[DType.float32, 16](0.0)
+                acc1[i] = SIMD[DType.float32, 16](0.0)
+
+            for blk in range(c_in_blocks):
+                var sc0 = scales[rs0 + blk]
+                var b0 = W_packed.load[16](rp0 + blk * 16)
+                var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+
+                var sc1 = scales[rs1 + blk]
+                var b1 = W_packed.load[16](rp1 + blk * 16)
+                var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+
+                var x_off = blk * 32
+                comptime for i in range(MAX_B):
+                    if i < B:
+                        var xb = i * c_in + x_off
+                        var xe = X_deint.load[16](xb)
+                        var xo = X_deint.load[16](xb + 16)
+                        acc0[i] = we0.fma(xe, wo0.fma(xo, acc0[i]))
+                        acc1[i] = we1.fma(xe, wo1.fma(xo, acc1[i]))
+
+            comptime for i in range(MAX_B):
+                if i < B:
+                    out_ptr[i * o_stride + r] = acc0[i].reduce_add().cast[out_type]()
+                    out_ptr[i * o_stride + r + 1] = acc1[i].reduce_add().cast[out_type]()
+            r += 2
+
+        while r < end_r:
+            var rp0 = r * c_in_packed
+            var rs0 = r * c_in_blocks
+            comptime for i in range(MAX_B):
+                acc0[i] = SIMD[DType.float32, 16](0.0)
+            for blk in range(c_in_blocks):
+                var sc0 = scales[rs0 + blk]
+                var b0 = W_packed.load[16](rp0 + blk * 16)
+                var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                var x_off = blk * 32
+                comptime for i in range(MAX_B):
+                    if i < B:
+                        var xb = i * c_in + x_off
+                        var xe = X_deint.load[16](xb)
+                        var xo = X_deint.load[16](xb + 16)
+                        acc0[i] = we0.fma(xe, wo0.fma(xo, acc0[i]))
+            comptime for i in range(MAX_B):
+                if i < B:
+                    out_ptr[i * o_stride + r] = acc0[i].reduce_add().cast[out_type]()
+            r += 1
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+
+@always_inline
+def q4_moe_gemm_deinterleaved[
+    out_type: DType = DType.float32
+](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X_deint: UnsafePointer[Float32, _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    out_stride: Int = -1,
+):
+    if B <= 0:
+        return
+    if B == 1:
+        q4_moe_gemm_deinterleaved_small_b[1, out_type](W_packed, scales, X_deint, out_ptr, B, c_in, c_out, num_tasks, out_stride)
+    elif B == 2:
+        q4_moe_gemm_deinterleaved_small_b[2, out_type](W_packed, scales, X_deint, out_ptr, B, c_in, c_out, num_tasks, out_stride)
+    elif B <= 4:
+        q4_moe_gemm_deinterleaved_small_b[4, out_type](W_packed, scales, X_deint, out_ptr, B, c_in, c_out, num_tasks, out_stride)
+    elif B <= 6:
+        q4_moe_gemm_deinterleaved_small_b[6, out_type](W_packed, scales, X_deint, out_ptr, B, c_in, c_out, num_tasks, out_stride)
+    else:
+        # For B > 6, unpack 2 rows in deinterleaved layout into L1 and tile B by 4
+        var tasks = num_tasks
+        if tasks > c_out:
+            tasks = c_out
+        if tasks < 1:
+            tasks = 1
+        var o_stride = out_stride if out_stride >= 0 else c_out
+        var chunk_size = ((c_out // tasks + 1) // 2) * 2
+        if chunk_size < 2:
+            chunk_size = 2
+        var c_in_packed = c_in // 2
+        var c_in_blocks = c_in // 32
+
+        def worker_large(t: Int) capturing -> None:
+            var start_r = t * chunk_size
+            if start_r >= c_out:
+                return
+            var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+            if end_r > c_out:
+                end_r = c_out
+
+            var w_deint0 = alloc[Float32](c_in)
+            var w_deint1 = alloc[Float32](c_in)
+
+            var r = start_r
+            while r + 1 < end_r:
+                var rp0 = r * c_in_packed
+                var rs0 = r * c_in_blocks
+                var rp1 = (r + 1) * c_in_packed
+                var rs1 = (r + 1) * c_in_blocks
+                for blk in range(c_in_blocks):
+                    var sc0 = scales[rs0 + blk]
+                    var b0 = W_packed.load[16](rp0 + blk * 16)
+                    w_deint0.store[16](blk * 32, ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+                    w_deint0.store[16](blk * 32 + 16, ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+
+                    var sc1 = scales[rs1 + blk]
+                    var b1 = W_packed.load[16](rp1 + blk * 16)
+                    w_deint1.store[16](blk * 32, ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+                    w_deint1.store[16](blk * 32 + 16, ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+
+                var b = 0
+                while b + 2 < B:
+                    var a0_0 = SIMD[DType.float32, 16](0.0)
+                    var a0_1 = SIMD[DType.float32, 16](0.0)
+                    var a0_2 = SIMD[DType.float32, 16](0.0)
+                    var a1_0 = SIMD[DType.float32, 16](0.0)
+                    var a1_1 = SIMD[DType.float32, 16](0.0)
+                    var a1_2 = SIMD[DType.float32, 16](0.0)
+                    var xb0 = (b + 0) * c_in
+                    var xb1 = (b + 1) * c_in
+                    var xb2 = (b + 2) * c_in
+                    for k in range(0, c_in, 16):
+                        var w0 = w_deint0.load[16](k)
+                        var w1 = w_deint1.load[16](k)
+                        var x0 = X_deint.load[16](xb0 + k)
+                        var x1 = X_deint.load[16](xb1 + k)
+                        var x2 = X_deint.load[16](xb2 + k)
+                        a0_0 = w0.fma(x0, a0_0)
+                        a0_1 = w0.fma(x1, a0_1)
+                        a0_2 = w0.fma(x2, a0_2)
+                        a1_0 = w1.fma(x0, a1_0)
+                        a1_1 = w1.fma(x1, a1_1)
+                        a1_2 = w1.fma(x2, a1_2)
+                    out_ptr[(b + 0) * o_stride + r] = a0_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r] = a0_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r] = a0_2.reduce_add().cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r + 1] = a1_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r + 1] = a1_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r + 1] = a1_2.reduce_add().cast[out_type]()
+                    b += 3
+                while b < B:
+                    var a0 = SIMD[DType.float32, 16](0.0)
+                    var a1 = SIMD[DType.float32, 16](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 16):
+                        var x0 = X_deint.load[16](xb + k)
+                        a0 = w_deint0.load[16](k).fma(x0, a0)
+                        a1 = w_deint1.load[16](k).fma(x0, a1)
+                    out_ptr[b * o_stride + r] = a0.reduce_add().cast[out_type]()
+                    out_ptr[b * o_stride + r + 1] = a1.reduce_add().cast[out_type]()
+                    b += 1
+                r += 2
+
+            while r < end_r:
+                var rp0 = r * c_in_packed
+                var rs0 = r * c_in_blocks
+                for blk in range(c_in_blocks):
+                    var sc0 = scales[rs0 + blk]
+                    var b0 = W_packed.load[16](rp0 + blk * 16)
+                    w_deint0.store[16](blk * 32, ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+                    w_deint0.store[16](blk * 32 + 16, ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+                for b in range(B):
+                    var a0 = SIMD[DType.float32, 16](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 16):
+                        a0 = w_deint0.load[16](k).fma(X_deint.load[16](xb + k), a0)
+                    out_ptr[b * o_stride + r] = a0.reduce_add().cast[out_type]()
+                r += 1
+
+            w_deint0.free()
+            w_deint1.free()
+
+        if tasks == 1:
+            worker_large(0)
+        else:
+            parallelize[worker_large](tasks)
+
+
+@always_inline
 def unpack_16bytes(
     bytes: SIMD[DType.uint8, 16],
     mut w0: SIMD[DType.float32, 8],
