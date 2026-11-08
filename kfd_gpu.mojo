@@ -1,6 +1,7 @@
 from std.ffi import OwnedDLHandle
 from std.memory import alloc
 from std.collections import InlineArray, List
+from std.python import Python
 import std.os
 import std.time
 
@@ -379,6 +380,7 @@ struct KFDContext(Movable):
     var cpu_sfence: def(Int32) thin abi("C") -> Int32
     var cpu_clflush: def(Int) thin abi("C") -> Int32
     var cpu_clflush_range: def(Int, Int) thin abi("C") -> Int32
+    var cpu_copy_u8_to_f32_and_flush: def(Int, Int, Int, Float32) thin abi("C") -> Int32
     var cpu_wait_completion: def(Int) thin abi("C") -> Int32
     var cpu_disable_glibc_mmap: def(Int32) thin abi("C") -> Int32
     var usleep_fn: def(UInt32) thin abi("C") -> Int32
@@ -464,7 +466,10 @@ struct KFDContext(Movable):
     ) raises:
         self.has_queue = init_queue
         self.libc = OwnedDLHandle("libc.so.6")
-        self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
+        try:
+            self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/libcpu_fence.so")
+        except:
+            self.cpu_fence_lib = OwnedDLHandle("/home/phil/git/llm-mojo/scratch/libcpu_fence.so")
 
         self.c_open = self.libc.get_function[def(Int, Int32) thin abi("C") -> Int32]("open")
         self.c_close = self.libc.get_function[def(Int32) thin abi("C") -> Int32]("close")
@@ -476,6 +481,7 @@ struct KFDContext(Movable):
         self.cpu_sfence = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
         self.cpu_clflush = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
         self.cpu_clflush_range = self.cpu_fence_lib.get_function[def(Int, Int) thin abi("C") -> Int32]("cpu_clflush_range")
+        self.cpu_copy_u8_to_f32_and_flush = self.cpu_fence_lib.get_function[def(Int, Int, Int, Float32) thin abi("C") -> Int32]("cpu_copy_u8_to_f32_and_flush")
         self.cpu_wait_completion = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_wait_completion")
         self.cpu_disable_glibc_mmap = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_disable_glibc_mmap")
         self.usleep_fn = self.libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
@@ -484,6 +490,12 @@ struct KFDContext(Movable):
         # On amdgpu/gfx90c, munmap() on the process mm_struct fires mmu_notifier_invalidate_range_start,
         # triggering CWSR wave preemption and UTCL2 invalidation on the shared PASID.
         _ = self.cpu_disable_glibc_mmap(0)
+        if init_queue:
+            try:
+                var py_gc = Python.import_module("gc")
+                _ = py_gc.disable()
+            except:
+                pass
 
         self.kfd_fd = -1
         self.drm_fd = -1
@@ -688,6 +700,7 @@ struct KFDContext(Movable):
         self.cpu_sfence = take.cpu_sfence
         self.cpu_clflush = take.cpu_clflush
         self.cpu_clflush_range = take.cpu_clflush_range
+        self.cpu_copy_u8_to_f32_and_flush = take.cpu_copy_u8_to_f32_and_flush
         self.cpu_wait_completion = take.cpu_wait_completion
         self.cpu_disable_glibc_mmap = take.cpu_disable_glibc_mmap
         self.usleep_fn = take.usleep_fn
@@ -704,41 +717,71 @@ struct KFDContext(Movable):
         self.doorbell_mmap_addr = take.doorbell_mmap_addr
         self.doorbell_reg_addr = take.doorbell_reg_addr
 
-    def __del__(deinit self):
+    def close(mut self):
+        """Idempotently destroys the hardware AQL queue, unmaps buffers, and closes KFD/DRM file descriptors."""
         if self.has_queue:
-            var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
-            destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=self.queue_id)
-            _ = self.c_ioctl(self.kfd_fd, Self.AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
-            destroy_args_ptr.free()
+            if self.kfd_fd >= 0 and self.queue_id > 0:
+                var destroy_args_ptr = alloc[kfd_ioctl_destroy_queue_args](1)
+                destroy_args_ptr[0] = kfd_ioctl_destroy_queue_args(queue_id=self.queue_id)
+                _ = self.c_ioctl(self.kfd_fd, Self.AMDKFD_IOC_DESTROY_QUEUE, destroy_args_ptr.__int__())
+                destroy_args_ptr.free()
+                self.queue_id = 0
 
-            _ = self.c_munmap(self.doorbell_mmap_addr, 0x2000)
+            if self.doorbell_mmap_addr != 0 and self.doorbell_mmap_addr != -1:
+                _ = self.c_munmap(self.doorbell_mmap_addr, 0x2000)
+                self.doorbell_mmap_addr = 0
+                self.doorbell_reg_addr = 0
 
             try:
                 for i in range(len(self.modules)):
                     if self.modules[i].raw_size > 0:
                         self.modules[i].raw_bytes.free()
+                        self.modules[i].raw_size = 0
                     if self.modules[i].gpu_buf.size > 0:
                         self.free_gpu_buffer(self.modules[i].gpu_buf)
-                self.free_gpu_buffer(self.kernarg_buf)
-                self.free_gpu_buffer(self.completion_buf)
-                self.free_gpu_buffer(self.eop_buf)
-                self.free_gpu_buffer(self.cwsr_buf)
-                self.free_gpu_buffer(self.gart_buf)
-                self.free_gpu_buffer(self.ring_buf)
+                        self.modules[i].gpu_buf.size = 0
+                if self.kernarg_buf.size > 0:
+                    self.free_gpu_buffer(self.kernarg_buf)
+                    self.kernarg_buf.size = 0
+                if self.completion_buf.size > 0:
+                    self.free_gpu_buffer(self.completion_buf)
+                    self.completion_buf.size = 0
+                if self.eop_buf.size > 0:
+                    self.free_gpu_buffer(self.eop_buf)
+                    self.eop_buf.size = 0
+                if self.cwsr_buf.size > 0:
+                    self.free_gpu_buffer(self.cwsr_buf)
+                    self.cwsr_buf.size = 0
+                if self.gart_buf.size > 0:
+                    self.free_gpu_buffer(self.gart_buf)
+                    self.gart_buf.size = 0
+                if self.ring_buf.size > 0:
+                    self.free_gpu_buffer(self.ring_buf)
+                    self.ring_buf.size = 0
             except:
                 pass
 
-            _ = self.c_close(self.kfd_fd)
-            _ = self.c_close(self.drm_fd)
+            if self.kfd_fd >= 0:
+                _ = self.c_close(self.kfd_fd)
+                self.kfd_fd = -1
+            if self.drm_fd >= 0:
+                _ = self.c_close(self.drm_fd)
+                self.drm_fd = -1
+            self.has_queue = False
         else:
             for i in range(len(self.modules)):
                 if self.modules[i].raw_size > 0:
                     self.modules[i].raw_bytes.free()
+                    self.modules[i].raw_size = 0
                 if self.modules[i].gpu_buf.size > 0:
                     try:
                         self.free_gpu_buffer(self.modules[i].gpu_buf)
+                        self.modules[i].gpu_buf.size = 0
                     except:
                         pass
+
+    def __del__(deinit self):
+        self.close()
 
     def _open_cstr(self, path: String, flags: Int32) -> Int32:
         var path_bytes = path.as_bytes()
@@ -757,6 +800,19 @@ struct KFDContext(Movable):
         if size_bytes <= 0:
             return
         _ = self.cpu_clflush_range(addr, size_bytes)
+
+    @always_inline
+    def copy_u8_to_f32_and_flush(
+        self,
+        src_u8_addr: Int,
+        dst_f32_addr: Int,
+        n_elems: Int,
+        scale: Float32 = 1.0,
+    ):
+        """Converts uint8 input buffer to float32 * scale in GTT memory and flushes CPU cache lines in one C call."""
+        if n_elems <= 0:
+            return
+        _ = self.cpu_copy_u8_to_f32_and_flush(src_u8_addr, dst_f32_addr, n_elems, scale)
 
     def alloc_gpu_buffer(
         self,
@@ -989,6 +1045,112 @@ struct KFDContext(Movable):
         doorbell_ptr[0] = self.packet_idx - 1
         _ = cpu_sfence(0)
 
+    @always_inline
+    def slot_completion_va(self, slot: Int) -> UInt64:
+        return UInt64(self.completion_buf.va_addr + slot * 64)
+
+    @always_inline
+    def slot_kernarg_cpu_addr(self, slot: Int) -> Int:
+        return self.kernarg_buf.cpu_addr + slot * 512
+
+    @always_inline
+    def slot_kernarg_va_addr(self, slot: Int) -> UInt64:
+        return UInt64(self.kernarg_buf.va_addr + slot * 512)
+
+    @always_inline
+    def prepare_slot(mut self) -> Int:
+        """Reserves the next circular ring buffer slot (0..1023) and zeroes its GTT completion flag & workgroup counter."""
+        var slot = Int(self.packet_idx % 1024)
+        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
+        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
+        completion_ptr[0] = 0
+        completion_ptr[1] = 0
+        _ = self.cpu_sfence(0)
+        _ = self.cpu_clflush(completion_slot_cpu_addr)
+        return slot
+
+    @always_inline
+    def publish_slot(
+        mut self,
+        slot: Int,
+        kernel: HSACOKernel,
+        grid_size_x: UInt32,
+        workgroup_size_x: UInt16 = 256,
+        kernarg_bytes: Int = 64,
+        barrier: Bool = False,
+        ring_doorbell_now: Bool = True,
+    ):
+        """Flushes kernargs and publishes an AQL dispatch packet using two-phase header writing (header=1 first, valid header last)."""
+        var cpu_sfence = self.cpu_sfence
+        var cpu_clflush = self.cpu_clflush
+        var kernarg_slot_cpu_addr = self.kernarg_buf.cpu_addr + slot * 512
+        var kernarg_slot_va_addr = UInt64(self.kernarg_buf.va_addr + slot * 512)
+
+        if kernarg_bytes <= 64:
+            _ = cpu_sfence(0)
+            _ = cpu_clflush(kernarg_slot_cpu_addr)
+        else:
+            self.flush_cache_range(kernarg_slot_cpu_addr, kernarg_bytes)
+
+        var pkt_header = Self.AQL_HEADER_BARRIER if barrier else Self.AQL_HEADER_NO_BARRIER
+        var packet = hsa_kernel_dispatch_packet_t(
+            header=1,
+            setup=1,
+            workgroup_size_x=workgroup_size_x,
+            workgroup_size_y=1,
+            workgroup_size_z=1,
+            grid_size_x=grid_size_x,
+            grid_size_y=1,
+            grid_size_z=1,
+            private_segment_size=kernel.private_segment_size,
+            group_segment_size=kernel.group_segment_size,
+            kernel_object=kernel.kd_va_addr,
+            kernarg_address=kernarg_slot_va_addr,
+            completion_signal=0,
+        )
+
+        var ring_slot_addr = self.ring_buf.cpu_addr + slot * 64
+        var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutUntrackedOrigin](
+            unsafe_from_address=ring_slot_addr
+        )
+        ring_packet_ptr[0] = packet^
+        _ = cpu_sfence(0)
+        UnsafePointer[UInt16, MutUntrackedOrigin](unsafe_from_address=ring_slot_addr)[0] = pkt_header
+        self.packet_idx += 1
+
+        _ = cpu_sfence(0)
+        _ = cpu_clflush(ring_slot_addr)
+
+        if ring_doorbell_now:
+            self.ring_doorbell()
+
+    def wait_slot(
+        self,
+        slot: Int,
+        out_ptr_addr: Int = 0,
+        out_bytes: Int = 0,
+        flush_cache: Bool = True,
+    ) raises:
+        """Spins on the slot's GTT completion flag using C pause/clflush polling and optionally invalidates output cache lines."""
+        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
+        var wait_rc = self.cpu_wait_completion(completion_slot_cpu_addr)
+        if wait_rc != 0:
+            var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
+            var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](
+                unsafe_from_address=self.gart_buf.cpu_addr + 56
+            )[0]
+            var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](
+                unsafe_from_address=self.gart_buf.cpu_addr + 128
+            )[0]
+            print("GPU Execution Timeout details:")
+            print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
+            print("  Completion flag in memory:", completion_ptr[0])
+            print("  Atomic counter in memory:", completion_ptr[1])
+            raise Error("GPU execution timed out in wait_slot!")
+
+        if flush_cache and out_ptr_addr != 0 and out_bytes > 0:
+            self.flush_cache_range(out_ptr_addr, out_bytes)
+
     def enqueue_kernel_matmul(
         mut self,
         kernel: HSACOKernel,
@@ -1010,9 +1172,6 @@ struct KFDContext(Movable):
         if c_out <= 0 or batch_size <= 0:
             raise Error("enqueue_kernel_matmul requires c_out > 0 and batch_size > 0")
 
-        var cpu_sfence = self.cpu_sfence
-        var cpu_clflush = self.cpu_clflush
-
         if flush_input:
             self.flush_cache_range(x_addr, c_in * batch_size * 4)
 
@@ -1020,27 +1179,16 @@ struct KFDContext(Movable):
         if flush_output_before and out_ptr_addr != 0 and effective_out_stride == c_out:
             self.flush_cache_range(out_ptr_addr, c_out * batch_size * 4)
 
-        var slot = Int(self.packet_idx % 1024)
-
-        # 1. Reset completion flag & atomic workgroup counter for this slot
-        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
-        var completion_slot_va_addr = self.completion_buf.va_addr + slot * 64
-        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
-        completion_ptr[0] = 0
-        completion_ptr[1] = 0
-        _ = cpu_sfence(0)
-        _ = cpu_clflush(completion_slot_cpu_addr)
-
-        # 2. Pack kernel arguments into slot's kernarg memory
-        var kernarg_slot_cpu_addr = self.kernarg_buf.cpu_addr + slot * 512
-        var kernarg_slot_va_addr = self.kernarg_buf.va_addr + slot * 512
+        var slot = self.prepare_slot()
+        var completion_slot_va_addr = self.slot_completion_va(slot)
+        var kernarg_slot_cpu_addr = self.slot_kernarg_cpu_addr(slot)
 
         var kernarg_p = UnsafePointer[UInt64, MutUntrackedOrigin](unsafe_from_address=kernarg_slot_cpu_addr)
         kernarg_p[0] = UInt64(W_packed_addr)
         kernarg_p[1] = UInt64(scales_addr)
         kernarg_p[2] = UInt64(x_addr)
         kernarg_p[3] = UInt64(out_ptr_addr)
-        kernarg_p[4] = UInt64(completion_slot_va_addr)
+        kernarg_p[4] = completion_slot_va_addr
 
         var num_row_tiles = (c_out + 15) // 16
         var num_token_tiles = (batch_size + 15) // 16
@@ -1054,43 +1202,15 @@ struct KFDContext(Movable):
         kernarg_u32_p[4] = UInt32(batch_size)           # batch_size
         kernarg_u32_p[5] = UInt32(effective_out_stride) # out_stride (elements per token row)
 
-        _ = cpu_sfence(0)
-        _ = cpu_clflush(kernarg_slot_cpu_addr)
-
-        # 3. Format HSA AQL Dispatch Packet (64 bytes), writing header=1 (INVALID) first, then header last
-        var pkt_header = Self.AQL_HEADER_BARRIER if barrier else Self.AQL_HEADER_NO_BARRIER
-        var packet = hsa_kernel_dispatch_packet_t(
-            header=1,
-            setup=1,
-            workgroup_size_x=256,
-            workgroup_size_y=1,
-            workgroup_size_z=1,
+        self.publish_slot(
+            slot,
+            kernel,
             grid_size_x=UInt32(num_workgroups * 256),
-            grid_size_y=1,
-            grid_size_z=1,
-            private_segment_size=kernel.private_segment_size,
-            group_segment_size=kernel.group_segment_size,
-            kernel_object=kernel.kd_va_addr,
-            kernarg_address=UInt64(kernarg_slot_va_addr),
-            completion_signal=0,
+            workgroup_size_x=256,
+            kernarg_bytes=64,
+            barrier=barrier,
+            ring_doorbell_now=ring_doorbell_now,
         )
-
-        # 4. Write dispatch packet body to circular ring buffer, fence, then publish header last
-        var ring_slot_addr = self.ring_buf.cpu_addr + slot * 64
-        var ring_packet_ptr = UnsafePointer[hsa_kernel_dispatch_packet_t, MutUntrackedOrigin](
-            unsafe_from_address=ring_slot_addr
-        )
-        ring_packet_ptr[0] = packet^
-        _ = cpu_sfence(0)
-        UnsafePointer[UInt16, MutUntrackedOrigin](unsafe_from_address=ring_slot_addr)[0] = pkt_header
-        self.packet_idx += 1
-
-        _ = cpu_sfence(0)
-        _ = cpu_clflush(ring_slot_addr)
-
-        if ring_doorbell_now:
-            self.ring_doorbell()
-
         return slot
 
     def enqueue_matmul(
@@ -1131,24 +1251,12 @@ struct KFDContext(Movable):
         flush_cache: Bool = True,
         out_elem_bytes: Int = 4,
     ) raises:
-        var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
-        var wait_rc = self.cpu_wait_completion(completion_slot_cpu_addr)
-        if wait_rc != 0:
-            var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
-            var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](
-                unsafe_from_address=self.gart_buf.cpu_addr + 56
-            )[0]
-            var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](
-                unsafe_from_address=self.gart_buf.cpu_addr + 128
-            )[0]
-            print("GPU Execution Timeout details:")
-            print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
-            print("  Completion flag in memory:", completion_ptr[0])
-            print("  Atomic counter in memory:", completion_ptr[1])
-            raise Error("GPU execution timed out in wait_matmul!")
-
-        if flush_cache and out_ptr_addr != 0:
-            self.flush_cache_range(out_ptr_addr, c_out * batch_size * out_elem_bytes)
+        self.wait_slot(
+            slot,
+            out_ptr_addr=out_ptr_addr,
+            out_bytes=c_out * batch_size * out_elem_bytes,
+            flush_cache=flush_cache,
+        )
 
     def launch_matmul(
         mut self,
