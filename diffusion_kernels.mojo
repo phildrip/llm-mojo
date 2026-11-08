@@ -1873,3 +1873,122 @@ def taylorseer_forecast_skipped_step(
             h_ptr.store[8](i, forecast.cast[DType.float16]())
 
 
+# ==============================================================================
+# 5. Noise-Scheduled MoE LOD & Subbatch Set-Cover (llm-mojo-2tc.5)
+# ==============================================================================
+
+
+@always_inline
+def compute_moe_lod_k(denoise_step: Int, mean_ent: Float32) -> Int:
+    """Returns active Top-K expert budget based on diffusion noise/entropy phase:
+      - Phase 1 (Chaos / High-Noise, step == 0 or mean_ent > 2.5): Top-2
+      - Phase 2 (Structure Formation, 0.5 < mean_ent <= 2.5): Top-4
+      - Phase 3 (Fine Lock-In, mean_ent <= 0.5): Top-8"""
+    if denoise_step == 0 or mean_ent > Float32(2.5):
+        return 2
+    elif mean_ent > Float32(0.5):
+        return 4
+    else:
+        return 8
+
+
+@always_inline
+def compute_moe_lod_top_p(denoise_step: Int, mean_ent: Float32) -> Float32:
+    """Returns nucleus cumulative probability threshold `moe_top_p` for MoE routing."""
+    if denoise_step == 0 or mean_ent > Float32(2.5):
+        return Float32(0.65)
+    elif mean_ent > Float32(0.5):
+        return Float32(0.80)
+    else:
+        return Float32(0.92)
+
+
+@always_inline
+def apply_moe_lod_and_set_cover(
+    canvas_top_idx: UnsafePointer[Int, _],
+    canvas_top_val: UnsafePointer[Float32, _],
+    router_per_expert_scale: UnsafePointer[Float32, _],
+    canvas_top_weights: UnsafePointer[Float32, MutAnyOrigin],
+    B: Int,
+    top_k_experts: Int,
+    active_top_k: Int,
+    moe_top_p: Float32,
+):
+    """Applies Noise-Scheduled MoE Level-of-Detail (Top-2 -> Top-4 -> Top-8 + Top-P)
+    and Subbatch Set-Cover singleton pruning (pruning secondary slots `s >= 1` whose
+    expert is only routed to a single token across the canvas, folding their probability
+    mass into the token's primary expert before applying `router_per_expert_scale`)."""
+    var eff_k = active_top_k if active_top_k <= top_k_experts else top_k_experts
+    if eff_k < 1:
+        eff_k = 1
+
+    # Pass 1: Per-token LOD truncation (active_top_k & moe_top_p) + probability normalization
+    var expert_counts = InlineArray[Int, 128](uninitialized=True)
+    for e in range(128):
+        expert_counts[e] = 0
+
+    for b in range(B):
+        var top_i = canvas_top_idx + b * top_k_experts
+        var top_v = canvas_top_val + b * top_k_experts
+        var top_w = canvas_top_weights + b * top_k_experts
+
+        var sum_all: Float32 = 0.0
+        for s in range(top_k_experts):
+            if top_i[s] >= 0:
+                sum_all += top_v[s]
+        var inv_sum_all = Float32(1.0) / (sum_all + Float32(1e-10))
+
+        var cum_p: Float32 = 0.0
+        var sum_kept: Float32 = 0.0
+        for s in range(top_k_experts):
+            var idx = top_i[s]
+            var norm_p = top_v[s] * inv_sum_all
+            if s == 0 and idx >= 0:
+                top_w[s] = norm_p
+                cum_p += norm_p
+                sum_kept += norm_p
+            elif s < eff_k and idx >= 0 and norm_p >= Float32(0.05) and cum_p < moe_top_p:
+                top_w[s] = norm_p
+                cum_p += norm_p
+                sum_kept += norm_p
+            else:
+                top_w[s] = 0.0
+
+        # Renormalize retained probabilities to sum to 1.0 (temporarily stored in top_w before per-expert scale)
+        var inv_kept = Float32(1.0) / (sum_kept + Float32(1e-10))
+        for s in range(eff_k):
+            var e = top_i[s]
+            if top_w[s] > 0.0 and e >= 0 and e < 128:
+                top_w[s] = top_w[s] * inv_kept
+                expert_counts[e] += 1
+            else:
+                top_w[s] = 0.0
+
+    # Pass 2: Subbatch Set-Cover singleton pruning on secondary slots (when eff_k < top_k_experts) + per-expert scaling
+    var prune_singletons = eff_k < top_k_experts
+    for b in range(B):
+        var top_i = canvas_top_idx + b * top_k_experts
+        var top_w = canvas_top_weights + b * top_k_experts
+
+        if prune_singletons:
+            var folded_mass: Float32 = 0.0
+            for s in range(1, eff_k):
+                var prob_s = top_w[s]
+                var e = top_i[s]
+                if prob_s > 0.0 and e >= 0 and e < 128:
+                    if expert_counts[e] == 1:
+                        folded_mass += prob_s
+                        top_w[s] = 0.0
+            if folded_mass > 0.0 and top_i[0] >= 0:
+                top_w[0] += folded_mass
+
+        for s in range(eff_k):
+            var prob_s = top_w[s]
+            var e = top_i[s]
+            if prob_s > 0.0 and e >= 0 and e < 128:
+                top_w[s] = prob_s * router_per_expert_scale[e]
+            else:
+                top_w[s] = 0.0
+
+
+

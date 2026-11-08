@@ -21,6 +21,9 @@ from diffusion_kernels import (
     teacache_eval_gate,
     taylorseer_record_full_step,
     taylorseer_forecast_skipped_step,
+    compute_moe_lod_k,
+    compute_moe_lod_top_p,
+    apply_moe_lod_and_set_cover,
 )
 import std.time
 
@@ -1020,12 +1023,17 @@ def pad_left(s: String, width: Int) -> String:
 def main() raises:
     var use_gpu = True
     var bench_mode = False
+    var bench_steps = 2
     var cmd_args = std.sys.argv()
     for idx in range(1, len(cmd_args)):
         if cmd_args[idx] == "--cpu":
             use_gpu = False
         elif cmd_args[idx] == "--bench":
             bench_mode = True
+            bench_steps = 2
+        elif cmd_args[idx] == "--bench4":
+            bench_mode = True
+            bench_steps = 4
 
     var num_tasks = num_physical_cores()
     print("=========================================================")
@@ -1682,7 +1690,7 @@ def main() raises:
         var hist_len: Int = 0
         var prev_mean_ent: Float32 = 0.0
         var steps_executed: Int = 0
-        var max_steps_this_turn = 2 if bench_mode else MAX_DENOISE_STEPS
+        var max_steps_this_turn = bench_steps if bench_mode else MAX_DENOISE_STEPS
 
         t_decode_start = std.time.perf_counter()
 
@@ -1702,7 +1710,9 @@ def main() raises:
             if active_len == 0:
                 print("  [denoise ", denoise_step, "] all 256 tokens locked — early exit!")
                 break
-            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", CANVAS_LEN)
+            var active_top_k = compute_moe_lod_k(denoise_step, prev_mean_ent)
+            var moe_top_p = compute_moe_lod_top_p(denoise_step, prev_mean_ent)
+            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", CANVAS_LEN, " moe_lod_k=", active_top_k)
             steps_executed += 1
 
             # Temperature schedule (computed up front for TeaCache polynomial modulation & Sampler)
@@ -1760,7 +1770,7 @@ def main() raises:
                 rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, weights.input_layernorm_weight, canvas_norm, active_len, CONFIG.embed_dim)
                 
                 if use_gpu:
-                    # Flush canvas_norm once, enqueue Wk (and Wv if sliding) on iGPU while CPU computes Wq
+                    # Flush canvas_norm once, enqueue Wk on iGPU (~18 ms) while CPU computes Wq (+ Wv if sliding)
                     gpu_ctx.flush_cache_range(canvas_norm.__int__(), active_len * CONFIG.embed_dim * 4)
                     var slot_k = gpu_ctx.enqueue_matmul(
                         weights.wk_packed.__int__(),
@@ -1771,31 +1781,22 @@ def main() raises:
                         kv_stride,
                         batch_size=active_len,
                         flush_cache=False,
-                        ring_doorbell_now=is_global,
+                        ring_doorbell_now=True,
                     )
-                    var slot_v = Int(0)
-                    if not is_global:
-                        slot_v = gpu_ctx.enqueue_matmul(
-                            weights.wv_packed.__int__(),
-                            weights.wv_scales.__int__(),
-                            canvas_norm.__int__(),
-                            temp_packed_v.__int__(),
-                            CONFIG.embed_dim,
-                            kv_stride,
-                            batch_size=active_len,
-                            flush_cache=False,
-                            ring_doorbell_now=True,
-                        )
-                    # Concurrently compute Wq on 8 CPU cores using L1-cached 2x4 AVX2 GEMM directly into canvas_q
+                    # Concurrently compute Wq (and Wv if sliding) on 8 CPU cores using L1-cached 2x4 AVX2 GEMM
                     q4_gemm_l1_2x4[DType.float32, DType.float16](
                         weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q,
                         active_len, CONFIG.embed_dim, q_size, num_tasks,
                         in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE
                     )
-                    # Wait for iGPU Wk/Wv completion and copy into stride-padded canvas_k/canvas_v
-                    gpu_ctx.wait_matmul(slot_k, temp_packed_k.__int__(), kv_stride, batch_size=active_len, flush_cache=True)
                     if not is_global:
-                        gpu_ctx.wait_matmul(slot_v, temp_packed_v.__int__(), kv_stride, batch_size=active_len, flush_cache=True)
+                        q4_gemm_l1_2x4[DType.float32, DType.float16](
+                            weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v,
+                            active_len, CONFIG.embed_dim, kv_stride, num_tasks,
+                            in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE
+                        )
+                    # Wait for iGPU Wk completion and copy into stride-padded canvas_k
+                    gpu_ctx.wait_matmul(slot_k, temp_packed_k.__int__(), kv_stride, batch_size=active_len, flush_cache=True)
 
                     for b in range(active_len):
                         var src_ptr = temp_packed_k + b * kv_stride
@@ -1809,12 +1810,6 @@ def main() raises:
                             var k_ptr = canvas_k + b * MAX_KV_SIZE
                             for i in range(0, kv_stride, 8):
                                 v_ptr.store[8](i, k_ptr.load[8](i))
-                    else:
-                        for b in range(active_len):
-                            var src_ptr = temp_packed_v + b * kv_stride
-                            var dst_ptr = canvas_v + b * MAX_KV_SIZE
-                            for i in range(0, kv_stride, 8):
-                                dst_ptr.store[8](i, src_ptr.load[8](i).cast[DType.float16]())
                 else:
                     # CPU L1-cached 2x4 AVX2 batched Q4 GEMM
                     q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, active_len, CONFIG.embed_dim, q_size, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE)
@@ -1920,26 +1915,14 @@ def main() raises:
                 var tl_ffn = std.time.perf_counter()
                 rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, weights.pre_feedforward_layernorm_weight, canvas_norm, active_len, CONFIG.embed_dim)
                 var slot_gate = Int(0)
-                var slot_up = Int(0)
                 if use_gpu:
-                    # Enqueue Shared MLP w_gate & w_up on iGPU while CPU executes MoE router + 128 experts!
+                    # Enqueue Shared MLP w_gate on iGPU (~28 ms) while CPU executes MoE + w_up!
                     gpu_ctx.flush_cache_range(canvas_norm.__int__(), active_len * CONFIG.embed_dim * 4)
                     slot_gate = gpu_ctx.enqueue_matmul(
                         weights.w_gate_packed.__int__(),
                         weights.w_gate_scales.__int__(),
                         canvas_norm.__int__(),
                         temp_packed_q.__int__(),
-                        CONFIG.embed_dim,
-                        CONFIG.standard_mlp_dim,
-                        batch_size=active_len,
-                        flush_cache=False,
-                        ring_doorbell_now=False,
-                    )
-                    slot_up = gpu_ctx.enqueue_matmul(
-                        weights.w_up_packed.__int__(),
-                        weights.w_up_scales.__int__(),
-                        canvas_norm.__int__(),
-                        temp_packed_k.__int__(),
                         CONFIG.embed_dim,
                         CONFIG.standard_mlp_dim,
                         batch_size=active_len,
@@ -1989,23 +1972,22 @@ def main() raises:
                     var scores_t = canvas_router_scores + b * CONFIG.num_experts
                     var top_idx_t = canvas_top_idx + b * CONFIG.top_k_experts
                     var top_val_t = canvas_top_val + b * CONFIG.top_k_experts
-                    var top_weights_t = canvas_top_weights + b * CONFIG.top_k_experts
 
                     softmax(scores_t, CONFIG.num_experts)
                     get_top_k[8](scores_t, top_idx_t, top_val_t, CONFIG.num_experts)
 
-                    var sum_top_val: Float32 = 0.0
-                    for i in range(CONFIG.top_k_experts):
-                        sum_top_val += top_val_t[i]
-                    for i in range(CONFIG.top_k_experts):
-                        var idx = top_idx_t[i]
-                        var norm_prob = top_val_t[i] / (sum_top_val + 1e-10)
-                        if idx < 0 or norm_prob < 0.05:
-                            top_weights_t[i] = 0.0
-                        else:
-                            top_weights_t[i] = norm_prob * weights.router_per_expert_scale[idx]
-
                 parallelize[router_topk_worker](active_len)
+
+                apply_moe_lod_and_set_cover(
+                    canvas_top_idx,
+                    canvas_top_val,
+                    weights.router_per_expert_scale,
+                    canvas_top_weights,
+                    active_len,
+                    CONFIG.top_k_experts,
+                    active_top_k,
+                    moe_top_p,
+                )
 
                 run_diffusion_moe_experts_parallel(
                     weights.experts_gate_up_packed,
@@ -2029,8 +2011,13 @@ def main() raises:
 
                 if use_gpu:
                     var tl_ffn2 = std.time.perf_counter()
+                    q4_gemm_l1_2x4[DType.float32, DType.float32](
+                        weights.w_up_packed, weights.w_up_scales,
+                        canvas_norm, temp_packed_k,
+                        active_len, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks,
+                        in_stride=CONFIG.embed_dim, out_stride=CONFIG.standard_mlp_dim,
+                    )
                     gpu_ctx.wait_matmul(slot_gate, temp_packed_q.__int__(), CONFIG.standard_mlp_dim, batch_size=active_len, flush_cache=True)
-                    gpu_ctx.wait_matmul(slot_up, temp_packed_k.__int__(), CONFIG.standard_mlp_dim, batch_size=active_len, flush_cache=True)
                     for b in range(active_len):
                         var g_ptr = temp_packed_q + b * CONFIG.standard_mlp_dim
                         var u_ptr = temp_packed_k + b * CONFIG.standard_mlp_dim
@@ -2095,7 +2082,6 @@ def main() raises:
                         consec_skips += 1
                         taylorseer_forecast_skipped_step(
                             canvas_hidden,
-                            teacache_h5_prev,
                             active_canvas_idx,
                             taylor_D,
                             taylor_d1,
