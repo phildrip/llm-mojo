@@ -1585,3 +1585,291 @@ def scatter_active_sampler_outputs[
         for i in range(0, embed_dim, 8):
             d_ptr.store[8](i, s_ptr.load[8](i))
 
+
+# ==============================================================================
+# 4. TeaCache (CVPR 2025) & TaylorSeer (ICCV 2025) Feature Forecasting (2tc.4/7)
+# ==============================================================================
+
+
+@always_inline
+def teacache_eval_gate(
+    h_curr: UnsafePointer[Float16, _],
+    h_prev_full: UnsafePointer[Float16, MutAnyOrigin],
+    active_canvas_idx: UnsafePointer[Int, _],
+    active_len: Int,
+    embed_dim: Int,
+    temp: Float32,
+    full_steps_count: Int,
+    consec_skips: Int,
+    accum_fluctuation: UnsafePointer[Float32, MutAnyOrigin],
+    teacache_thresh: Float32 = 0.20,
+    max_consec_skips: Int = 2,
+) -> Bool:
+    """Evaluates the TeaCache (CVPR 2025) polynomial timestep-modulated relative L1 gate
+    at the probe layer (layer 5).
+    Returns `True` if middle layers (6..22) should be skipped and forecasted via TaylorSeer,
+    or `False` if all 30 layers should be evaluated (updating `h_prev_full` and resetting
+    `accum_fluctuation[0] = 0.0`). Requires `full_steps_count >= 2` so both self-conditioning
+    and 1st-order Taylor velocity `d1_D` are initialized before forecasting."""
+    if full_steps_count < 2:
+        for b in range(active_len):
+            var orig_t = active_canvas_idx[b]
+            var s_ptr = h_curr + b * embed_dim
+            var d_ptr = h_prev_full + orig_t * embed_dim
+            for i in range(0, embed_dim, 8):
+                d_ptr.store[8](i, s_ptr.load[8](i))
+        accum_fluctuation[0] = 0.0
+        return False
+
+    # Compute normalized L2/cosine fluctuation ||c - p||_2^2 / (||c||_2^2 + ||p||_2^2)
+    # over 16-token pooled semantic blocks so independent per-token re-noising variance
+    # cancels by 16x in squared norm while avoiding the sqrt(2*(1-rho)) L1 singularity.
+    var diff_sq_vec = SIMD[DType.float32, 8](0.0)
+    var sum_sq_vec = SIMD[DType.float32, 8](0.0)
+    var block_step = 16 if active_len >= 16 else active_len
+    var b_start = 0
+    while b_start < active_len:
+        var b_end = b_start + block_step
+        if b_end > active_len:
+            b_end = active_len
+        for i in range(0, embed_dim, 8):
+            var sum_c = SIMD[DType.float32, 8](0.0)
+            var sum_p = SIMD[DType.float32, 8](0.0)
+            for b in range(b_start, b_end):
+                var orig_t = active_canvas_idx[b]
+                sum_c += (h_curr + b * embed_dim).load[8](i).cast[DType.float32]()
+                sum_p += (h_prev_full + orig_t * embed_dim).load[8](i).cast[DType.float32]()
+            var d_v = sum_c - sum_p
+            diff_sq_vec = d_v.fma(d_v, diff_sq_vec)
+            sum_sq_vec = sum_c.fma(sum_c, sum_p.fma(sum_p, sum_sq_vec))
+        b_start = b_end
+
+    var raw_l1 = diff_sq_vec.reduce_add() / (sum_sq_vec.reduce_add() + Float32(1e-6))
+
+    # Normalized trajectory progress u in [0, 1] for temp in [0.8 -> 0.4]
+    var u = (Float32(0.8) - temp) * Float32(2.5)
+    if u < 0.0:
+        u = 0.0
+    if u > 1.0:
+        u = 1.0
+    var du = u - Float32(0.5)
+    # U-shaped polynomial modulation: higher sensitivity at noisy start & final snap,
+    # smoother tolerance in mid-trajectory
+    var poly_mod = Float32(0.45) + Float32(1.4) * du * du
+    var new_accum = accum_fluctuation[0] + poly_mod * raw_l1
+
+    if new_accum < teacache_thresh and consec_skips < max_consec_skips:
+        accum_fluctuation[0] = new_accum
+        return True
+
+    # Full evaluation triggered: update reference probe state and reset accumulator
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var s_ptr = h_curr + b * embed_dim
+        var d_ptr = h_prev_full + orig_t * embed_dim
+        for i in range(0, embed_dim, 8):
+            d_ptr.store[8](i, s_ptr.load[8](i))
+    accum_fluctuation[0] = 0.0
+    return False
+
+
+@always_inline
+def taylorseer_record_full_step(
+    h_start: UnsafePointer[Float16, _],
+    h_end: UnsafePointer[Float16, _],
+    active_canvas_idx: UnsafePointer[Int, _],
+    taylor_D: UnsafePointer[Float32, MutAnyOrigin],
+    taylor_d1: UnsafePointer[Float32, MutAnyOrigin],
+    taylor_d2: UnsafePointer[Float32, MutAnyOrigin],
+    active_len: Int,
+    embed_dim: Int,
+    full_steps_count: Int,
+):
+    """Records the middle-block residual `D_k = h_end - h_start` and updates backward
+    finite differences `d1_D = D_k - D_{k-1}` and `d2_D = d1_D - d1_{k-1}` in Float32
+    (eliminating FP16 finite-difference cancellation) for all active canvas tokens."""
+    var zero_f32 = SIMD[DType.float32, 8](0.0)
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var s_ptr = h_start + b * embed_dim
+        var e_ptr = h_end + b * embed_dim
+        var d_ptr = taylor_D + orig_t * embed_dim
+        var d1_ptr = taylor_d1 + orig_t * embed_dim
+        var d2_ptr = taylor_d2 + orig_t * embed_dim
+
+        if full_steps_count == 0:
+            for i in range(0, embed_dim, 8):
+                var d_new = e_ptr.load[8](i).cast[DType.float32]() - s_ptr.load[8](i).cast[DType.float32]()
+                d_ptr.store[8](i, d_new)
+                d1_ptr.store[8](i, zero_f32)
+                d2_ptr.store[8](i, zero_f32)
+        elif full_steps_count == 1:
+            for i in range(0, embed_dim, 8):
+                var d_new = e_ptr.load[8](i).cast[DType.float32]() - s_ptr.load[8](i).cast[DType.float32]()
+                var d_old = d_ptr.load[8](i)
+                var d1_new = d_new - d_old
+                d_ptr.store[8](i, d_new)
+                d1_ptr.store[8](i, d1_new)
+                d2_ptr.store[8](i, zero_f32)
+        else:
+            for i in range(0, embed_dim, 8):
+                var d_new = e_ptr.load[8](i).cast[DType.float32]() - s_ptr.load[8](i).cast[DType.float32]()
+                var d_old = d_ptr.load[8](i)
+                var d1_old = d1_ptr.load[8](i)
+                var d1_new = d_new - d_old
+                var d2_new = d1_new - d1_old
+                d_ptr.store[8](i, d_new)
+                d1_ptr.store[8](i, d1_new)
+                d2_ptr.store[8](i, d2_new)
+
+
+@always_inline
+def taylorseer_forecast_skipped_step(
+    canvas_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    active_canvas_idx: UnsafePointer[Int, _],
+    taylor_D: UnsafePointer[Float32, _],
+    taylor_d1: UnsafePointer[Float32, _],
+    taylor_d2: UnsafePointer[Float32, _],
+    active_len: Int,
+    embed_dim: Int,
+    full_steps_count: Int,
+    step_offset_m: Int,
+    max_vel_ratio: Float32 = 0.65,
+    max_acc_ratio: Float32 = 0.85,
+):
+    """Forecasts the middle-block output `h^(22)_{k+m} = h^(5)_{k+m} + D_hat(k+m)` using
+    Newton's backward finite-difference Taylor expansion in Float32:
+      `D_hat(k + m) = D_k + m * d1_D + 0.5 * m * (m + 1) * d2_D`
+    with per-token confidence-gated curvature damping to prevent overshoot on discontinuous tokens."""
+    var m_f32 = Float32(step_offset_m)
+    var max_vel_sq = max_vel_ratio * max_vel_ratio
+    var max_acc_sq = max_acc_ratio * max_acc_ratio
+
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var h_ptr = canvas_hidden + b * embed_dim
+        var d_ptr = taylor_D + orig_t * embed_dim
+        var d1_ptr = taylor_d1 + orig_t * embed_dim
+        var d2_ptr = taylor_d2 + orig_t * embed_dim
+
+        var c1: Float32 = 0.0
+        var c2: Float32 = 0.0
+
+        if full_steps_count >= 2:
+            var norm_d_sq = SIMD[DType.float32, 8](0.0)
+            var norm_d1_sq = SIMD[DType.float32, 8](0.0)
+            var norm_d2_sq = SIMD[DType.float32, 8](0.0)
+            for i in range(0, embed_dim, 8):
+                var dv = d_ptr.load[8](i)
+                var d1v = d1_ptr.load[8](i)
+                var d2v = d2_ptr.load[8](i)
+                norm_d_sq = dv.fma(dv, norm_d_sq)
+                norm_d1_sq = d1v.fma(d1v, norm_d1_sq)
+                norm_d2_sq = d2v.fma(d2v, norm_d2_sq)
+
+            var d_sq = norm_d_sq.reduce_add()
+            var d1_sq = norm_d1_sq.reduce_add()
+            var d2_sq = norm_d2_sq.reduce_add()
+
+            if d1_sq <= max_vel_sq * (d_sq + Float32(1e-6)):
+                c1 = m_f32
+                if full_steps_count >= 3 and d2_sq <= max_acc_sq * (d1_sq + Float32(1e-6)):
+                    c2 = Float32(0.5) * m_f32 * (m_f32 + Float32(1.0))
+
+        var c1_vec = SIMD[DType.float32, 8](c1)
+        var c2_vec = SIMD[DType.float32, 8](c2)
+        var f16_max = SIMD[DType.float32, 8](65500.0)
+        var f16_min = SIMD[DType.float32, 8](-65500.0)
+        for i in range(0, embed_dim, 8):
+            var hv = h_ptr.load[8](i).cast[DType.float32]()
+            var dv = d_ptr.load[8](i)
+            var d1v = d1_ptr.load[8](i)
+            var d2v = d2_ptr.load[8](i)
+            var forecast = hv + dv + c1_vec * d1v + c2_vec * d2v
+            forecast = forecast.clamp(f16_min, f16_max)
+            h_ptr.store[8](i, forecast.cast[DType.float16]())
+
+
+@always_inline
+def taylorseer_forecast_skipped_step(
+    canvas_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    h_prev_full: UnsafePointer[Float16, _],
+    active_canvas_idx: UnsafePointer[Int, _],
+    taylor_D: UnsafePointer[Float32, _],
+    taylor_d1: UnsafePointer[Float32, _],
+    taylor_d2: UnsafePointer[Float32, _],
+    active_len: Int,
+    embed_dim: Int,
+    full_steps_count: Int,
+    step_offset_m: Int,
+    max_vel_ratio: Float32 = 0.65,
+    max_acc_ratio: Float32 = 0.85,
+):
+    """Scale-aware TaylorSeer forecast that trust-region bounds the early-layer re-noising
+    perturbation `h^(5)_{k+m} - h^(5)_k` relative to the target layer-22 norm `||h^(22)_k||_2`."""
+    var m_f32 = Float32(step_offset_m)
+    var max_vel_sq = max_vel_ratio * max_vel_ratio
+    var max_acc_sq = max_acc_ratio * max_acc_ratio
+    var f16_max = SIMD[DType.float32, 8](65500.0)
+    var f16_min = SIMD[DType.float32, 8](-65500.0)
+
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var h_ptr = canvas_hidden + b * embed_dim
+        var hp_ptr = h_prev_full + orig_t * embed_dim
+        var d_ptr = taylor_D + orig_t * embed_dim
+        var d1_ptr = taylor_d1 + orig_t * embed_dim
+        var d2_ptr = taylor_d2 + orig_t * embed_dim
+
+        var norm_h22_sq = SIMD[DType.float32, 8](0.0)
+        var norm_dh5_sq = SIMD[DType.float32, 8](0.0)
+        var norm_d_sq = SIMD[DType.float32, 8](0.0)
+        var norm_d1_sq = SIMD[DType.float32, 8](0.0)
+        var norm_d2_sq = SIMD[DType.float32, 8](0.0)
+
+        for i in range(0, embed_dim, 8):
+            var hv = h_ptr.load[8](i).cast[DType.float32]()
+            var hpv = hp_ptr.load[8](i).cast[DType.float32]()
+            var dv = d_ptr.load[8](i)
+            var h22_prev = hpv + dv
+            var dh5 = hv - hpv
+            norm_h22_sq = h22_prev.fma(h22_prev, norm_h22_sq)
+            norm_dh5_sq = dh5.fma(dh5, norm_dh5_sq)
+            if full_steps_count >= 2:
+                var d1v = d1_ptr.load[8](i)
+                var d2v = d2_ptr.load[8](i)
+                norm_d_sq = dv.fma(dv, norm_d_sq)
+                norm_d1_sq = d1v.fma(d1v, norm_d1_sq)
+                norm_d2_sq = d2v.fma(d2v, norm_d2_sq)
+
+        var h22_norm = sqrt(norm_h22_sq.reduce_add() + Float32(1e-6))
+        var dh5_norm = sqrt(norm_dh5_sq.reduce_add() + Float32(1e-6))
+        var gamma: Float32 = 1.0
+        if dh5_norm > Float32(0.15) * h22_norm:
+            gamma = (Float32(0.15) * h22_norm) / dh5_norm
+
+        var c1: Float32 = 0.0
+        var c2: Float32 = 0.0
+        if full_steps_count >= 2:
+            var d_sq = norm_d_sq.reduce_add()
+            var d1_sq = norm_d1_sq.reduce_add()
+            var d2_sq = norm_d2_sq.reduce_add()
+            if d1_sq <= max_vel_sq * (d_sq + Float32(1e-6)):
+                c1 = m_f32
+                if full_steps_count >= 3 and d2_sq <= max_acc_sq * (d1_sq + Float32(1e-6)):
+                    c2 = Float32(0.5) * m_f32 * (m_f32 + Float32(1.0))
+
+        var gamma_vec = SIMD[DType.float32, 8](gamma)
+        var c1_vec = SIMD[DType.float32, 8](c1)
+        var c2_vec = SIMD[DType.float32, 8](c2)
+        for i in range(0, embed_dim, 8):
+            var hv = h_ptr.load[8](i).cast[DType.float32]()
+            var hpv = hp_ptr.load[8](i).cast[DType.float32]()
+            var dv = d_ptr.load[8](i)
+            var d1v = d1_ptr.load[8](i)
+            var d2v = d2_ptr.load[8](i)
+            var forecast = (hpv + dv) + gamma_vec * (hv - hpv) + c1_vec * d1v + c2_vec * d2v
+            forecast = forecast.clamp(f16_min, f16_max)
+            h_ptr.store[8](i, forecast.cast[DType.float16]())
+
+

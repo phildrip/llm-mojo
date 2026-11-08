@@ -18,6 +18,9 @@ from diffusion_kernels import (
     update_locked_mask,
     gather_active,
     scatter_active_sampler_outputs,
+    teacache_eval_gate,
+    taylorseer_record_full_step,
+    taylorseer_forecast_skipped_step,
 )
 import std.time
 
@@ -350,10 +353,15 @@ def rms_norm[
         acc = acc + v * v
     var sum_sq = acc.reduce_add()
     var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
+    var f16_min = SIMD[DType.float32, 8](-65500.0)
+    var f16_max = SIMD[DType.float32, 8](65500.0)
     for i in range(0, size, 8):
         var v = x.load[8](i).cast[DType.float32]()
         var weight = w.load[8](i)
-        out_ptr.store[8](i, (v * inv_rms * weight).cast[out_type]())
+        var res = v * inv_rms * weight
+        comptime if out_type == DType.float16:
+            res = res.clamp(f16_min, f16_max)
+        out_ptr.store[8](i, res.cast[out_type]())
 
 @always_inline
 def rms_norm_noscale[
@@ -370,9 +378,14 @@ def rms_norm_noscale[
         acc = acc + v * v
     var sum_sq = acc.reduce_add()
     var inv_rms = 1.0 / sqrt(sum_sq / Float32(size) + 1e-6)
+    var f16_min = SIMD[DType.float32, 8](-65500.0)
+    var f16_max = SIMD[DType.float32, 8](65500.0)
     for i in range(0, size, 8):
         var v = x.load[8](i).cast[DType.float32]()
-        out_ptr.store[8](i, (v * inv_rms).cast[out_type]())
+        var res = v * inv_rms
+        comptime if out_type == DType.float16:
+            res = res.clamp(f16_min, f16_max)
+        out_ptr.store[8](i, res.cast[out_type]())
 
 @always_inline
 def unpack_4bytes(b0: UInt8, b1: UInt8, b2: UInt8, b3: UInt8) -> SIMD[DType.float32, 8]:
@@ -1338,6 +1351,13 @@ def main() raises:
     var compact_entropy = alloc[Float32](CANVAS_LEN)
     var compact_argmax = alloc[Int](CANVAS_LEN)
     var compact_new_tokens = alloc[Int](CANVAS_LEN)
+    # TeaCache & TaylorSeer feature forecasting buffers (llm-mojo-2tc.4 & 2tc.7)
+    var teacache_h5_prev = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var taylor_h5_curr = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var taylor_D = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var taylor_d1 = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var taylor_d2 = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var teacache_accum = alloc[Float32](1)
 
     print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
           (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
@@ -1673,6 +1693,9 @@ def main() raises:
         var confidence_threshold: Float32 = 0.005
         for t in range(CANVAS_LEN):
             locked_mask[t] = False
+        var full_steps_count = 0
+        var consec_skips = 0
+        teacache_accum[0] = 0.0
 
         while denoise_step < max_steps_this_turn:
             var active_len = build_active_canvas_map(locked_mask, active_canvas_idx, CANVAS_LEN)
@@ -1681,6 +1704,14 @@ def main() raises:
                 break
             print("  [denoise ", denoise_step, "] active_len=", active_len, "/", CANVAS_LEN)
             steps_executed += 1
+
+            # Temperature schedule (computed up front for TeaCache polynomial modulation & Sampler)
+            var remaining = MAX_DENOISE_STEPS - denoise_step
+            if remaining < 1:
+                remaining = 1
+            var temp = t_min + (t_max - t_min) * Float32(remaining) / Float32(MAX_DENOISE_STEPS)
+            if temp < 1e-10:
+                temp = 1e-10
 
             # Compute canvas embeddings + batched self-conditioning on active_len unconverged tokens (llm-mojo-2tc.1 & 2tc.3)
             var t_sc_start = std.time.perf_counter()
@@ -1709,7 +1740,10 @@ def main() raises:
             var t_sc_end = std.time.perf_counter()
 
             # Decoder forward: layer-first, compacted active_len projections, full bidirectional attention
+            var skip_mid_layers = False
             for l in range(30):
+                if skip_mid_layers and l >= 6 and l <= 22:
+                    continue
                 var weights = CONFIG.get_layer_weights(l, base_ptr + CONFIG.get_layer_offset(l))
                 var is_global = CONFIG.is_global_layer(l)
                 var layer_heads = 16
@@ -1873,11 +1907,13 @@ def main() raises:
                     in_stride=MAX_Q_SIZE, out_stride=CONFIG.embed_dim
                 )
                 rms_norm_batch[in_type=DType.float32, out_type=DType.float32](canvas_proj_attn, weights.post_attention_layernorm_weight, canvas_proj_attn, active_len, CONFIG.embed_dim)
+                var f16_min_v = SIMD[DType.float32, 8](-65500.0)
+                var f16_max_v = SIMD[DType.float32, 8](65500.0)
                 for b in range(active_len):
                     var hidden = canvas_hidden + b * CONFIG.embed_dim
                     var proj = canvas_proj_attn + b * CONFIG.embed_dim
                     for i in range(0, CONFIG.embed_dim, 8):
-                        var val = hidden.load[8](i).cast[DType.float32]() + proj.load[8](i)
+                        var val = (hidden.load[8](i).cast[DType.float32]() + proj.load[8](i)).clamp(f16_min_v, f16_max_v)
                         hidden.store[8](i, val.cast[DType.float16]())
 
                 # Phase 2c + 2d: Shared MLP + MoE Experts (overlapped across iGPU & CPU when use_gpu=True)
@@ -1964,7 +2000,7 @@ def main() raises:
                     for i in range(CONFIG.top_k_experts):
                         var idx = top_idx_t[i]
                         var norm_prob = top_val_t[i] / (sum_top_val + 1e-10)
-                        if norm_prob < 0.05:
+                        if idx < 0 or norm_prob < 0.05:
                             top_weights_t[i] = 0.0
                         else:
                             top_weights_t[i] = norm_prob * weights.router_per_expert_scale[idx]
@@ -2003,7 +2039,7 @@ def main() raises:
                             var g_v = g_ptr.load[8](i)
                             var u_v = u_ptr.load[8](i)
                             var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * g_v))
-                            var act = g_v * sig * u_v
+                            var act = (g_v * sig * u_v).clamp(f16_min_v, f16_max_v)
                             out_ptr.store[8](i, act.cast[DType.float16]())
                     q4_gemm_l1_2x4[DType.float16, DType.float16](
                         weights.w_down_packed, weights.w_down_scales,
@@ -2024,13 +2060,15 @@ def main() raises:
                     var combined = canvas_combined + b * CONFIG.embed_dim
                     var ffn = canvas_ffn_out + b * CONFIG.embed_dim
                     for i in range(0, CONFIG.embed_dim, 8):
-                        combined.store[8](i, shared_n.load[8](i) + moe_n.load[8](i))
+                        var comb_f32 = (shared_n.load[8](i).cast[DType.float32]() + moe_n.load[8](i).cast[DType.float32]()).clamp(f16_min_v, f16_max_v)
+                        combined.store[8](i, comb_f32.cast[DType.float16]())
                     rms_norm[in_type=DType.float16, out_type=DType.float16](combined, weights.post_feedforward_layernorm_weight, ffn, CONFIG.embed_dim)
                     var scalar_vec = SIMD[DType.float32, 8](scalar)
                     for i in range(0, CONFIG.embed_dim, 8):
                         var h_val = hidden.load[8](i).cast[DType.float32]()
                         var ffn_val = ffn.load[8](i).cast[DType.float32]()
-                        hidden.store[8](i, ((h_val + ffn_val) * scalar_vec).cast[DType.float16]())
+                        var out_h = ((h_val + ffn_val) * scalar_vec).clamp(f16_min_v, f16_max_v)
+                        hidden.store[8](i, out_h.cast[DType.float16]())
 
                 if l == 0 or l == 15 or l == 29:
                     print("    layer ", l, " qkv=", String((tl_qkv_end - tl_qkv) * 1000), "ms",
@@ -2038,15 +2076,59 @@ def main() raises:
                           " ffn=", String((tl_ffn_end - tl_ffn) * 1000), "ms",
                           " moe=", String((tl_moe_end - tl_moe) * 1000), "ms")
 
+                # TeaCache (CVPR 2025) & TaylorSeer (ICCV 2025) middle-block forecasting (llm-mojo-2tc.4 & 2tc.7)
+                if l == 5:
+                    skip_mid_layers = teacache_eval_gate(
+                        canvas_hidden,
+                        teacache_h5_prev,
+                        active_canvas_idx,
+                        active_len,
+                        CONFIG.embed_dim,
+                        temp,
+                        full_steps_count,
+                        consec_skips,
+                        teacache_accum,
+                        teacache_thresh=0.72,
+                        max_consec_skips=2,
+                    )
+                    if skip_mid_layers:
+                        consec_skips += 1
+                        taylorseer_forecast_skipped_step(
+                            canvas_hidden,
+                            teacache_h5_prev,
+                            active_canvas_idx,
+                            taylor_D,
+                            taylor_d1,
+                            taylor_d2,
+                            active_len,
+                            CONFIG.embed_dim,
+                            full_steps_count,
+                            consec_skips,
+                        )
+                        print("    -> TeaCache + TaylorSeer: forecasted layers 6..22 (m=", consec_skips, " accum=", String(teacache_accum[0]), ")")
+                    else:
+                        for b in range(active_len):
+                            var s_ptr = canvas_hidden + b * CONFIG.embed_dim
+                            var d_ptr = taylor_h5_curr + b * CONFIG.embed_dim
+                            for i in range(0, CONFIG.embed_dim, 8):
+                                d_ptr.store[8](i, s_ptr.load[8](i))
+                elif l == 22 and not skip_mid_layers:
+                    taylorseer_record_full_step(
+                        taylor_h5_curr,
+                        canvas_hidden,
+                        active_canvas_idx,
+                        taylor_D,
+                        taylor_d1,
+                        taylor_d2,
+                        active_len,
+                        CONFIG.embed_dim,
+                        full_steps_count,
+                    )
+                    full_steps_count += 1
+                    consec_skips = 0
+
             # --- Sampler step (Sparse Top-32 reservoir + soft-embed on active_len tokens, llm-mojo-2tc.1 & 2tc.3) ---
             var t_samp_start = std.time.perf_counter()
-            # Temperature schedule
-            var remaining = MAX_DENOISE_STEPS - denoise_step
-            if remaining < 1:
-                remaining = 1
-            var temp = t_min + (t_max - t_min) * Float32(remaining) / Float32(MAX_DENOISE_STEPS)
-            if temp < 1e-10:
-                temp = 1e-10
 
             for t in range(CANVAS_LEN):
                 rng_state ^= rng_state >> 12
@@ -2356,4 +2438,10 @@ def main() raises:
     compact_entropy.free()
     compact_argmax.free()
     compact_new_tokens.free()
+    teacache_h5_prev.free()
+    taylor_h5_curr.free()
+    taylor_D.free()
+    taylor_d1.free()
+    taylor_d2.free()
+    teacache_accum.free()
     gpu_ctx.close()
