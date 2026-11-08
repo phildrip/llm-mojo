@@ -378,6 +378,9 @@ struct KFDContext(Movable):
     var c_errno_loc: def() thin abi("C") -> Int
     var cpu_sfence: def(Int32) thin abi("C") -> Int32
     var cpu_clflush: def(Int) thin abi("C") -> Int32
+    var cpu_clflush_range: def(Int, Int) thin abi("C") -> Int32
+    var cpu_wait_completion: def(Int) thin abi("C") -> Int32
+    var cpu_disable_glibc_mmap: def(Int32) thin abi("C") -> Int32
     var usleep_fn: def(UInt32) thin abi("C") -> Int32
 
     var ring_buf: GPUMemoryBuffer
@@ -472,7 +475,15 @@ struct KFDContext(Movable):
         self.c_errno_loc = self.libc.get_function[def() thin abi("C") -> Int]("__errno_location")
         self.cpu_sfence = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_sfence")
         self.cpu_clflush = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_clflush")
+        self.cpu_clflush_range = self.cpu_fence_lib.get_function[def(Int, Int) thin abi("C") -> Int32]("cpu_clflush_range")
+        self.cpu_wait_completion = self.cpu_fence_lib.get_function[def(Int) thin abi("C") -> Int32]("cpu_wait_completion")
+        self.cpu_disable_glibc_mmap = self.cpu_fence_lib.get_function[def(Int32) thin abi("C") -> Int32]("cpu_disable_glibc_mmap")
         self.usleep_fn = self.libc.get_function[def(UInt32) thin abi("C") -> Int32]("usleep")
+
+        # Prevent glibc free() from ever calling munmap() or shrinking the brk heap while KFD PASID is active.
+        # On amdgpu/gfx90c, munmap() on the process mm_struct fires mmu_notifier_invalidate_range_start,
+        # triggering CWSR wave preemption and UTCL2 invalidation on the shared PASID.
+        _ = self.cpu_disable_glibc_mmap(0)
 
         self.kfd_fd = -1
         self.drm_fd = -1
@@ -676,6 +687,9 @@ struct KFDContext(Movable):
         self.c_errno_loc = take.c_errno_loc
         self.cpu_sfence = take.cpu_sfence
         self.cpu_clflush = take.cpu_clflush
+        self.cpu_clflush_range = take.cpu_clflush_range
+        self.cpu_wait_completion = take.cpu_wait_completion
+        self.cpu_disable_glibc_mmap = take.cpu_disable_glibc_mmap
         self.usleep_fn = take.usleep_fn
         self.ring_buf = take.ring_buf^
         self.gart_buf = take.gart_buf^
@@ -742,13 +756,7 @@ struct KFDContext(Movable):
         """Flushes/invalidates CPU cache lines covering [addr, addr + size_bytes) and issues sfence."""
         if size_bytes <= 0:
             return
-        var clflush = self.cpu_clflush
-        var base = (addr // 64) * 64
-        var end = addr + size_bytes
-        while base < end:
-            _ = clflush(base)
-            base += 64
-        _ = self.cpu_sfence(0)
+        _ = self.cpu_clflush_range(addr, size_bytes)
 
     def alloc_gpu_buffer(
         self,
@@ -1123,37 +1131,21 @@ struct KFDContext(Movable):
         flush_cache: Bool = True,
         out_elem_bytes: Int = 4,
     ) raises:
-        var cpu_sfence = self.cpu_sfence
-        var cpu_clflush = self.cpu_clflush
         var completion_slot_cpu_addr = self.completion_buf.cpu_addr + slot * 64
-        var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
-
-        var attempts = 0
-        var c_usleep = self.usleep_fn
-        while True:
-            if completion_ptr[0] == 1:
-                break
-            attempts += 1
-            if attempts > 500000:
-                _ = cpu_clflush(completion_slot_cpu_addr)
-                _ = cpu_sfence(0)
-                _ = c_usleep(5)
-            elif attempts % 5000 == 0:
-                _ = cpu_clflush(completion_slot_cpu_addr)
-                _ = cpu_sfence(0)
-            if attempts > 10000000:
-                var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](
-                    unsafe_from_address=self.gart_buf.cpu_addr + 56
-                )[0]
-                var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](
-                    unsafe_from_address=self.gart_buf.cpu_addr + 128
-                )[0]
-                print("GPU Execution Timeout details:")
-                print("  Attempts reached:", attempts)
-                print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
-                print("  Completion flag in memory:", completion_ptr[0])
-                print("  Atomic counter in memory:", completion_ptr[1])
-                raise Error("GPU execution timed out in wait_matmul!")
+        var wait_rc = self.cpu_wait_completion(completion_slot_cpu_addr)
+        if wait_rc != 0:
+            var completion_ptr = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=completion_slot_cpu_addr)
+            var current_wptr = UnsafePointer[UInt64, MutUntrackedOrigin](
+                unsafe_from_address=self.gart_buf.cpu_addr + 56
+            )[0]
+            var current_rptr = UnsafePointer[UInt64, MutUntrackedOrigin](
+                unsafe_from_address=self.gart_buf.cpu_addr + 128
+            )[0]
+            print("GPU Execution Timeout details:")
+            print("  GART wptr:", current_wptr, "| GART rptr:", current_rptr)
+            print("  Completion flag in memory:", completion_ptr[0])
+            print("  Atomic counter in memory:", completion_ptr[1])
+            raise Error("GPU execution timed out in wait_matmul!")
 
         if flush_cache and out_ptr_addr != 0:
             self.flush_cache_range(out_ptr_addr, c_out * batch_size * out_elem_bytes)

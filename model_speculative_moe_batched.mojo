@@ -1406,11 +1406,13 @@ def main() raises:
     print("Loading AutoTokenizer...")
     var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
     var py_builtins = Python.import_module("builtins")
+    var py_gc = Python.import_module("gc")
+    _ = py_gc.disable()
     try:
         _ = Python.import_module("readline")
     except:
         pass
-    print("Tokenizer loaded successfully!")
+    print("Tokenizer loaded successfully! (Python cyclic GC disabled for KFD PASID safety)")
 
     # MTP SPECULATIVE DECODING SETUP
     var use_mtp = True
@@ -2887,21 +2889,22 @@ def main() raises:
 
                             if use_gpu:
                                 gpu_ctx.flush_cache_range(pref_norm_x.__int__(), verify_b * CONFIG.embed_dim * 4)
-                                var slot_k = gpu_ctx.enqueue_matmul(
-                                    weights.wk_packed.__int__(),
-                                    weights.wk_scales.__int__(),
-                                    pref_norm_x.__int__(),
-                                    pref_k.__int__(),
-                                    CONFIG.embed_dim,
-                                    kv_stride,
-                                    batch_size=verify_b,
-                                    flush_cache=False,
-                                    barrier=False,
-                                    ring_doorbell_now=False,
-                                )
-                                var slot_v = 0
-                                if not is_global:
-                                    slot_v = gpu_ctx.enqueue_matmul(
+                                var slot_kv = 0
+                                if is_global:
+                                    slot_kv = gpu_ctx.enqueue_matmul(
+                                        weights.wk_packed.__int__(),
+                                        weights.wk_scales.__int__(),
+                                        pref_norm_x.__int__(),
+                                        pref_k.__int__(),
+                                        CONFIG.embed_dim,
+                                        kv_stride,
+                                        batch_size=verify_b,
+                                        flush_cache=False,
+                                        barrier=False,
+                                        ring_doorbell_now=True,
+                                    )
+                                else:
+                                    slot_kv = gpu_ctx.enqueue_matmul(
                                         weights.wv_packed.__int__(),
                                         weights.wv_scales.__int__(),
                                         pref_norm_x.__int__(),
@@ -2911,18 +2914,22 @@ def main() raises:
                                         batch_size=verify_b,
                                         flush_cache=False,
                                         barrier=False,
-                                        ring_doorbell_now=False,
+                                        ring_doorbell_now=True,
                                     )
-                                gpu_ctx.ring_doorbell()
-                                # CDC-6600 Asymmetric Overlap: 8-core CPU computes 5-token Wq while iGPU computes Wk + Wv!
+                                # Tail-straggler balanced QKV: 8-core CPU computes 5-token Wq (+ Wk on SWA) while iGPU computes Wv (or Wk on Global)!
                                 if verify_b == 5:
                                     q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
+                                    if not is_global:
+                                        q4_matmul_batch5(weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
                                 else:
                                     for b in range(verify_b):
                                         q4_matmul_vec(weights.wq_packed, weights.wq_scales, pref_norm_x + b * CONFIG.embed_dim, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
-                                gpu_ctx.wait_matmul(slot_k, pref_k.__int__(), kv_stride, batch_size=verify_b)
-                                if not is_global:
-                                    gpu_ctx.wait_matmul(slot_v, pref_v.__int__(), kv_stride, batch_size=verify_b)
+                                        if not is_global:
+                                            q4_matmul_vec(weights.wk_packed, weights.wk_scales, pref_norm_x + b * CONFIG.embed_dim, pref_k + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                if is_global:
+                                    gpu_ctx.wait_matmul(slot_kv, pref_k.__int__(), kv_stride, batch_size=verify_b)
+                                else:
+                                    gpu_ctx.wait_matmul(slot_kv, pref_v.__int__(), kv_stride, batch_size=verify_b)
                             else:
                                 if verify_b == 5:
                                     q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)

@@ -105,3 +105,24 @@ This avoids MLIR/LLVM layout macros and is fully compatible with Mojo 2026 synta
   grep -a "amdgpu" /var/log/kern.log | tail -n 50
   grep -a "kfd" /var/log/kern.log | tail -n 50
   ```
+
+---
+
+## 6. Hybrid CPU+iGPU Shared PASID & `munmap()` MMU-Notifier Trap (`gfxhub0` UTCL2 Fault)
+
+### The Problem
+When CPU worker threads run in the same process (`mm_struct` / `PASID`) as a bare-metal KFD AQL queue (`AMDKFD_IOC_ACQUIRE_VM`), any large temporary heap allocation that exceeds glibc's `M_MMAP_THRESHOLD` (`128 KB`) causes `free()` to invoke `munmap()` while GPU waves may be in flight.
+- On Linux `amdgpu` (`gfx90c`), `munmap()` on the process's `mm_struct` fires `mmu_notifier_invalidate_range_start`, which triggers **CWSR wave preemption and UTCL2 TLB invalidation on the shared PASID** (`[gfxhub0] retry page fault ... from IH client 0x1b (UTCL2)`).
+- Because a bare-metal user-mode AQL queue has no CWSR trap-handler shader loaded, CWSR preemption faults and hard-locks the iGPU.
+
+### The Solution
+1. **Disable glibc `mmap()` and heap trimming at KFD startup (`scratch/cpu_fence.c` $\to$ `cpu_disable_glibc_mmap`):**
+   ```c
+   mallopt(M_MMAP_MAX, 0);
+   mallopt(M_TRIM_THRESHOLD, -1);
+   ```
+   `KFDContext.__init__` calls `cpu_disable_glibc_mmap(0)` immediately so `free()` never calls `munmap()` or shrinks the `brk` heap while KFD is active.
+2. **Zero heap allocations (`alloc`/`free`) and `gc.disable()` while GPU waves are in flight:**
+   Use pre-allocated scratch buffers or stack `InlineArray` buffers inside hybrid CPU+iGPU regions, and disable Python's cyclic GC (`gc.disable()`) after loading `AutoTokenizer`.
+3. **Keep VRAM carveout allocations minimal (`DEFAULT_GTT_FLAGS` for data buffers):**
+   Only `cwsr_buf` (`2.8 MB`) and `eop_buf` (`4 KB`) use `DEFAULT_VRAM_FLAGS`; all weight and activation buffers use `DEFAULT_GTT_FLAGS` so the desktop compositor's VRAM carveout is never starved.
