@@ -391,10 +391,9 @@ struct Q4Embedding:
         for b in range(num_blocks):
             var scale = self.scales[row_scales_offset + b]
             var bytes = self.packed_weights.load[16](row_packed_offset + b * 16)
-            var w_even = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-            var w_odd = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-            var block_dot = w_even * x_even.load[16](b * 16) + w_odd * x_odd.load[16](b * 16)
-            acc = acc + block_dot * scale
+            var w_even = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * scale
+            var w_odd = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * scale
+            acc = w_even.fma(x_even.load[16](b * 16), w_odd.fma(x_odd.load[16](b * 16), acc))
         return acc.reduce_add()
 
     @always_inline
@@ -423,9 +422,9 @@ struct Q4Embedding:
         for b in range(b_25, b_50):
             var sc = self.scales[r_sc + b]
             var bytes = self.packed_weights.load[16](r_pack + b * 16)
-            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-            acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * sc
+            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            acc = we.fma(x_even.load[16](b * 16), wo.fma(x_odd.load[16](b * 16), acc))
 
         var p50 = acc.reduce_add()
         if p50 + self.row_tail_bound_11[r] * x_rms_50 < prune_thresh:
@@ -435,9 +434,9 @@ struct Q4Embedding:
         for b in range(b_50, b_75):
             var sc = self.scales[r_sc + b]
             var bytes = self.packed_weights.load[16](r_pack + b * 16)
-            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-            acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * sc
+            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            acc = we.fma(x_even.load[16](b * 16), wo.fma(x_odd.load[16](b * 16), acc))
 
         var p75 = acc.reduce_add()
         if p75 + self.row_tail_bound_75[r] * x_rms_75 < prune_thresh:
@@ -447,9 +446,9 @@ struct Q4Embedding:
         for b in range(b_75, num_blocks):
             var sc = self.scales[r_sc + b]
             var bytes = self.packed_weights.load[16](r_pack + b * 16)
-            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-            acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * sc
+            var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+            acc = we.fma(x_even.load[16](b * 16), wo.fma(x_odd.load[16](b * 16), acc))
 
         var sum = acc.reduce_add()
         if sum > local_max_sum:
@@ -550,15 +549,15 @@ struct Q4Embedding:
                     var xo = x_odd.load[16](b * 16)
                     var sc0 = self.s1_scales[r0_s1_sc + b]
                     var b0 = self.s1_packed.load[16](r0_s1_p + b * 16)
-                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0 = we0.fma(xe, wo0.fma(xo, acc0))
 
                     var sc1 = self.s1_scales[r1_s1_sc + b]
                     var b1 = self.s1_packed.load[16](r1_s1_p + b * 16)
-                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    acc1 = we1.fma(xe, wo1.fma(xo, acc1))
 
                 var p0 = acc0.reduce_add()
                 if p0 + self.row_tail_bound_25[r] * x_rms_25 >= prune_thresh:
@@ -796,11 +795,11 @@ struct Q4Embedding:
                     var bytes = self.s1_packed.load[16](r_s1_p + b * 16)
                     var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
                     var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
-                    acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
-                    acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
-                    acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
-                    acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
-                    acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+                    acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                    acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                    acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                    acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                    acc4 = we.fma(xe4.load[16](b * 16), wo.fma(xo4.load[16](b * 16), acc4))
 
                 var tb25 = self.row_tail_bound_25[r]
                 var p0 = acc0.reduce_add()
@@ -825,11 +824,11 @@ struct Q4Embedding:
                         var bytes = self.packed_weights.load[16](r_pack + b * 16)
                         var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
                         var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
-                        acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
-                        acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
-                        acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
-                        acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
-                        acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+                        acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                        acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                        acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                        acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                        acc4 = we.fma(xe4.load[16](b * 16), wo.fma(xo4.load[16](b * 16), acc4))
 
                     var tb50 = self.row_tail_bound_11[r]
                     k0 = (acc0.reduce_add() + tb50 * rms50_0 >= pth0)
@@ -845,11 +844,11 @@ struct Q4Embedding:
                             var bytes = self.packed_weights.load[16](r_pack + b * 16)
                             var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
                             var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
-                            acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
-                            acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
-                            acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
-                            acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
-                            acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+                            acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                            acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                            acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                            acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                            acc4 = we.fma(xe4.load[16](b * 16), wo.fma(xo4.load[16](b * 16), acc4))
 
                         var tb75 = self.row_tail_bound_75[r]
                         k0 = (acc0.reduce_add() + tb75 * rms75_0 >= pth0)
@@ -865,11 +864,11 @@ struct Q4Embedding:
                                 var bytes = self.packed_weights.load[16](r_pack + b * 16)
                                 var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
                                 var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
-                                acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
-                                acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
-                                acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
-                                acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
-                                acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+                                acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                                acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                                acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                                acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                                acc4 = we.fma(xe4.load[16](b * 16), wo.fma(xo4.load[16](b * 16), acc4))
 
                             var sum0 = acc0.reduce_add()
                             if sum0 > lmax0:

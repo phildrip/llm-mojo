@@ -121,15 +121,15 @@ def q4_matmul_vec(
 
                 var sc0 = scales[rs0 + b]
                 var b0 = W_packed.load[16](rp0 + b * 16)
-                var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                acc0 = we0.fma(xe, wo0.fma(xo, acc0))
 
                 var sc1 = scales[rs1 + b]
                 var b1 = W_packed.load[16](rp1 + b * 16)
-                var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+                var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                acc1 = we1.fma(xe, wo1.fma(xo, acc1))
 
             out_ptr[r] = acc0.reduce_add()
             out_ptr[r + 1] = acc1.reduce_add()
@@ -142,9 +142,9 @@ def q4_matmul_vec(
             for b in range(c_in_blocks):
                 var scale = scales[r_offset_scales + b]
                 var bytes = W_packed.load[16](r_offset_packed + b * 16)
-                var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                acc = acc + (we * x_even.load[16](b * 16) + wo * x_odd.load[16](b * 16)) * scale
+                var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * scale
+                var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * scale
+                acc = we.fma(x_even.load[16](b * 16), wo.fma(x_odd.load[16](b * 16), acc))
             out_ptr[r] = acc.reduce_add()
             r += 1
 
@@ -228,11 +228,11 @@ def q4_matmul_batch5(
                 var bytes = W_packed.load[16](rp + b * 16)
                 var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
                 var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
-                acc0 = acc0 + (we * xe0.load[16](b * 16) + wo * xo0.load[16](b * 16))
-                acc1 = acc1 + (we * xe1.load[16](b * 16) + wo * xo1.load[16](b * 16))
-                acc2 = acc2 + (we * xe2.load[16](b * 16) + wo * xo2.load[16](b * 16))
-                acc3 = acc3 + (we * xe3.load[16](b * 16) + wo * xo3.load[16](b * 16))
-                acc4 = acc4 + (we * xe4.load[16](b * 16) + wo * xo4.load[16](b * 16))
+                acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                acc4 = we.fma(xe4.load[16](b * 16), wo.fma(xo4.load[16](b * 16), acc4))
             out_batch[0 * c_out + r] = acc0.reduce_add()
             out_batch[1 * c_out + r] = acc1.reduce_add()
             out_batch[2 * c_out + r] = acc2.reduce_add()
@@ -487,15 +487,15 @@ def run_moe_experts_stage1_8core(
                     var xo = xo_ptr.load[16](b * 16)
                     var sc0 = gu_s[rs0 + b]
                     var b0 = gu_p.load[16](rp0 + b * 16)
-                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0 = we0.fma(xe, wo0.fma(xo, acc0))
 
                     var sc1 = gu_s[rs1 + b]
                     var b1 = gu_p.load[16](rp1 + b * 16)
-                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    acc1 = we1.fma(xe, wo1.fma(xo, acc1))
                 gu_out[r] = acc0.reduce_add()
                 gu_out[r + 1] = acc1.reduce_add()
                 r += 2
@@ -508,9 +508,9 @@ def run_moe_experts_stage1_8core(
                     var xo = xo_ptr.load[16](b * 16)
                     var sc0 = gu_s[rs0 + b]
                     var b0 = gu_p.load[16](rp0 + b * 16)
-                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0 = we0.fma(xe, wo0.fma(xo, acc0))
                 gu_out[r] = acc0.reduce_add()
                 r += 1
 
@@ -576,15 +576,15 @@ def run_moe_experts_stage2_8core(
                     var xo = ad_o.load[16](b * 16)
                     var sc0 = dn_s[rs0 + b]
                     var b0 = dn_p.load[16](rp0 + b * 16)
-                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0 = we0.fma(xe, wo0.fma(xo, acc0))
 
                     var sc1 = dn_s[rs1 + b]
                     var b1 = dn_p.load[16](rp1 + b * 16)
-                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc1 = acc1 + (we1 * xe + wo1 * xo) * sc1
+                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    acc1 = we1.fma(xe, wo1.fma(xo, acc1))
                 moe_out[r] += acc0.reduce_add() * w_e
                 moe_out[r + 1] += acc1.reduce_add() * w_e
                 r += 2
@@ -597,9 +597,9 @@ def run_moe_experts_stage2_8core(
                     var xo = ad_o.load[16](b * 16)
                     var sc0 = dn_s[rs0 + b]
                     var b0 = dn_p.load[16](rp0 + b * 16)
-                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                    acc0 = acc0 + (we0 * xe + wo0 * xo) * sc0
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0 = we0.fma(xe, wo0.fma(xo, acc0))
                 moe_out[r] += acc0.reduce_add() * w_e
                 r += 1
 
@@ -688,15 +688,15 @@ def run_moe_coalesced_stage1(
                         var xo0 = in_o0.load[16](blk * 16)
                         var sc0 = gu_s[rs0 + blk]
                         var bytes0 = gu_p.load[16](rp0 + blk * 16)
-                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we0 * xe0 + wo0 * xo0) * sc0
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0 = we0.fma(xe0, wo0.fma(xo0, acc0))
 
                         var sc1 = gu_s[rs1 + blk]
                         var bytes1 = gu_p.load[16](rp1 + blk * 16)
-                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc1 = acc1 + (we1 * xe0 + wo1 * xo0) * sc1
+                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        acc1 = we1.fma(xe0, wo1.fma(xo0, acc1))
                     out0[r] = acc0.reduce_add()
                     out0[r + 1] = acc1.reduce_add()
                     r += 2
@@ -709,9 +709,9 @@ def run_moe_coalesced_stage1(
                         var xo0 = in_o0.load[16](blk * 16)
                         var sc0 = gu_s[rs0 + blk]
                         var bytes0 = gu_p.load[16](rp0 + blk * 16)
-                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we0 * xe0 + wo0 * xo0) * sc0
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0 = we0.fma(xe0, wo0.fma(xo0, acc0))
                     out0[r] = acc0.reduce_add()
                     r += 1
             elif m_count == 2:
@@ -720,7 +720,43 @@ def run_moe_coalesced_stage1(
                 var in_o0 = in_e0 + half_in
                 var in_e1 = batch_in_deint + b_t1 * embed_dim
                 var in_o1 = in_e1 + half_in
-                for r in range(sr, er):
+                var out0 = gu_out_scratch + base_slot * gate_up_rows
+                var out1 = gu_out_scratch + (base_slot + 1) * gate_up_rows
+                var r = sr
+                while r + 1 < er:
+                    var rp0 = r * half_in
+                    var rs0 = r * c_in_blocks
+                    var rp1 = (r + 1) * half_in
+                    var rs1 = (r + 1) * c_in_blocks
+                    var acc0_r0 = SIMD[DType.float32, 16](0.0)
+                    var acc1_r0 = SIMD[DType.float32, 16](0.0)
+                    var acc0_r1 = SIMD[DType.float32, 16](0.0)
+                    var acc1_r1 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(c_in_blocks):
+                        var xe0 = in_e0.load[16](blk * 16)
+                        var xo0 = in_o0.load[16](blk * 16)
+                        var xe1 = in_e1.load[16](blk * 16)
+                        var xo1 = in_o1.load[16](blk * 16)
+
+                        var sc0 = gu_s[rs0 + blk]
+                        var bytes0 = gu_p.load[16](rp0 + blk * 16)
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0_r0 = we0.fma(xe0, wo0.fma(xo0, acc0_r0))
+                        acc1_r0 = we0.fma(xe1, wo0.fma(xo1, acc1_r0))
+
+                        var sc1 = gu_s[rs1 + blk]
+                        var bytes1 = gu_p.load[16](rp1 + blk * 16)
+                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        acc0_r1 = we1.fma(xe0, wo1.fma(xo0, acc0_r1))
+                        acc1_r1 = we1.fma(xe1, wo1.fma(xo1, acc1_r1))
+                    out0[r] = acc0_r0.reduce_add()
+                    out1[r] = acc1_r0.reduce_add()
+                    out0[r + 1] = acc0_r1.reduce_add()
+                    out1[r + 1] = acc1_r1.reduce_add()
+                    r += 2
+                while r < er:
                     var rp = r * half_in
                     var rs = r * c_in_blocks
                     var acc0 = SIMD[DType.float32, 16](0.0)
@@ -728,12 +764,13 @@ def run_moe_coalesced_stage1(
                     for blk in range(c_in_blocks):
                         var sc = gu_s[rs + blk]
                         var bytes = gu_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
-                    gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
-                    gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(in_e0.load[16](blk * 16), wo.fma(in_o0.load[16](blk * 16), acc0))
+                        acc1 = we.fma(in_e1.load[16](blk * 16), wo.fma(in_o1.load[16](blk * 16), acc1))
+                    out0[r] = acc0.reduce_add()
+                    out1[r] = acc1.reduce_add()
+                    r += 1
             elif m_count == 3:
                 var b_t1 = bucket_toks[e * 5 + 1]
                 var b_t2 = bucket_toks[e * 5 + 2]
@@ -752,11 +789,11 @@ def run_moe_coalesced_stage1(
                     for blk in range(c_in_blocks):
                         var sc = gu_s[rs + blk]
                         var bytes = gu_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(in_e0.load[16](blk * 16), wo.fma(in_o0.load[16](blk * 16), acc0))
+                        acc1 = we.fma(in_e1.load[16](blk * 16), wo.fma(in_o1.load[16](blk * 16), acc1))
+                        acc2 = we.fma(in_e2.load[16](blk * 16), wo.fma(in_o2.load[16](blk * 16), acc2))
                     gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
                     gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
                     gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
@@ -782,12 +819,12 @@ def run_moe_coalesced_stage1(
                     for blk in range(c_in_blocks):
                         var sc = gu_s[rs + blk]
                         var bytes = gu_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
-                        acc3 = acc3 + (we * in_e3.load[16](blk * 16) + wo * in_o3.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(in_e0.load[16](blk * 16), wo.fma(in_o0.load[16](blk * 16), acc0))
+                        acc1 = we.fma(in_e1.load[16](blk * 16), wo.fma(in_o1.load[16](blk * 16), acc1))
+                        acc2 = we.fma(in_e2.load[16](blk * 16), wo.fma(in_o2.load[16](blk * 16), acc2))
+                        acc3 = we.fma(in_e3.load[16](blk * 16), wo.fma(in_o3.load[16](blk * 16), acc3))
                     gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
                     gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
                     gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
@@ -818,13 +855,13 @@ def run_moe_coalesced_stage1(
                     for blk in range(c_in_blocks):
                         var sc = gu_s[rs + blk]
                         var bytes = gu_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
-                        acc3 = acc3 + (we * in_e3.load[16](blk * 16) + wo * in_o3.load[16](blk * 16)) * sc
-                        acc4 = acc4 + (we * in_e4.load[16](blk * 16) + wo * in_o4.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(in_e0.load[16](blk * 16), wo.fma(in_o0.load[16](blk * 16), acc0))
+                        acc1 = we.fma(in_e1.load[16](blk * 16), wo.fma(in_o1.load[16](blk * 16), acc1))
+                        acc2 = we.fma(in_e2.load[16](blk * 16), wo.fma(in_o2.load[16](blk * 16), acc2))
+                        acc3 = we.fma(in_e3.load[16](blk * 16), wo.fma(in_o3.load[16](blk * 16), acc3))
+                        acc4 = we.fma(in_e4.load[16](blk * 16), wo.fma(in_o4.load[16](blk * 16), acc4))
                     gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
                     gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
                     gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
@@ -833,15 +870,25 @@ def run_moe_coalesced_stage1(
 
     parallelize[coal_s1](tasks)
 
+    # Fused In-Register GeGLU + Dual-Space Deinterleave (eliminates intermediate act_scratch stores/loads!)
     for p in range(total_pairs):
-        var gu_out = gu_out_scratch + p * gate_up_rows
-        var act_ptr = act_scratch + p * expert_mlp_dim
-        gelu_and_mul_moe(gu_out, gu_out + expert_mlp_dim, act_ptr, expert_mlp_dim)
+        var gu_gate = gu_out_scratch + p * gate_up_rows
+        var gu_up = gu_gate + expert_mlp_dim
         var ad_e = act_deint_scratch + p * expert_mlp_dim
         var ad_o = ad_e + down_half_in
         for blk in range(down_blocks):
-            var v0 = act_ptr.load[16](blk * 32)
-            var v1 = act_ptr.load[16](blk * 32 + 16)
+            var g0 = gu_gate.load[16](blk * 32)
+            var g1 = gu_gate.load[16](blk * 32 + 16)
+            var u0 = gu_up.load[16](blk * 32)
+            var u1 = gu_up.load[16](blk * 32 + 16)
+            var sig0 = SIMD[DType.float32, 16](1.0) / (
+                SIMD[DType.float32, 16](1.0) + exp(SIMD[DType.float32, 16](-1.702) * g0)
+            )
+            var sig1 = SIMD[DType.float32, 16](1.0) / (
+                SIMD[DType.float32, 16](1.0) + exp(SIMD[DType.float32, 16](-1.702) * g1)
+            )
+            var v0 = (g0 * sig0) * u0
+            var v1 = (g1 * sig1) * u1
             ad_e.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
             ad_o.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
     return num_unique
@@ -903,15 +950,15 @@ def run_moe_coalesced_stage2(
                         var ao0 = ao0_ptr.load[16](blk * 16)
                         var sc0 = dn_s[rs0 + blk]
                         var bytes0 = dn_p.load[16](rp0 + blk * 16)
-                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we0 * ae0 + wo0 * ao0) * sc0
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0 = we0.fma(ae0, wo0.fma(ao0, acc0))
 
                         var sc1 = dn_s[rs1 + blk]
                         var bytes1 = dn_p.load[16](rp1 + blk * 16)
-                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc1 = acc1 + (we1 * ae0 + wo1 * ao0) * sc1
+                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        acc1 = we1.fma(ae0, wo1.fma(ao0, acc1))
                     out0_ptr[r] += acc0.reduce_add() * w0
                     out0_ptr[r + 1] += acc1.reduce_add() * w0
                     r += 2
@@ -924,9 +971,9 @@ def run_moe_coalesced_stage2(
                         var ao0 = ao0_ptr.load[16](blk * 16)
                         var sc0 = dn_s[rs0 + blk]
                         var bytes0 = dn_p.load[16](rp0 + blk * 16)
-                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we0 * ae0 + wo0 * ao0) * sc0
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0 = we0.fma(ae0, wo0.fma(ao0, acc0))
                     out0_ptr[r] += acc0.reduce_add() * w0
                     r += 1
             elif m_count == 2:
@@ -936,7 +983,43 @@ def run_moe_coalesced_stage2(
                 var ao0_ptr = ae0_ptr + down_half_in
                 var ae1_ptr = act_deint_scratch + (base_slot + 1) * expert_mlp_dim
                 var ao1_ptr = ae1_ptr + down_half_in
-                for r in range(sr, er):
+                var out0_ptr = batch_moe_out + b_t0 * embed_dim
+                var out1_ptr = batch_moe_out + b_t1 * embed_dim
+                var r = sr
+                while r + 1 < er:
+                    var rp0 = r * down_half_in
+                    var rs0 = r * down_blocks
+                    var rp1 = (r + 1) * down_half_in
+                    var rs1 = (r + 1) * down_blocks
+                    var acc0_r0 = SIMD[DType.float32, 16](0.0)
+                    var acc1_r0 = SIMD[DType.float32, 16](0.0)
+                    var acc0_r1 = SIMD[DType.float32, 16](0.0)
+                    var acc1_r1 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(down_blocks):
+                        var ae0 = ae0_ptr.load[16](blk * 16)
+                        var ao0 = ao0_ptr.load[16](blk * 16)
+                        var ae1 = ae1_ptr.load[16](blk * 16)
+                        var ao1 = ao1_ptr.load[16](blk * 16)
+
+                        var sc0 = dn_s[rs0 + blk]
+                        var bytes0 = dn_p.load[16](rp0 + blk * 16)
+                        var we0 = ((bytes0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        var wo0 = ((bytes0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                        acc0_r0 = we0.fma(ae0, wo0.fma(ao0, acc0_r0))
+                        acc1_r0 = we0.fma(ae1, wo0.fma(ao1, acc1_r0))
+
+                        var sc1 = dn_s[rs1 + blk]
+                        var bytes1 = dn_p.load[16](rp1 + blk * 16)
+                        var we1 = ((bytes1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        var wo1 = ((bytes1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                        acc0_r1 = we1.fma(ae0, wo1.fma(ao0, acc0_r1))
+                        acc1_r1 = we1.fma(ae1, wo1.fma(ao1, acc1_r1))
+                    out0_ptr[r] += acc0_r0.reduce_add() * w0
+                    out1_ptr[r] += acc1_r0.reduce_add() * w1
+                    out0_ptr[r + 1] += acc0_r1.reduce_add() * w0
+                    out1_ptr[r + 1] += acc1_r1.reduce_add() * w1
+                    r += 2
+                while r < er:
                     var rp = r * down_half_in
                     var rs = r * down_blocks
                     var acc0 = SIMD[DType.float32, 16](0.0)
@@ -944,12 +1027,13 @@ def run_moe_coalesced_stage2(
                     for blk in range(down_blocks):
                         var sc = dn_s[rs + blk]
                         var bytes = dn_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
-                    batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
-                    batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(ae0_ptr.load[16](blk * 16), wo.fma(ao0_ptr.load[16](blk * 16), acc0))
+                        acc1 = we.fma(ae1_ptr.load[16](blk * 16), wo.fma(ao1_ptr.load[16](blk * 16), acc1))
+                    out0_ptr[r] += acc0.reduce_add() * w0
+                    out1_ptr[r] += acc1.reduce_add() * w1
+                    r += 1
             elif m_count == 3:
                 var b_t1 = bucket_toks[e * 5 + 1]
                 var b_t2 = bucket_toks[e * 5 + 2]
@@ -970,11 +1054,11 @@ def run_moe_coalesced_stage2(
                     for blk in range(down_blocks):
                         var sc = dn_s[rs + blk]
                         var bytes = dn_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(ae0_ptr.load[16](blk * 16), wo.fma(ao0_ptr.load[16](blk * 16), acc0))
+                        acc1 = we.fma(ae1_ptr.load[16](blk * 16), wo.fma(ao1_ptr.load[16](blk * 16), acc1))
+                        acc2 = we.fma(ae2_ptr.load[16](blk * 16), wo.fma(ao2_ptr.load[16](blk * 16), acc2))
                     batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
                     batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
                     batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
@@ -1003,12 +1087,12 @@ def run_moe_coalesced_stage2(
                     for blk in range(down_blocks):
                         var sc = dn_s[rs + blk]
                         var bytes = dn_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
-                        acc3 = acc3 + (we * ae3_ptr.load[16](blk * 16) + wo * ao3_ptr.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(ae0_ptr.load[16](blk * 16), wo.fma(ao0_ptr.load[16](blk * 16), acc0))
+                        acc1 = we.fma(ae1_ptr.load[16](blk * 16), wo.fma(ao1_ptr.load[16](blk * 16), acc1))
+                        acc2 = we.fma(ae2_ptr.load[16](blk * 16), wo.fma(ao2_ptr.load[16](blk * 16), acc2))
+                        acc3 = we.fma(ae3_ptr.load[16](blk * 16), wo.fma(ao3_ptr.load[16](blk * 16), acc3))
                     batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
                     batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
                     batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
@@ -1043,13 +1127,13 @@ def run_moe_coalesced_stage2(
                     for blk in range(down_blocks):
                         var sc = dn_s[rs + blk]
                         var bytes = dn_p.load[16](rp + blk * 16)
-                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
-                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
-                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
-                        acc3 = acc3 + (we * ae3_ptr.load[16](blk * 16) + wo * ao3_ptr.load[16](blk * 16)) * sc
-                        acc4 = acc4 + (we * ae4_ptr.load[16](blk * 16) + wo * ao4_ptr.load[16](blk * 16)) * sc
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                        acc0 = we.fma(ae0_ptr.load[16](blk * 16), wo.fma(ao0_ptr.load[16](blk * 16), acc0))
+                        acc1 = we.fma(ae1_ptr.load[16](blk * 16), wo.fma(ao1_ptr.load[16](blk * 16), acc1))
+                        acc2 = we.fma(ae2_ptr.load[16](blk * 16), wo.fma(ao2_ptr.load[16](blk * 16), acc2))
+                        acc3 = we.fma(ae3_ptr.load[16](blk * 16), wo.fma(ao3_ptr.load[16](blk * 16), acc3))
+                        acc4 = we.fma(ae4_ptr.load[16](blk * 16), wo.fma(ao4_ptr.load[16](blk * 16), acc4))
                     batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
                     batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
                     batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
