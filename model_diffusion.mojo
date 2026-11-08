@@ -7,6 +7,12 @@ import std.os
 from std.algorithm import parallelize
 from std.sys.info import num_physical_cores
 from q4_embed import Q4Embedding
+from diffusion_kernels import (
+    sc_forward_batch,
+    sample_and_soft_embed_top32_batch,
+    q4_gemm_l1_2x4,
+    q4_fused_gate_up_geglu_l1,
+)
 import std.time
 
 # ==============================================================================
@@ -1934,10 +1940,13 @@ def pad_left(s: String, width: Int) -> String:
 
 def main() raises:
     var use_gpu = True
+    var bench_mode = False
     var cmd_args = std.sys.argv()
     for idx in range(1, len(cmd_args)):
         if cmd_args[idx] == "--cpu":
             use_gpu = False
+        elif cmd_args[idx] == "--bench":
+            bench_mode = True
 
     var num_tasks = num_physical_cores()
     print("=========================================================")
@@ -2285,21 +2294,15 @@ def main() raises:
     var argmax_canvas = alloc[Int](CANVAS_LEN)
     # Self-conditioning soft embeds [CANVAS_LEN, embed_dim]
     var sc_embeds = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    # SC MLP scratch buffers
-    var sc_buf_normed = alloc[Float32](CONFIG.embed_dim)
-    var sc_buf_gate = alloc[Float32](SC_SIZE)
-    var sc_buf_up = alloc[Float32](SC_SIZE)
-    var sc_buf_gated = alloc[Float32](SC_SIZE)
-    var sc_buf_down = alloc[Float32](CONFIG.embed_dim)
-    var sc_out_buf = alloc[Float32](CONFIG.embed_dim)
+    # Batched SC MLP scratch buffers
+    var sc_buf_normed = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    var sc_buf_gated = alloc[Float32](CANVAS_LEN * SC_SIZE)
+    var sc_buf_down = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
     # Per-canvas-token final norm + logits storage
     var canvas_final_norm = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
-    # Sampler buffers
-    var sampler_logits = alloc[Float32](CONFIG.vocab_size)
-    var sampler_probs = alloc[Float32](CONFIG.vocab_size)
-    # Per-token logits/probs buffers for batched logit projection
+    # Per-token logits buffer for batched logit projection + Top-32 sparse sampler
     var canvas_logits = alloc[Float32](CANVAS_LEN * CONFIG.vocab_size)
-    var canvas_probs = alloc[Float32](CANVAS_LEN * CONFIG.vocab_size)
+    var rand_buf = alloc[Float32](CANVAS_LEN)
     var token_entropy = alloc[Float32](CANVAS_LEN)
     var new_tokens = alloc[Int](CANVAS_LEN)
     var argmax_tokens = alloc[Int](CANVAS_LEN)
@@ -2311,29 +2314,39 @@ def main() raises:
     print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
           (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
 
-    # 6. Initialize tokenizer
-    var py = Python.import_module("time")
-    var transformers = Python.import_module("transformers")
-    print("Loading AutoTokenizer...")
-    var tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
-    var py_builtins = Python.import_module("builtins")
-    print("Tokenizer loaded successfully!")
+    # 6. Initialize tokenizer (skipped in --bench mode for zero-Python PASID safety)
+    var tokenizer = PythonObject()
+    var py_builtins = PythonObject()
+    if not bench_mode:
+        var transformers = Python.import_module("transformers")
+        print("Loading AutoTokenizer...")
+        tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
+        py_builtins = Python.import_module("builtins")
+        print("Tokenizer loaded successfully!")
 
     print("---------------------------------------------------------")
     print("   Chat Agent is ready! Type 'exit' or 'quit' to end.")
     print("---------------------------------------------------------")
 
     var prompt_scale = sqrt(Float32(CONFIG.embed_dim))
+    var bench_iter = 0
 
     while True:
         print()
         var user_input_str: String
-        try:
-            var user_input = py_builtins.input("User > ")
-            user_input_str = String(String(user_input).strip())
-        except err:
-            print("\nError reading input:", err)
-            break
+        if bench_mode:
+            if bench_iter >= 1:
+                break
+            user_input_str = "Explain quantum computing in simple terms."
+            bench_iter += 1
+            print("User > [BENCH] " + user_input_str)
+        else:
+            try:
+                var user_input = py_builtins.input("User > ")
+                user_input_str = String(String(user_input).strip())
+            except err:
+                print("\nError reading input:", err)
+                break
 
 
         if user_input_str == "exit" or user_input_str == "quit":
@@ -2342,14 +2355,35 @@ def main() raises:
             continue
 
 
-        var prompt_str = String("<bos><|turn>user\n") + user_input_str + String("<turn|>\n<|turn>model\n")
-        var encoded = tokenizer.encode(prompt_str, add_special_tokens=False)
         var prompt_tokens = List[Int]()
-        for i in range(len(encoded)):
-            var tok = Int(py=encoded[i])
-            if tok >= CONFIG.vocab_size:
-                tok = 3 # Map out-of-vocab tokens to <unk> (index 3) to prevent out-of-bounds errors
-            prompt_tokens.append(tok)
+        if bench_mode:
+            var bench_toks = InlineArray[Int, 16](uninitialized=True)
+            bench_toks[0] = 2
+            bench_toks[1] = 105
+            bench_toks[2] = 2364
+            bench_toks[3] = 107
+            bench_toks[4] = 1841
+            bench_toks[5] = 603
+            bench_toks[6] = 496
+            bench_toks[7] = 1775
+            bench_toks[8] = 675
+            bench_toks[9] = 496
+            bench_toks[10] = 1212
+            bench_toks[11] = 3
+            bench_toks[12] = 106
+            bench_toks[13] = 107
+            bench_toks[14] = 105
+            bench_toks[15] = 4368
+            for i in range(16):
+                prompt_tokens.append(bench_toks[i])
+        else:
+            var prompt_str = String("<bos><|turn>user\n") + user_input_str + String("<turn|>\n<|turn>model\n")
+            var encoded = tokenizer.encode(prompt_str, add_special_tokens=False)
+            for i in range(len(encoded)):
+                var tok = Int(py=encoded[i])
+                if tok >= CONFIG.vocab_size:
+                    tok = 3 # Map out-of-vocab tokens to <unk> (index 3) to prevent out-of-bounds errors
+                prompt_tokens.append(tok)
 
         var num_prompt_tokens = len(prompt_tokens)
         if num_prompt_tokens + CANVAS_LEN > CONFIG.max_seq_len:
@@ -2583,11 +2617,14 @@ def main() raises:
         print("\n  Prefill: ", num_prompt_tokens, " tokens in ",
               String((t_prefill_end - t_prefill_start) * 1000.0), " ms")
 
-        # --- Canvas initialization ---
-        var np_random = Python.import_module("numpy.random")
-        var canvas_ids_py = np_random.randint(0, CONFIG.vocab_size, CANVAS_LEN)
+        # --- Canvas initialization (pure-Mojo xorshift64* PRNG: zero Python heap allocs) ---
+        var rng_state: UInt64 = 0x853C49E6748FEA9B
         for t in range(CANVAS_LEN):
-            canvas_tokens[t] = Int(py=canvas_ids_py[t])
+            rng_state ^= rng_state >> 12
+            rng_state ^= rng_state << 25
+            rng_state ^= rng_state >> 27
+            var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
+            canvas_tokens[t] = Int(rnd_u64 % UInt64(CONFIG.vocab_size))
         for i in range(CANVAS_LEN * CONFIG.embed_dim):
             sc_embeds[i] = 0.0
 
@@ -2597,6 +2634,7 @@ def main() raises:
         var hist_len: Int = 0
         var prev_mean_ent: Float32 = 0.0
         var steps_executed: Int = 0
+        var max_steps_this_turn = 2 if bench_mode else MAX_DENOISE_STEPS
 
         t_decode_start = std.time.perf_counter()
 
@@ -2606,30 +2644,30 @@ def main() raises:
         var entropy_bound: Float32 = 0.1
         var confidence_threshold: Float32 = 0.005
 
-        while denoise_step < MAX_DENOISE_STEPS:
+        while denoise_step < max_steps_this_turn:
             print("  [denoise ", denoise_step, "]")
             steps_executed += 1
 
-            # Compute canvas embeddings + self-conditioning
+            # Compute canvas embeddings + batched self-conditioning (llm-mojo-2tc.1)
+            var t_sc_start = std.time.perf_counter()
+            var p_scale_vec = SIMD[DType.float32, 8](prompt_scale)
             for t in range(CANVAS_LEN):
                 var hidden_t = canvas_hidden + t * CONFIG.embed_dim
                 embed.reconstruct[type=DType.float16](canvas_tokens[t], hidden_t)
-                var p_scale_vec = SIMD[DType.float32, 8](prompt_scale)
                 for i in range(0, CONFIG.embed_dim, 8):
                     var val = hidden_t.load[8](i).cast[DType.float32]() * p_scale_vec
                     hidden_t.store[8](i, val.cast[DType.float16]())
-                sc_forward[inputs_embeds_type=DType.float16, sc_out_type=DType.float32](
-                    hidden_t,
-                    sc_embeds + t * CONFIG.embed_dim,
-                    sc_gate_packed, sc_up_packed, sc_down_packed,
-                    sc_gate_scales, sc_up_scales, sc_down_scales,
-                    sc_pre_norm,
-                    sc_buf_normed, sc_buf_gate, sc_buf_up, sc_buf_gated, sc_buf_down,
-                    sc_out_buf,
-                    CONFIG.embed_dim, SC_SIZE, num_tasks,
-                )
-                for i in range(0, CONFIG.embed_dim, 8):
-                    hidden_t.store[8](i, sc_out_buf.load[8](i).cast[DType.float16]())
+            sc_forward_batch[inputs_embeds_type=DType.float16, sc_out_type=DType.float16](
+                canvas_hidden,
+                sc_embeds,
+                sc_gate_packed, sc_up_packed, sc_down_packed,
+                sc_gate_scales, sc_up_scales, sc_down_scales,
+                sc_pre_norm,
+                sc_buf_normed, sc_buf_gated, sc_buf_down,
+                canvas_hidden,
+                CANVAS_LEN, CONFIG.embed_dim, SC_SIZE, num_tasks,
+            )
+            var t_sc_end = std.time.perf_counter()
 
             # Decoder forward: layer-first, batched projections, bidirectional attention
             for l in range(30):
@@ -3025,7 +3063,8 @@ def main() raises:
                           " ffn=", String((tl_ffn_end - tl_ffn) * 1000), "ms",
                           " moe=", String((tl_moe_end - tl_moe) * 1000), "ms")
 
-            # --- Sampler step ---
+            # --- Sampler step (Sparse Top-32 reservoir + soft-embed, llm-mojo-2tc.1) ---
+            var t_samp_start = std.time.perf_counter()
             # Temperature schedule
             var remaining = MAX_DENOISE_STEPS - denoise_step
             if remaining < 1:
@@ -3034,76 +3073,43 @@ def main() raises:
             if temp < 1e-10:
                 temp = 1e-10
 
-            # Per-canvas-position: full logits, log_softmax, entropy, sample, argmax, SC soft embed
-            var rand_u = np_random.rand(CANVAS_LEN)
-            var rand_buf = alloc[Float32](CANVAS_LEN)
             for t in range(CANVAS_LEN):
-                rand_buf[t] = Float32(Float64(py=rand_u[t]))
+                rng_state ^= rng_state >> 12
+                rng_state ^= rng_state << 25
+                rng_state ^= rng_state >> 27
+                var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
+                rand_buf[t] = Float32(rnd_u64 & 0xFFFFFF) / Float32(16777216.0)
 
             # Batched logit projection: read embed weights ONCE for all 256 tokens
             rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, final_norm_weight, canvas_final_norm, CANVAS_LEN, CONFIG.embed_dim)
-            q4_gemv_tiled[8](embed.packed_weights, embed.scales, canvas_final_norm, canvas_logits,
-                          CANVAS_LEN, CONFIG.embed_dim, CONFIG.vocab_size, num_tasks,
-                          CONFIG.embed_dim, CONFIG.vocab_size)
+            q4_gemm_l1_2x4[DType.float32, DType.float32](
+                embed.packed_weights, embed.scales, canvas_final_norm, canvas_logits,
+                CANVAS_LEN, CONFIG.embed_dim, CONFIG.vocab_size, num_tasks,
+                CONFIG.embed_dim, CONFIG.vocab_size
+            )
+            var t_logit_end = std.time.perf_counter()
 
-            # Parallelized per-token: scale+softcap, softmax, entropy, argmax, sample, sc_embed
-            def sampler_worker(t: Int) capturing -> None:
-                var logits_t = canvas_logits + t * CONFIG.vocab_size
-                var probs_t = canvas_probs + t * CONFIG.vocab_size
-
-                for v in range(CONFIG.vocab_size):
-                    logits_t[v] = (Float32(30.0) * tanh(logits_t[v] / Float32(30.0))) / temp
-
-                var max_logit: Float32 = logits_t[0]
-                for v in range(1, CONFIG.vocab_size):
-                    if logits_t[v] > max_logit:
-                        max_logit = logits_t[v]
-                var sum_exp: Float32 = 0.0
-                for v in range(CONFIG.vocab_size):
-                    var lp = exp(logits_t[v] - max_logit)
-                    probs_t[v] = lp
-                    sum_exp += lp
-                var log_sum = log(sum_exp + 1e-30)
-
-                var ent: Float32 = 0.0
-                for v in range(CONFIG.vocab_size):
-                    var p = probs_t[v] / (sum_exp + 1e-30)
-                    probs_t[v] = p
-                    if p > 1e-12:
-                        ent -= p * (logits_t[v] - max_logit - log_sum)
-                token_entropy[t] = ent
-
-                var t_argmax = 0
-                var t_max_logit = logits_t[0]
-                for v in range(1, CONFIG.vocab_size):
-                    if logits_t[v] > t_max_logit:
-                        t_max_logit = logits_t[v]
-                        t_argmax = v
-                argmax_tokens[t] = t_argmax
-
-                var u = rand_buf[t]
-                var cumsum: Float32 = 0.0
-                var sampled = t_argmax
-                for v in range(CONFIG.vocab_size):
-                    cumsum += probs_t[v]
-                    if cumsum >= u:
-                        sampled = v
-                        break
-                new_tokens[t] = sampled
-
-                probs_to_soft_embed(
-                    probs_t,
-                    embed.packed_weights, embed.scales,
-                    sc_embeds + t * CONFIG.embed_dim,
-                    CONFIG.vocab_size, CONFIG.embed_dim, 1,
-                )
-                var sc_embeds_t = sc_embeds + t * CONFIG.embed_dim
-                var p_scale_vec = SIMD[DType.float32, 8](prompt_scale)
-                for i in range(0, CONFIG.embed_dim, 8):
-                    sc_embeds_t.store[8](i, sc_embeds_t.load[8](i) * p_scale_vec)
-
-            parallelize[sampler_worker](CANVAS_LEN)
-            rand_buf.free()
+            # Parallelized per-token Top-32 softcap, cumulant entropy, sample, sparse sc_embed
+            sample_and_soft_embed_top32_batch[32](
+                canvas_logits,
+                rand_buf,
+                embed.packed_weights,
+                embed.scales,
+                token_entropy,
+                argmax_tokens,
+                new_tokens,
+                sc_embeds,
+                CANVAS_LEN,
+                CONFIG.vocab_size,
+                CONFIG.embed_dim,
+                temp,
+                prompt_scale,
+                num_tasks,
+            )
+            var t_samp_end = std.time.perf_counter()
+            print("    sc_mlp=", String((t_sc_end - t_sc_start) * 1000.0), "ms",
+                  " logit_proj=", String((t_logit_end - t_samp_start) * 1000.0), "ms",
+                  " top32_sampler=", String((t_samp_end - t_logit_end) * 1000.0), "ms")
 
             # Mean entropy + confidence
             var mean_ent: Float32 = 0.0
@@ -3172,14 +3178,15 @@ def main() raises:
                     n_accept += 1
             var n_reject = CANVAS_LEN - n_accept
             if n_reject > 0:
-                var reject_ids_py = np_random.randint(0, CONFIG.vocab_size, n_reject)
-                var reject_idx = 0
                 for t in range(CANVAS_LEN):
                     if eb_mask[t]:
                         canvas_tokens[t] = new_tokens[t]
                     else:
-                        canvas_tokens[t] = Int(py=reject_ids_py[reject_idx])
-                        reject_idx += 1
+                        rng_state ^= rng_state >> 12
+                        rng_state ^= rng_state << 25
+                        rng_state ^= rng_state >> 27
+                        var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
+                        canvas_tokens[t] = Int(rnd_u64 % UInt64(CONFIG.vocab_size))
             else:
                 for t in range(CANVAS_LEN):
                     canvas_tokens[t] = new_tokens[t]
@@ -3233,11 +3240,14 @@ def main() raises:
         print("  Total denoise time: ", String(denoise_duration * 1000.0), " ms")
         print("  Avg per step:     ", String(denoise_duration * 1000.0 / Float64(steps_executed)), " ms")
         print("  Output:")
-        var output_list = Python.list()
-        for t in range(CANVAS_LEN):
-            output_list.append(argmax_canvas[t])
-        var decoded_output = tokenizer.decode(output_list)
-        py_builtins.print("    ", decoded_output)
+        if bench_mode:
+            print("    [bench first 8 argmax token IDs]:", argmax_canvas[0], argmax_canvas[1], argmax_canvas[2], argmax_canvas[3], argmax_canvas[4], argmax_canvas[5], argmax_canvas[6], argmax_canvas[7])
+        else:
+            var output_list = Python.list()
+            for t in range(CANVAS_LEN):
+                output_list.append(argmax_canvas[t])
+            var decoded_output = tokenizer.decode(output_list)
+            py_builtins.print("    ", decoded_output)
         print("---------------------------------------------------------")
 
     # Cleanup memory
@@ -3309,16 +3319,11 @@ def main() raises:
     argmax_canvas.free()
     sc_embeds.free()
     sc_buf_normed.free()
-    sc_buf_gate.free()
-    sc_buf_up.free()
     sc_buf_gated.free()
     sc_buf_down.free()
-    sc_out_buf.free()
     canvas_final_norm.free()
-    sampler_logits.free()
-    sampler_probs.free()
     canvas_logits.free()
-    canvas_probs.free()
+    rand_buf.free()
     token_entropy.free()
     new_tokens.free()
     argmax_tokens.free()
