@@ -617,6 +617,7 @@ struct Q4Embedding:
         out_next_tokens: UnsafePointer[Int, MutUntrackedOrigin],
         num_tasks: Int,
         softcap: Bool = True,
+        active_tokens: Int = 5,
     ) -> None:
         """5-token coalesced Dual-Space Deinterleaved + 3-Tier Subspace Sieve logit projection.
         Streams the 25% Stage-1 prefix from contiguous L3-friendly memory across all 5 tokens,
@@ -642,31 +643,39 @@ struct Q4Embedding:
         var stack_rms50 = InlineArray[Float32, 5](uninitialized=True)
         var stack_rms75 = InlineArray[Float32, 5](uninitialized=True)
         for tok in range(5):
-            var x_src = x_batch + tok * self.embed_dim
             var xe_dst = x_deint + tok * self.embed_dim
             var xo_dst = xe_dst + half_dim
-            var sq_25_50 = SIMD[DType.float32, 16](0.0)
-            var sq_50_75 = SIMD[DType.float32, 16](0.0)
-            var sq_75_100 = SIMD[DType.float32, 16](0.0)
-            for b in range(num_blocks):
-                var v0 = x_src.load[16](b * 32)
-                var v1 = x_src.load[16](b * 32 + 16)
-                var ev = v0.deinterleave()[0].join(v1.deinterleave()[0])
-                var od = v0.deinterleave()[1].join(v1.deinterleave()[1])
-                xe_dst.store[16](b * 16, ev)
-                xo_dst.store[16](b * 16, od)
-                if b >= b_75:
-                    sq_75_100 = sq_75_100 + ev * ev + od * od
-                elif b >= b_50:
-                    sq_50_75 = sq_50_75 + ev * ev + od * od
-                elif b >= b_25:
-                    sq_25_50 = sq_25_50 + ev * ev + od * od
-            var s75 = sq_75_100.reduce_add()
-            var s50 = s75 + sq_50_75.reduce_add()
-            var s25 = s50 + sq_25_50.reduce_add()
-            stack_rms75[tok] = sqrt(s75)
-            stack_rms50[tok] = sqrt(s50)
-            stack_rms25[tok] = sqrt(s25)
+            if tok < active_tokens:
+                var x_src = x_batch + tok * self.embed_dim
+                var sq_25_50 = SIMD[DType.float32, 16](0.0)
+                var sq_50_75 = SIMD[DType.float32, 16](0.0)
+                var sq_75_100 = SIMD[DType.float32, 16](0.0)
+                for b in range(num_blocks):
+                    var v0 = x_src.load[16](b * 32)
+                    var v1 = x_src.load[16](b * 32 + 16)
+                    var ev = v0.deinterleave()[0].join(v1.deinterleave()[0])
+                    var od = v0.deinterleave()[1].join(v1.deinterleave()[1])
+                    xe_dst.store[16](b * 16, ev)
+                    xo_dst.store[16](b * 16, od)
+                    if b >= b_75:
+                        sq_75_100 = sq_75_100 + ev * ev + od * od
+                    elif b >= b_50:
+                        sq_50_75 = sq_50_75 + ev * ev + od * od
+                    elif b >= b_25:
+                        sq_25_50 = sq_25_50 + ev * ev + od * od
+                var s75 = sq_75_100.reduce_add()
+                var s50 = s75 + sq_50_75.reduce_add()
+                var s25 = s50 + sq_25_50.reduce_add()
+                stack_rms75[tok] = sqrt(s75)
+                stack_rms50[tok] = sqrt(s50)
+                stack_rms25[tok] = sqrt(s25)
+            else:
+                for b in range(num_blocks):
+                    xe_dst.store[16](b * 16, SIMD[DType.float32, 16](0.0))
+                    xo_dst.store[16](b * 16, SIMD[DType.float32, 16](0.0))
+                stack_rms75[tok] = 0.0
+                stack_rms50[tok] = 0.0
+                stack_rms25[tok] = 0.0
 
         var xe0 = x_deint + 0 * self.embed_dim
         var xo0 = xe0 + half_dim
@@ -706,22 +715,27 @@ struct Q4Embedding:
         )
 
         for tok in range(5):
-            var xe_t = x_deint + tok * self.embed_dim
-            var xo_t = xe_t + half_dim
-            var best_s: Float32 = -1e30
-            var best_i: Int = 0
-            var cand = seed_tokens[tok]
-            if cand >= seed_count and cand < self.vocab_size:
-                best_s = self._eval_row_full(cand, xe_t, xo_t, num_blocks)
-                best_i = cand
-            for r in range(seed_count):
-                var s = self._eval_row_full(r, xe_t, xo_t, num_blocks)
-                if s > best_s or (s == best_s and r < best_i):
-                    best_s = s
-                    best_i = r
-            stack_seed_sum[tok] = best_s
-            stack_seed_tok[tok] = best_i
-            shared_best_ptr[tok] = best_s
+            if tok < active_tokens:
+                var xe_t = x_deint + tok * self.embed_dim
+                var xo_t = xe_t + half_dim
+                var best_s: Float32 = -1e30
+                var best_i: Int = 0
+                var cand = seed_tokens[tok]
+                if cand >= seed_count and cand < self.vocab_size:
+                    best_s = self._eval_row_full(cand, xe_t, xo_t, num_blocks)
+                    best_i = cand
+                for r in range(seed_count):
+                    var s = self._eval_row_full(r, xe_t, xo_t, num_blocks)
+                    if s > best_s or (s == best_s and r < best_i):
+                        best_s = s
+                        best_i = r
+                stack_seed_sum[tok] = best_s
+                stack_seed_tok[tok] = best_i
+                shared_best_ptr[tok] = best_s
+            else:
+                stack_seed_sum[tok] = 1e30
+                stack_seed_tok[tok] = 0
+                shared_best_ptr[tok] = 1e30
 
         var stack_thread_sum = InlineArray[Float32, 64 * 5](uninitialized=True)
         var stack_thread_tok = InlineArray[Int, 64 * 5](uninitialized=True)
@@ -930,7 +944,7 @@ struct Q4Embedding:
         else:
             parallelize[batch5_proj_worker](num_tasks)
 
-        for tok in range(5):
+        for tok in range(active_tokens):
             var best_l: Float32 = -1e30
             var best_i: Int = 0
             for t in range(num_tasks):
@@ -941,12 +955,48 @@ struct Q4Embedding:
                     best_i = ti
             out_next_tokens[tok] = best_i
 
-        self.last_winner_tok[0] = out_next_tokens[4]
+        self.last_winner_tok[0] = out_next_tokens[active_tokens - 1]
         var _keep_alive = stack_deint[0] + stack_shared_best[0] + stack_thread_sum[0] + Float32(stack_thread_tok[0])
         if _keep_alive > 1e38:
             out_next_tokens[0] += 0
         if self.embed_dim > 2816:
             x_deint.free()
+
+    @always_inline
+    def project_logits_batchN_parallel(
+        self,
+        batch_size: Int,
+        x_batch: UnsafePointer[Float32, _],
+        seed_tokens: UnsafePointer[Int, _],
+        out_next_tokens: UnsafePointer[Int, MutUntrackedOrigin],
+        num_tasks: Int,
+        softcap: Bool = True,
+    ) -> None:
+        """Variable-horizon (1..5 tokens) coalesced 3-Tier Subspace Sieve logit projection.
+        Dispatches batch_size == 1 to the 2-row blocked single-token sieve (saving ~7.7 ms)
+        and masks inactive slots (tok >= batch_size) with pth = 1e30 so Stages 2..4 only fire for active tokens.
+        """
+        debug_assert(batch_size >= 1 and batch_size <= 5, "project_logits_batchN_parallel requires 1 <= batch_size <= 5")
+        if batch_size == 1:
+            if seed_tokens[0] >= 0 and seed_tokens[0] < self.vocab_size:
+                self.last_winner_tok[0] = seed_tokens[0]
+            var stack_lmax = InlineArray[Float32, 64](uninitialized=True)
+            var stack_ltok = InlineArray[Int, 64](uninitialized=True)
+            var lmax_ptr = UnsafePointer[Float32, MutExternalOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=stack_lmax))
+            )
+            var ltok_ptr = UnsafePointer[Int, MutExternalOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=stack_ltok))
+            )
+            self.project_logits_parallel(x_batch, lmax_ptr, ltok_ptr, num_tasks, softcap=softcap)
+            out_next_tokens[0] = self.last_winner_tok[0]
+            var _keep_1 = stack_lmax[0] + Float32(stack_ltok[0])
+            if _keep_1 > 1e38:
+                out_next_tokens[0] += 0
+            return
+        self.project_logits_batch5_parallel(
+            x_batch, seed_tokens, out_next_tokens, num_tasks, softcap=softcap, active_tokens=batch_size
+        )
 
     @always_inline
     def project_full_logits(

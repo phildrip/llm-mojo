@@ -23,6 +23,8 @@ from moe_kernels import (
     quantize_fp32_to_q4_0,
     q4_matmul_vec,
     q4_matmul_batch5,
+    q4_matmul_batchN,
+    compute_adaptive_draft_steps,
     compute_moe_lod_weights,
     compute_subbatch_set_cover_moe_weights,
     run_moe_experts_stage1_8core,
@@ -996,7 +998,7 @@ def run_moe_coalesced_subbatch_stage1(
         unsafe_from_address=Int(UnsafePointer(to=stack_all_top_val))
     )
 
-    if sub_b == 5 and embed_dim <= 2816 and num_experts <= 128:
+    if embed_dim <= 2816 and num_experts <= 128:
         var stack_scaled_batch = InlineArray[Float32, 5 * 2816](uninitialized=True)
         var stack_scores_batch = InlineArray[Float32, 5 * 128](uninitialized=True)
         var scaled_batch_ptr = UnsafePointer[Float32, MutExternalOrigin](
@@ -1005,7 +1007,7 @@ def run_moe_coalesced_subbatch_stage1(
         var scores_batch_ptr = UnsafePointer[Float32, MutExternalOrigin](
             unsafe_from_address=Int(UnsafePointer(to=stack_scores_batch))
         )
-        for b in range(5):
+        for b in range(sub_b):
             var x_b = x_sub + b * embed_dim
             var sb_dst = scaled_batch_ptr + b * embed_dim
             rms_norm_noscale(x_b, norm_x, embed_dim)
@@ -1020,7 +1022,8 @@ def run_moe_coalesced_subbatch_stage1(
                 xe_ptr.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
                 xo_ptr.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
 
-        q4_matmul_batch5(
+        q4_matmul_batchN(
+            sub_b,
             weights.w_router_packed,
             weights.w_router_scales,
             scaled_batch_ptr,
@@ -1029,7 +1032,7 @@ def run_moe_coalesced_subbatch_stage1(
             num_experts,
             num_tasks,
         )
-        for b in range(5):
+        for b in range(sub_b):
             var sc_b = scores_batch_ptr + b * num_experts
             softmax(sc_b, num_experts)
             get_top_k[8](sc_b, all_top_idx_ptr + b * 8, all_top_val_ptr + b * 8, num_experts)
@@ -2954,44 +2957,50 @@ def main() raises:
                     var pos = seq_ptr[].pos
                     var current_token_id = seq_ptr[].tokens[pos]
                     
-                    var num_steps = 4
+                    var rem_tokens = seq_ptr[].max_gen - pos
+                    var max_draft_steps = compute_adaptive_draft_steps(rem_tokens, 4)
                     var draft_tokens = List[Int]()
                     draft_tokens.append(current_token_id)
                     
-                    for i in range(0, mtp_config.backbone_dim, 16):
-                        mtp_cur_recurrent_h.store[16](i, seq_ptr[].recurrent_h.load[16](i))
-                        
-                    var draft_active_token = current_token_id
-                    for step_idx in range(num_steps):
-                        var rope_pos = pos + step_idx
-                        var kv_pos = pos - 1
-                        var sampled_tok = mtp_generate_step(
-                            draft_active_token, mtp_cur_recurrent_h, mtp_weights, mtp_layers, mtp_lm_head_q4,
-                            seq_ptr[].block_table, block_size, k_block_pools, v_block_pools,
-                            rope_pos, kv_pos, mtp_h_next, mtp_config, num_tasks,
-                            embed, real_weights_loaded,
-                            ring_size, (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0),
-                            mtp_x_concat, mtp_x_assistant, mtp_norm_x, mtp_q,
-                            attn_scores, attn_rows, mtp_attn_out, mtp_proj_attn_out,
-                            mtp_ffn_h1, mtp_ffn_h2, mtp_ffn_out_gate, mtp_ffn_out,
-                            local_max_logits, local_next_tokens,
-                        )
-                                
-                        draft_active_token = sampled_tok
-                        draft_tokens.append(draft_active_token)
-                        
+                    if max_draft_steps > 0:
                         for i in range(0, mtp_config.backbone_dim, 16):
-                            mtp_cur_recurrent_h.store[16](i, mtp_h_next.load[16](i))
+                            mtp_cur_recurrent_h.store[16](i, seq_ptr[].recurrent_h.load[16](i))
                             
-                    if not is_chat_mode:
+                        var draft_active_token = current_token_id
+                        for step_idx in range(max_draft_steps):
+                            var rope_pos = pos + step_idx
+                            var kv_pos = pos - 1
+                            var sampled_tok = mtp_generate_step(
+                                draft_active_token, mtp_cur_recurrent_h, mtp_weights, mtp_layers, mtp_lm_head_q4,
+                                seq_ptr[].block_table, block_size, k_block_pools, v_block_pools,
+                                rope_pos, kv_pos, mtp_h_next, mtp_config, num_tasks,
+                                embed, real_weights_loaded,
+                                ring_size, (ring_row(seq_ptr[].kv_slot, ring_size, 0) if ring_size > 0 else 0),
+                                mtp_x_concat, mtp_x_assistant, mtp_norm_x, mtp_q,
+                                attn_scores, attn_rows, mtp_attn_out, mtp_proj_attn_out,
+                                mtp_ffn_h1, mtp_ffn_h2, mtp_ffn_out_gate, mtp_ffn_out,
+                                local_max_logits, local_next_tokens,
+                            )
+                                    
+                            draft_active_token = sampled_tok
+                            draft_tokens.append(draft_active_token)
+                            
+                            for i in range(0, mtp_config.backbone_dim, 16):
+                                mtp_cur_recurrent_h.store[16](i, mtp_h_next.load[16](i))
+                            # Early EOS / turn-end stopping: never draft past a terminal token
+                            if sampled_tok == 1 or sampled_tok == 106:
+                                break
+                    var num_steps = len(draft_tokens) - 1
+                            
+                    if not is_chat_mode and num_steps > 0:
                         var draft_token_list = Python.list()
                         for t_idx in range(1, len(draft_tokens)):
                             draft_token_list.append(draft_tokens[t_idx])
                         var draft_decoded = tokenizer.decode(draft_token_list)
                         print("[DEBUG Req #" + String(seq_ptr[].id) + "] Draft predicted: \"" + String(draft_decoded) + "\" (tokens: " + String(draft_token_list) + ")")
 
-                    # Batched Speculative Draft Verification (batch = num_steps + 1 = 5):
-                    # Verify all 5 tokens in a SINGLE layer-first pass using 2D LDS-tiled iGPU GEMMs
+                    # Batched Speculative Draft Verification (batch = num_steps + 1 in 1..5):
+                    # Verify all verify_b tokens in a SINGLE layer-first pass using 2D LDS-tiled iGPU GEMMs
                     # + Hoare Bucket-Sorted Coalesced MoE on CPU!
                     var verify_b = num_steps + 1
                     debug_assert(
@@ -3065,33 +3074,19 @@ def main() raises:
                                         barrier=False,
                                         ring_doorbell_now=True,
                                     )
-                                # Tail-straggler balanced QKV: 8-core CPU computes 5-token Wq (+ Wk on SWA) while iGPU computes Wv (or Wk on Global)!
-                                if verify_b == 5:
-                                    q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
-                                    if not is_global:
-                                        q4_matmul_batch5(weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
-                                else:
-                                    for b in range(verify_b):
-                                        q4_matmul_vec(weights.wq_packed, weights.wq_scales, pref_norm_x + b * CONFIG.embed_dim, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
-                                        if not is_global:
-                                            q4_matmul_vec(weights.wk_packed, weights.wk_scales, pref_norm_x + b * CONFIG.embed_dim, pref_k + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                # Tail-straggler balanced QKV: 8-core CPU computes verify_b-token Wq (+ Wk on SWA) while iGPU computes Wv (or Wk on Global)!
+                                q4_matmul_batchN(verify_b, weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
+                                if not is_global:
+                                    q4_matmul_batchN(verify_b, weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
                                 if is_global:
                                     gpu_ctx.wait_matmul(slot_kv, pref_k.__int__(), kv_stride, batch_size=verify_b)
                                 else:
                                     gpu_ctx.wait_matmul(slot_kv, pref_v.__int__(), kv_stride, batch_size=verify_b)
                             else:
-                                if verify_b == 5:
-                                    q4_matmul_batch5(weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
-                                    q4_matmul_batch5(weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
-                                    if not is_global:
-                                        q4_matmul_batch5(weights.wv_packed, weights.wv_scales, pref_norm_x, pref_v, CONFIG.embed_dim, kv_stride, num_tasks)
-                                else:
-                                    for b in range(verify_b):
-                                        var nx_b = pref_norm_x + b * CONFIG.embed_dim
-                                        q4_matmul_vec(weights.wq_packed, weights.wq_scales, nx_b, pref_q + b * q_dim, CONFIG.embed_dim, q_dim, num_tasks)
-                                        q4_matmul_vec(weights.wk_packed, weights.wk_scales, nx_b, pref_k + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
-                                        if not is_global:
-                                            q4_matmul_vec(weights.wv_packed, weights.wv_scales, nx_b, pref_v + b * kv_stride, CONFIG.embed_dim, kv_stride, num_tasks)
+                                q4_matmul_batchN(verify_b, weights.wq_packed, weights.wq_scales, pref_norm_x, pref_q, CONFIG.embed_dim, q_dim, num_tasks)
+                                q4_matmul_batchN(verify_b, weights.wk_packed, weights.wk_scales, pref_norm_x, pref_k, CONFIG.embed_dim, kv_stride, num_tasks)
+                                if not is_global:
+                                    q4_matmul_batchN(verify_b, weights.wv_packed, weights.wv_scales, pref_norm_x, pref_v, CONFIG.embed_dim, kv_stride, num_tasks)
 
                             for b in range(verify_b):
                                 var v_pos = pos + b
@@ -3127,25 +3122,7 @@ def main() raises:
                                     lsa_k, lsa_p, lsa_sinks, lsa_window,
                                 )
 
-                            if verify_b == 5:
-                                q4_matmul_batch5(weights.wo_packed, weights.wo_scales, pref_attn_out, pref_proj_out, q_dim, CONFIG.embed_dim, num_tasks)
-                            elif use_gpu:
-                                var slot_wo = gpu_ctx.enqueue_matmul(
-                                    weights.wo_packed.__int__(),
-                                    weights.wo_scales.__int__(),
-                                    pref_attn_out.__int__(),
-                                    pref_proj_out.__int__(),
-                                    q_dim,
-                                    CONFIG.embed_dim,
-                                    batch_size=verify_b,
-                                    flush_cache=True,
-                                    barrier=False,
-                                    ring_doorbell_now=True,
-                                )
-                                gpu_ctx.wait_matmul(slot_wo, pref_proj_out.__int__(), CONFIG.embed_dim, batch_size=verify_b)
-                            else:
-                                for b in range(verify_b):
-                                    q4_matmul_vec(weights.wo_packed, weights.wo_scales, pref_attn_out + b * q_dim, pref_proj_out + b * CONFIG.embed_dim, q_dim, CONFIG.embed_dim, num_tasks)
+                            q4_matmul_batchN(verify_b, weights.wo_packed, weights.wo_scales, pref_attn_out, pref_proj_out, q_dim, CONFIG.embed_dim, num_tasks)
 
                             for b in range(verify_b):
                                 var proj_b = pref_proj_out + b * CONFIG.embed_dim
@@ -3270,21 +3247,10 @@ def main() raises:
                                     CONFIG.embed_dim,
                                     CONFIG.expert_mlp_dim,
                                 )
-                                if verify_b == 5:
-                                    q4_matmul_batch5(weights.w_gate_packed, weights.w_gate_scales, pref_norm_x, pref_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                    q4_matmul_batch5(weights.w_up_packed, weights.w_up_scales, pref_norm_x, pref_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                    gelu_and_mul(pref_h1, pref_h2, pref_gate, verify_b * CONFIG.standard_mlp_dim)
-                                    q4_matmul_batch5(weights.w_down_packed, weights.w_down_scales, pref_gate, pref_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
-                                else:
-                                    for b in range(verify_b):
-                                        var nx_b = pref_norm_x + b * CONFIG.embed_dim
-                                        var h1_b = pref_h1 + b * CONFIG.standard_mlp_dim
-                                        var h2_b = pref_h2 + b * CONFIG.standard_mlp_dim
-                                        var g_b = pref_gate + b * CONFIG.standard_mlp_dim
-                                        q4_matmul_vec(weights.w_gate_packed, weights.w_gate_scales, nx_b, h1_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                        q4_matmul_vec(weights.w_up_packed, weights.w_up_scales, nx_b, h2_b, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
-                                        gelu_and_mul(h1_b, h2_b, g_b, CONFIG.standard_mlp_dim)
-                                        q4_matmul_vec(weights.w_down_packed, weights.w_down_scales, g_b, pref_mlp_out + b * CONFIG.embed_dim, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
+                                q4_matmul_batchN(verify_b, weights.w_gate_packed, weights.w_gate_scales, pref_norm_x, pref_h1, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                q4_matmul_batchN(verify_b, weights.w_up_packed, weights.w_up_scales, pref_norm_x, pref_h2, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks)
+                                gelu_and_mul(pref_h1, pref_h2, pref_gate, verify_b * CONFIG.standard_mlp_dim)
+                                q4_matmul_batchN(verify_b, weights.w_down_packed, weights.w_down_scales, pref_gate, pref_mlp_out, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks)
 
                             var scalar = weights.layer_scalar[0]
                             for b in range(verify_b):
@@ -3298,7 +3264,7 @@ def main() raises:
                                 for i in range(CONFIG.embed_dim):
                                     x_b[i] = (x_b[i] + ffn_out[i]) * scalar
 
-                        # Coalesced 5-Token Final Norm + Single-Pass PVS Logit Verification!
+                        # Coalesced Variable-Horizon Final Norm + Single-Pass Subspace Sieve Logit Verification!
                         for b in range(verify_b):
                             rms_norm(
                                 pref_x + b * CONFIG.embed_dim,
@@ -3317,7 +3283,8 @@ def main() raises:
                         for j in range(1, num_steps + 1):
                             seed_toks_ptr[j - 1] = draft_tokens[j]
                         seed_toks_ptr[num_steps] = embed.last_winner_tok[0]
-                        embed.project_logits_batch5_parallel(
+                        embed.project_logits_batchN_parallel(
+                            verify_b,
                             pref_norm_x,
                             seed_toks_ptr,
                             verified_toks_ptr,

@@ -252,6 +252,181 @@ def q4_matmul_batch5(
 
 
 @always_inline
+def q4_matmul_batchN(
+    batch_size: Int,
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    x_batch: UnsafePointer[Float32, _],
+    out_batch: UnsafePointer[Float32, MutUntrackedOrigin],
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int = 8,
+):
+    """Variable-horizon (1..5 tokens) coalesced Q4_0 matrix-matrix multiply for adaptive draft verification.
+    Uses 2-row weight blocking + FMA for batch_size == 1, 2 and hoisted-scale FMA for batch_size == 3, 4, 5.
+    """
+    debug_assert(batch_size >= 1 and batch_size <= 5, "q4_matmul_batchN requires 1 <= batch_size <= 5")
+    if batch_size == 1:
+        q4_matmul_vec(W_packed, scales, x_batch, out_batch, c_in, c_out, num_tasks)
+        return
+    if batch_size == 5:
+        q4_matmul_batch5(W_packed, scales, x_batch, out_batch, c_in, c_out, num_tasks)
+        return
+
+    var c_in_blocks = c_in // 32
+    var c_in_packed = c_in // 2
+
+    var stack_deint = InlineArray[Float32, 4 * 8192](uninitialized=True)
+    var x_deint: UnsafePointer[Float32, MutUntrackedOrigin]
+    if c_in <= 8192:
+        x_deint = UnsafePointer[Float32, MutUntrackedOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_deint))
+        )
+    else:
+        x_deint = alloc[Float32](batch_size * c_in)
+
+    for tok in range(batch_size):
+        var x_src = x_batch + tok * c_in
+        var xe_dst = x_deint + tok * c_in
+        var xo_dst = xe_dst + c_in_packed
+        for b in range(c_in_blocks):
+            var v0 = x_src.load[16](b * 32)
+            var v1 = x_src.load[16](b * 32 + 16)
+            xe_dst.store[16](b * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
+            xo_dst.store[16](b * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+
+    var xe0 = x_deint + 0 * c_in
+    var xo0 = xe0 + c_in_packed
+    var xe1 = x_deint + 1 * c_in
+    var xo1 = xe1 + c_in_packed
+
+    var tasks = max(1, min(num_tasks, c_out))
+    var chunk = c_out // tasks
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk
+        var end_r = (t + 1) * chunk if t < tasks - 1 else c_out
+        if batch_size == 2:
+            var r = start_r
+            while r + 1 < end_r:
+                var rp0 = r * c_in_packed
+                var rs0 = r * c_in_blocks
+                var rp1 = (r + 1) * c_in_packed
+                var rs1 = (r + 1) * c_in_blocks
+                var acc0_r0 = SIMD[DType.float32, 16](0.0)
+                var acc1_r0 = SIMD[DType.float32, 16](0.0)
+                var acc0_r1 = SIMD[DType.float32, 16](0.0)
+                var acc1_r1 = SIMD[DType.float32, 16](0.0)
+                for b in range(c_in_blocks):
+                    var x0e = xe0.load[16](b * 16)
+                    var x0o = xo0.load[16](b * 16)
+                    var x1e = xe1.load[16](b * 16)
+                    var x1o = xo1.load[16](b * 16)
+
+                    var sc0 = scales[rs0 + b]
+                    var b0 = W_packed.load[16](rp0 + b * 16)
+                    var we0 = ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    var wo0 = ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
+                    acc0_r0 = we0.fma(x0e, wo0.fma(x0o, acc0_r0))
+                    acc1_r0 = we0.fma(x1e, wo0.fma(x1o, acc1_r0))
+
+                    var sc1 = scales[rs1 + b]
+                    var b1 = W_packed.load[16](rp1 + b * 16)
+                    var we1 = ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    var wo1 = ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
+                    acc0_r1 = we1.fma(x0e, wo1.fma(x0o, acc0_r1))
+                    acc1_r1 = we1.fma(x1e, wo1.fma(x1o, acc1_r1))
+                out_batch[0 * c_out + r] = acc0_r0.reduce_add()
+                out_batch[1 * c_out + r] = acc1_r0.reduce_add()
+                out_batch[0 * c_out + r + 1] = acc0_r1.reduce_add()
+                out_batch[1 * c_out + r + 1] = acc1_r1.reduce_add()
+                r += 2
+            while r < end_r:
+                var rp = r * c_in_packed
+                var rs = r * c_in_blocks
+                var acc0 = SIMD[DType.float32, 16](0.0)
+                var acc1 = SIMD[DType.float32, 16](0.0)
+                for b in range(c_in_blocks):
+                    var sc = scales[rs + b]
+                    var bytes = W_packed.load[16](rp + b * 16)
+                    var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                    acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                out_batch[0 * c_out + r] = acc0.reduce_add()
+                out_batch[1 * c_out + r] = acc1.reduce_add()
+                r += 1
+        elif batch_size == 3:
+            var xe2 = x_deint + 2 * c_in
+            var xo2 = xe2 + c_in_packed
+            for r in range(start_r, end_r):
+                var acc0 = SIMD[DType.float32, 16](0.0)
+                var acc1 = SIMD[DType.float32, 16](0.0)
+                var acc2 = SIMD[DType.float32, 16](0.0)
+                var rp = r * c_in_packed
+                var rs = r * c_in_blocks
+                for b in range(c_in_blocks):
+                    var sc = scales[rs + b]
+                    var bytes = W_packed.load[16](rp + b * 16)
+                    var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                    acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                    acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                out_batch[0 * c_out + r] = acc0.reduce_add()
+                out_batch[1 * c_out + r] = acc1.reduce_add()
+                out_batch[2 * c_out + r] = acc2.reduce_add()
+        else:
+            var xe2 = x_deint + 2 * c_in
+            var xo2 = xe2 + c_in_packed
+            var xe3 = x_deint + 3 * c_in
+            var xo3 = xe3 + c_in_packed
+            for r in range(start_r, end_r):
+                var acc0 = SIMD[DType.float32, 16](0.0)
+                var acc1 = SIMD[DType.float32, 16](0.0)
+                var acc2 = SIMD[DType.float32, 16](0.0)
+                var acc3 = SIMD[DType.float32, 16](0.0)
+                var rp = r * c_in_packed
+                var rs = r * c_in_blocks
+                for b in range(c_in_blocks):
+                    var sc = scales[rs + b]
+                    var bytes = W_packed.load[16](rp + b * 16)
+                    var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc
+                    acc0 = we.fma(xe0.load[16](b * 16), wo.fma(xo0.load[16](b * 16), acc0))
+                    acc1 = we.fma(xe1.load[16](b * 16), wo.fma(xo1.load[16](b * 16), acc1))
+                    acc2 = we.fma(xe2.load[16](b * 16), wo.fma(xo2.load[16](b * 16), acc2))
+                    acc3 = we.fma(xe3.load[16](b * 16), wo.fma(xo3.load[16](b * 16), acc3))
+                out_batch[0 * c_out + r] = acc0.reduce_add()
+                out_batch[1 * c_out + r] = acc1.reduce_add()
+                out_batch[2 * c_out + r] = acc2.reduce_add()
+                out_batch[3 * c_out + r] = acc3.reduce_add()
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+
+    var _keep_alive = stack_deint[0]
+    if _keep_alive > 1e38:
+        out_batch[0] += 0.0
+    if c_in > 8192:
+        x_deint.free()
+
+
+@always_inline
+def compute_adaptive_draft_steps(rem_tokens: Int, max_steps: Int = 4) -> Int:
+    """Compute horizon-bounded maximum draft steps before running MTP.
+    Because target verification of N draft steps produces up to N + 1 tokens (N draft + 1 bonus),
+    when rem_tokens <= max_steps, we need at most max(0, rem_tokens - 1) draft steps.
+    """
+    if rem_tokens <= 1:
+        return 0
+    var needed = rem_tokens - 1
+    return needed if needed < max_steps else max_steps
+
+
+@always_inline
 def gelu_and_mul_moe(
     h1: UnsafePointer[Float32, _],
     h2: UnsafePointer[Float32, _],
