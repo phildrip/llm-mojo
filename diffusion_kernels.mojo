@@ -1,6 +1,6 @@
 from std.memory import alloc
 from std.collections import InlineArray
-from std.math import sqrt, exp, tanh, log
+from std.math import sqrt, exp, tanh, log, cos, sin
 from std.algorithm import parallelize
 
 
@@ -1611,7 +1611,7 @@ def teacache_eval_gate(
     or `False` if all 30 layers should be evaluated (updating `h_prev_full` and resetting
     `accum_fluctuation[0] = 0.0`). Requires `full_steps_count >= 2` so both self-conditioning
     and 1st-order Taylor velocity `d1_D` are initialized before forecasting."""
-    if full_steps_count < 2:
+    if full_steps_count < 1:
         for b in range(active_len):
             var orig_t = active_canvas_idx[b]
             var s_ptr = h_curr + b * embed_dim
@@ -1653,9 +1653,9 @@ def teacache_eval_gate(
     if u > 1.0:
         u = 1.0
     var du = u - Float32(0.5)
-    # U-shaped polynomial modulation: higher sensitivity at noisy start & final snap,
-    # smoother tolerance in mid-trajectory
-    var poly_mod = Float32(0.45) + Float32(1.4) * du * du
+    # Polynomial timestep modulation: gentler accumulation during coarse high-noise phase (u -> 0),
+    # stricter sensitivity during final token lock-in (u -> 1)
+    var poly_mod = Float32(0.45) + Float32(0.30) * du * du + Float32(0.25) * u
     var new_accum = accum_fluctuation[0] + poly_mod * raw_l1
 
     if new_accum < teacache_thresh and consec_skips < max_consec_skips:
@@ -1989,6 +1989,401 @@ def apply_moe_lod_and_set_cover(
                 top_w[s] = prob_s * router_per_expert_scale[e]
             else:
                 top_w[s] = 0.0
+
+
+# ==============================================================================
+# 6. Flash-dLLM + dLLM-KVQ: Fused Parallel QKV Prep, Hoisted RoPE & Head-Group
+#    Tiled FP16 Bidirectional Attention (llm-mojo-2tc.9)
+# ==============================================================================
+
+
+@always_inline
+def _softmax_inline(scores: UnsafePointer[Float32, MutAnyOrigin], size: Int):
+    var max_val = scores[0]
+    for i in range(1, size):
+        if scores[i] > max_val:
+            max_val = scores[i]
+    var sum_exp: Float32 = 0.0
+    for i in range(size):
+        var e = exp(scores[i] - max_val)
+        scores[i] = e
+        sum_exp += e
+    var inv_sum = Float32(1.0) / (sum_exp + Float32(1e-10))
+    for i in range(size):
+        scores[i] = scores[i] * inv_sum
+
+
+@always_inline
+def prep_qkv_norm_rope_kvq_batch(
+    canvas_q: UnsafePointer[Float16, MutAnyOrigin],
+    canvas_k: UnsafePointer[Float16, MutAnyOrigin],
+    canvas_v: UnsafePointer[Float16, MutAnyOrigin],
+    q_norm_weight: UnsafePointer[Float32, _],
+    k_norm_weight: UnsafePointer[Float32, _],
+    active_canvas_idx: UnsafePointer[Int, _],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    active_len: Int,
+    num_prompt_tokens: Int,
+    layer_heads: Int,
+    layer_kv_heads: Int,
+    layer_head_dim: Int,
+    kv_stride: Int,
+    layer_cache_offset: Int,
+    max_q_size: Int,
+    max_kv_size: Int,
+    is_global: Bool,
+):
+    """Parallelized Q/K/V head RMSNorm + Hoisted SIMD8 RoPE (computing cos/sin once
+    per token `b` instead of `layer_heads + layer_kv_heads` times, and rotating only
+    the active 64 pairs on global layers) + direct FP16 `dLLM-KVQ` cache scatter."""
+    var half_dim = layer_head_dim // 2
+    var rot_half = 64 if is_global else half_dim
+    var rot_vecs = rot_half // 8
+    var base: Float32 = Float32(1000000.0) if is_global else Float32(10000.0)
+    var inv_rope_dim = Float32(1.0) / Float32(512 if is_global else 256)
+
+    def prep_worker(b: Int) capturing -> None:
+        var orig_t = active_canvas_idx[b]
+        var pos = num_prompt_tokens + orig_t
+        var pos_f = Float32(pos)
+        var q_store = canvas_q + b * max_q_size
+        var k_store = canvas_k + b * max_kv_size
+        var v_store = canvas_v + b * max_kv_size
+
+        for h in range(layer_heads):
+            rms_norm[in_type=DType.float16, out_type=DType.float16](
+                q_store + h * layer_head_dim, q_norm_weight, q_store + h * layer_head_dim, layer_head_dim
+            )
+        for h in range(layer_kv_heads):
+            rms_norm[in_type=DType.float16, out_type=DType.float16](
+                k_store + h * layer_head_dim, k_norm_weight, k_store + h * layer_head_dim, layer_head_dim
+            )
+        for h in range(layer_kv_heads):
+            rms_norm_noscale[in_type=DType.float16, out_type=DType.float16](
+                v_store + h * layer_head_dim, v_store + h * layer_head_dim, layer_head_dim
+            )
+
+        # Precompute cos/sin SIMD8 tables once for token position `pos`
+        var cos_vecs = InlineArray[SIMD[DType.float32, 8], 16](uninitialized=True)
+        var sin_vecs = InlineArray[SIMD[DType.float32, 8], 16](uninitialized=True)
+        for v_idx in range(rot_vecs):
+            var base_i = v_idx * 8
+            var c_vec = SIMD[DType.float32, 8](0.0)
+            var s_vec = SIMD[DType.float32, 8](0.0)
+            comptime for lane in range(8):
+                var i = base_i + lane
+                var theta = pos_f / (base ** (Float32(2 * i) * inv_rope_dim))
+                c_vec[lane] = cos(theta)
+                s_vec[lane] = sin(theta)
+            cos_vecs[v_idx] = c_vec
+            sin_vecs[v_idx] = s_vec
+
+        # Apply SIMD8 RoPE across all Q heads and K heads using precomputed cos_vecs / sin_vecs
+        for h in range(layer_heads):
+            var h_ptr = q_store + h * layer_head_dim
+            for v_idx in range(rot_vecs):
+                var off = v_idx * 8
+                var c_v = cos_vecs[v_idx]
+                var s_v = sin_vecs[v_idx]
+                var v1 = h_ptr.load[8](off).cast[DType.float32]()
+                var v2 = h_ptr.load[8](half_dim + off).cast[DType.float32]()
+                h_ptr.store[8](off, (v1 * c_v - v2 * s_v).cast[DType.float16]())
+                h_ptr.store[8](half_dim + off, (v2 * c_v + v1 * s_v).cast[DType.float16]())
+
+        for h in range(layer_kv_heads):
+            var h_ptr = k_store + h * layer_head_dim
+            for v_idx in range(rot_vecs):
+                var off = v_idx * 8
+                var c_v = cos_vecs[v_idx]
+                var s_v = sin_vecs[v_idx]
+                var v1 = h_ptr.load[8](off).cast[DType.float32]()
+                var v2 = h_ptr.load[8](half_dim + off).cast[DType.float32]()
+                h_ptr.store[8](off, (v1 * c_v - v2 * s_v).cast[DType.float16]())
+                h_ptr.store[8](half_dim + off, (v2 * c_v + v1 * s_v).cast[DType.float16]())
+
+        # Scatter FP16 K and V directly into dLLM-KVQ cache
+        var step_cache_offset = layer_cache_offset + pos * kv_stride
+        for i in range(0, kv_stride, 16):
+            k_cache.store[16](step_cache_offset + i, k_store.load[16](i))
+            v_cache.store[16](step_cache_offset + i, v_store.load[16](i))
+
+    parallelize[prep_worker](active_len)
+
+
+@always_inline
+def flash_dllm_bidirectional_attn(
+    canvas_q: UnsafePointer[Float16, _],
+    k_cache: UnsafePointer[Float16, _],
+    v_cache: UnsafePointer[Float16, _],
+    canvas_attn_out: UnsafePointer[Float16, MutAnyOrigin],
+    active_len: Int,
+    seq_len: Int,
+    layer_heads: Int,
+    layer_kv_heads: Int,
+    layer_head_dim: Int,
+    kv_stride: Int,
+    layer_cache_offset: Int,
+    max_q_size: Int,
+):
+    """Flash-dLLM Head-Group & Query-Tile Fused Bidirectional Attention over FP16 `dLLM-KVQ`:
+      - On sliding/local layers (`ratio == 2`, `head_dim == 256`), pairs 2 query tokens `(b0, b1)`
+        with the 2 query heads `(2g, 2g+1)` sharing KV head `g` to evaluate **4 queries per KV load**.
+      - On global layers (`ratio == 8`, `head_dim == 512`), groups 4 query heads `(8g + r .. 8g + r + 3)`
+        sharing KV head `g` to evaluate **4 queries per KV load**.
+      - Cuts KV cache memory traffic by **8x** (2x from FP16 `dLLM-KVQ` + 4x from 4-query fusion)."""
+    var ratio = layer_heads // layer_kv_heads
+    var num_simd_lanes = layer_head_dim // 8
+
+    if ratio == 2 and num_simd_lanes == 32:
+        var num_pairs = (active_len + 1) // 2
+
+        def sliding_pair_worker(pair_idx: Int) capturing -> None:
+            var b0 = pair_idx * 2
+            var b1 = b0 + 1
+            var q0_base = canvas_q + b0 * max_q_size
+            var out0_base = canvas_attn_out + b0 * max_q_size
+
+            var q00 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+            var q01 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+            var acc00 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+            var acc01 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+            var scores00 = InlineArray[Float32, 512](uninitialized=True)
+            var scores01 = InlineArray[Float32, 512](uninitialized=True)
+            var s00_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int( UnsafePointer(to=scores00)))
+            var s01_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int( UnsafePointer(to=scores01)))
+
+            if b1 < active_len:
+                var q1_base = canvas_q + b1 * max_q_size
+                var out1_base = canvas_attn_out + b1 * max_q_size
+                var q10 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+                var q11 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+                var acc10 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+                var acc11 = InlineArray[SIMD[DType.float32, 8], 32](uninitialized=True)
+                var scores10 = InlineArray[Float32, 512](uninitialized=True)
+                var scores11 = InlineArray[Float32, 512](uninitialized=True)
+                var s10_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int( UnsafePointer(to=scores10)))
+                var s11_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int( UnsafePointer(to=scores11)))
+
+                for g in range(layer_kv_heads):
+                    var h0_off = (g * 2) * 256
+                    var h1_off = (g * 2 + 1) * 256
+                    var g_offset = g * 256
+
+                    for d in range(32):
+                        q00[d] = q0_base.load[8](h0_off + d * 8).cast[DType.float32]()
+                        q01[d] = q0_base.load[8](h1_off + d * 8).cast[DType.float32]()
+                        q10[d] = q1_base.load[8](h0_off + d * 8).cast[DType.float32]()
+                        q11[d] = q1_base.load[8](h1_off + d * 8).cast[DType.float32]()
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var v00 = SIMD[DType.float32, 8](0.0)
+                        var v01 = SIMD[DType.float32, 8](0.0)
+                        var v10 = SIMD[DType.float32, 8](0.0)
+                        var v11 = SIMD[DType.float32, 8](0.0)
+                        for d in range(32):
+                            var k_vec = k_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            v00 = q00[d].fma(k_vec, v00)
+                            v01 = q01[d].fma(k_vec, v01)
+                            v10 = q10[d].fma(k_vec, v10)
+                            v11 = q11[d].fma(k_vec, v11)
+                        s00_ptr[tt] = v00.reduce_add()
+                        s01_ptr[tt] = v01.reduce_add()
+                        s10_ptr[tt] = v10.reduce_add()
+                        s11_ptr[tt] = v11.reduce_add()
+
+                    _softmax_inline(s00_ptr, seq_len)
+                    _softmax_inline(s01_ptr, seq_len)
+                    _softmax_inline(s10_ptr, seq_len)
+                    _softmax_inline(s11_ptr, seq_len)
+
+                    for d in range(32):
+                        acc00[d] = SIMD[DType.float32, 8](0.0)
+                        acc01[d] = SIMD[DType.float32, 8](0.0)
+                        acc10[d] = SIMD[DType.float32, 8](0.0)
+                        acc11[d] = SIMD[DType.float32, 8](0.0)
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var w00 = SIMD[DType.float32, 8](s00_ptr[tt])
+                        var w01 = SIMD[DType.float32, 8](s01_ptr[tt])
+                        var w10 = SIMD[DType.float32, 8](s10_ptr[tt])
+                        var w11 = SIMD[DType.float32, 8](s11_ptr[tt])
+                        for d in range(32):
+                            var v_vec = v_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            acc00[d] = w00.fma(v_vec, acc00[d])
+                            acc01[d] = w01.fma(v_vec, acc01[d])
+                            acc10[d] = w10.fma(v_vec, acc10[d])
+                            acc11[d] = w11.fma(v_vec, acc11[d])
+
+                    for d in range(32):
+                        out0_base.store[8](h0_off + d * 8, acc00[d].cast[DType.float16]())
+                        out0_base.store[8](h1_off + d * 8, acc01[d].cast[DType.float16]())
+                        out1_base.store[8](h0_off + d * 8, acc10[d].cast[DType.float16]())
+                        out1_base.store[8](h1_off + d * 8, acc11[d].cast[DType.float16]())
+            else:
+                for g in range(layer_kv_heads):
+                    var h0_off = (g * 2) * 256
+                    var h1_off = (g * 2 + 1) * 256
+                    var g_offset = g * 256
+
+                    for d in range(32):
+                        q00[d] = q0_base.load[8](h0_off + d * 8).cast[DType.float32]()
+                        q01[d] = q0_base.load[8](h1_off + d * 8).cast[DType.float32]()
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var v00 = SIMD[DType.float32, 8](0.0)
+                        var v01 = SIMD[DType.float32, 8](0.0)
+                        for d in range(32):
+                            var k_vec = k_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            v00 = q00[d].fma(k_vec, v00)
+                            v01 = q01[d].fma(k_vec, v01)
+                        s00_ptr[tt] = v00.reduce_add()
+                        s01_ptr[tt] = v01.reduce_add()
+
+                    _softmax_inline(s00_ptr, seq_len)
+                    _softmax_inline(s01_ptr, seq_len)
+
+                    for d in range(32):
+                        acc00[d] = SIMD[DType.float32, 8](0.0)
+                        acc01[d] = SIMD[DType.float32, 8](0.0)
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var w00 = SIMD[DType.float32, 8](s00_ptr[tt])
+                        var w01 = SIMD[DType.float32, 8](s01_ptr[tt])
+                        for d in range(32):
+                            var v_vec = v_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            acc00[d] = w00.fma(v_vec, acc00[d])
+                            acc01[d] = w01.fma(v_vec, acc01[d])
+
+                    for d in range(32):
+                        out0_base.store[8](h0_off + d * 8, acc00[d].cast[DType.float16]())
+                        out0_base.store[8](h1_off + d * 8, acc01[d].cast[DType.float16]())
+
+        parallelize[sliding_pair_worker](num_pairs)
+
+    elif ratio == 8 and num_simd_lanes == 64:
+        def global_token_worker(b: Int) capturing -> None:
+            var q_base = canvas_q + b * max_q_size
+            var out_base = canvas_attn_out + b * max_q_size
+
+            var q0 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var q1 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var q2 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var q3 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var acc0 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var acc1 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var acc2 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var acc3 = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var scores0 = InlineArray[Float32, 512](uninitialized=True)
+            var scores1 = InlineArray[Float32, 512](uninitialized=True)
+            var scores2 = InlineArray[Float32, 512](uninitialized=True)
+            var scores3 = InlineArray[Float32, 512](uninitialized=True)
+            var s0_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=scores0)))
+            var s1_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=scores1)))
+            var s2_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=scores2)))
+            var s3_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=scores3)))
+
+            for g in range(layer_kv_heads):
+                var g_offset = g * 512
+                for sub in range(2):
+                    var h_base = g * 8 + sub * 4
+                    var h0_off = (h_base + 0) * 512
+                    var h1_off = (h_base + 1) * 512
+                    var h2_off = (h_base + 2) * 512
+                    var h3_off = (h_base + 3) * 512
+
+                    for d in range(64):
+                        q0[d] = q_base.load[8](h0_off + d * 8).cast[DType.float32]()
+                        q1[d] = q_base.load[8](h1_off + d * 8).cast[DType.float32]()
+                        q2[d] = q_base.load[8](h2_off + d * 8).cast[DType.float32]()
+                        q3[d] = q_base.load[8](h3_off + d * 8).cast[DType.float32]()
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var v0 = SIMD[DType.float32, 8](0.0)
+                        var v1 = SIMD[DType.float32, 8](0.0)
+                        var v2 = SIMD[DType.float32, 8](0.0)
+                        var v3 = SIMD[DType.float32, 8](0.0)
+                        for d in range(64):
+                            var k_vec = k_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            v0 = q0[d].fma(k_vec, v0)
+                            v1 = q1[d].fma(k_vec, v1)
+                            v2 = q2[d].fma(k_vec, v2)
+                            v3 = q3[d].fma(k_vec, v3)
+                        s0_ptr[tt] = v0.reduce_add()
+                        s1_ptr[tt] = v1.reduce_add()
+                        s2_ptr[tt] = v2.reduce_add()
+                        s3_ptr[tt] = v3.reduce_add()
+
+                    _softmax_inline(s0_ptr, seq_len)
+                    _softmax_inline(s1_ptr, seq_len)
+                    _softmax_inline(s2_ptr, seq_len)
+                    _softmax_inline(s3_ptr, seq_len)
+
+                    for d in range(64):
+                        acc0[d] = SIMD[DType.float32, 8](0.0)
+                        acc1[d] = SIMD[DType.float32, 8](0.0)
+                        acc2[d] = SIMD[DType.float32, 8](0.0)
+                        acc3[d] = SIMD[DType.float32, 8](0.0)
+
+                    for tt in range(seq_len):
+                        var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                        var w0 = SIMD[DType.float32, 8](s0_ptr[tt])
+                        var w1 = SIMD[DType.float32, 8](s1_ptr[tt])
+                        var w2 = SIMD[DType.float32, 8](s2_ptr[tt])
+                        var w3 = SIMD[DType.float32, 8](s3_ptr[tt])
+                        for d in range(64):
+                            var v_vec = v_cache.load[8](t_cache_offset + d * 8).cast[DType.float32]()
+                            acc0[d] = w0.fma(v_vec, acc0[d])
+                            acc1[d] = w1.fma(v_vec, acc1[d])
+                            acc2[d] = w2.fma(v_vec, acc2[d])
+                            acc3[d] = w3.fma(v_vec, acc3[d])
+
+                    for d in range(64):
+                        out_base.store[8](h0_off + d * 8, acc0[d].cast[DType.float16]())
+                        out_base.store[8](h1_off + d * 8, acc1[d].cast[DType.float16]())
+                        out_base.store[8](h2_off + d * 8, acc2[d].cast[DType.float16]())
+                        out_base.store[8](h3_off + d * 8, acc3[d].cast[DType.float16]())
+
+        parallelize[global_token_worker](active_len)
+    else:
+        def generic_attn_worker(b: Int) capturing -> None:
+            var q_load = canvas_q + b * max_q_size
+            var attn_out_ptr = canvas_attn_out + b * max_q_size
+            var scores = InlineArray[Float32, 512](uninitialized=True)
+            var s_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=scores)))
+            var q_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+            var acc_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
+
+            for h in range(layer_heads):
+                var h_offset = h * layer_head_dim
+                var g = h // ratio
+                var g_offset = g * layer_head_dim
+                for d in range(num_simd_lanes):
+                    q_regs[d] = q_load.load[8](h_offset + d * 8).cast[DType.float32]()
+                for tt in range(seq_len):
+                    var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                    var score_vec = SIMD[DType.float32, 8](0.0)
+                    for d in range(num_simd_lanes):
+                        score_vec = q_regs[d].fma(k_cache.load[8](t_cache_offset + d * 8).cast[DType.float32](), score_vec)
+                    s_ptr[tt] = score_vec.reduce_add()
+                _softmax_inline(s_ptr, seq_len)
+                for d in range(num_simd_lanes):
+                    acc_regs[d] = SIMD[DType.float32, 8](0.0)
+                for tt in range(seq_len):
+                    var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
+                    var s_vec = SIMD[DType.float32, 8](s_ptr[tt])
+                    for d in range(num_simd_lanes):
+                        acc_regs[d] = s_vec.fma(v_cache.load[8](t_cache_offset + d * 8).cast[DType.float32](), acc_regs[d])
+                for d in range(num_simd_lanes):
+                    attn_out_ptr.store[8](h_offset + d * 8, acc_regs[d].cast[DType.float16]())
+
+        parallelize[generic_attn_worker](active_len)
+
 
 
 

@@ -24,6 +24,8 @@ from diffusion_kernels import (
     compute_moe_lod_k,
     compute_moe_lod_top_p,
     apply_moe_lod_and_set_cover,
+    prep_qkv_norm_rope_kvq_batch,
+    flash_dllm_bidirectional_attn,
 )
 import std.time
 
@@ -1224,12 +1226,12 @@ def main() raises:
         var kv_heads = 2 if is_global else 8
         var head_dim = 512 if is_global else 256
         current_cache_offset += CONFIG.max_seq_len * kv_heads * head_dim
-    print("Allocating KV Cache (", (current_cache_offset * 8) // 1024 // 1024, " MB)...")
-    var k_cache = alloc[Float32](current_cache_offset)
-    var v_cache = alloc[Float32](current_cache_offset)
+    print("Allocating dLLM-KVQ FP16 KV Cache (", (current_cache_offset * 4) // 1024 // 1024, " MB)...")
+    var k_cache = alloc[Float16](current_cache_offset)
+    var v_cache = alloc[Float16](current_cache_offset)
     for i in range(current_cache_offset):
-        k_cache[i] = 0.0
-        v_cache[i] = 0.0
+        k_cache[i] = Float16(0.0)
+        v_cache[i] = Float16(0.0)
 
     # 5. Allocate thread-safe reusable activation buffers
     var local_x = alloc[Float32](CONFIG.embed_dim)
@@ -1300,8 +1302,8 @@ def main() raises:
 
     # Reusable packed flat temp buffers for Coalesced Batched GEMM launches
     var temp_packed_q_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_Q_SIZE * 4, gtt_cached_flags, cpu_access=True)
-    var temp_packed_k_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, gtt_cached_flags, cpu_access=True)
-    var temp_packed_v_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * MAX_KV_SIZE * 4, gtt_cached_flags, cpu_access=True)
+    var temp_packed_k_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.standard_mlp_dim * 4, gtt_cached_flags, cpu_access=True)
+    var temp_packed_v_buf = gpu_ctx.alloc_gpu_buffer(CANVAS_LEN * CONFIG.standard_mlp_dim * 4, gtt_cached_flags, cpu_access=True)
 
     var temp_packed_q = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_q_buf.cpu_addr)
     var temp_packed_k = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=temp_packed_k_buf.cpu_addr)
@@ -1447,9 +1449,9 @@ def main() raises:
             continue
 
         # Zero-out the KV Cache for the new interaction
-        for i in range(current_cache_offset):
-            k_cache[i] = 0.0
-            v_cache[i] = 0.0
+        for i in range(0, current_cache_offset, 16):
+            k_cache.store[16](i, SIMD[DType.float16, 16](0.0))
+            v_cache.store[16](i, SIMD[DType.float16, 16](0.0))
 
         print("Agent > (diffusion mode)")
 
@@ -1524,12 +1526,12 @@ def main() raises:
                 apply_rope(q, layer_heads, layer_head_dim, pos, is_global)
                 apply_rope(k_vec, layer_kv_heads, layer_head_dim, pos, is_global)
 
-                # 5. KV Cache write
+                # 5. KV Cache write (FP16 dLLM-KVQ)
                 var layer_cache_offset = kv_cache_offsets[l]
                 var step_cache_offset = layer_cache_offset + pos * kv_stride
-                for i in range(kv_stride):
-                    k_cache[step_cache_offset + i] = k_vec[i]
-                    v_cache[step_cache_offset + i] = v_vec[i]
+                for i in range(0, kv_stride, 8):
+                    k_cache.store[8](step_cache_offset + i, k_vec.load[8](i).cast[DType.float16]())
+                    v_cache.store[8](step_cache_offset + i, v_vec.load[8](i).cast[DType.float16]())
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
                     p_head_norm_rope_cache += ta1 - ta0
@@ -1542,19 +1544,19 @@ def main() raises:
                     var g_offset = g * layer_head_dim
                     for t in range(pos + 1):
                         var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                        var score: Float32 = 0.0
-                        for d in range(layer_head_dim):
-                            score += q[h_offset + d] * k_cache[t_cache_offset + d]
-                        attn_scores[t] = score
+                        var score_vec = SIMD[DType.float32, 8](0.0)
+                        for d in range(0, layer_head_dim, 8):
+                            score_vec += q.load[8](h_offset + d) * k_cache.load[8](t_cache_offset + d).cast[DType.float32]()
+                        attn_scores[t] = score_vec.reduce_add()
                         
                     softmax(attn_scores, pos + 1)
                     
-                    for d in range(layer_head_dim):
-                        var val_sum: Float32 = 0.0
+                    for d in range(0, layer_head_dim, 8):
+                        var val_vec = SIMD[DType.float32, 8](0.0)
                         for t in range(pos + 1):
                             var t_cache_offset = layer_cache_offset + t * kv_stride + g_offset
-                            val_sum += attn_scores[t] * v_cache[t_cache_offset + d]
-                        attn_out[h_offset + d] = val_sum
+                            val_vec += SIMD[DType.float32, 8](attn_scores[t]) * v_cache.load[8](t_cache_offset + d).cast[DType.float32]()
+                        attn_out.store[8](h_offset + d, val_vec)
                 ta1 = std.time.perf_counter()
                 if pos >= num_prompt_tokens:
                     p_attn_dot_product += ta1 - ta0
@@ -1824,74 +1826,44 @@ def main() raises:
                         q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, active_len, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE)
                 var tl_qkv_end = std.time.perf_counter()
 
-                # Phase 1b: Head norms + RoPE at true canvas position `pos = num_prompt_tokens + orig_t` + KV cache scatter
-                for b in range(active_len):
-                    var orig_t = active_canvas_idx[b]
-                    var pos = num_prompt_tokens + orig_t
-                    var q_store = canvas_q + b * MAX_Q_SIZE
-                    var k_store = canvas_k + b * MAX_KV_SIZE
-                    var v_store = canvas_v + b * MAX_KV_SIZE
+                # Phase 1b: Parallelized Head norms + Hoisted SIMD8 RoPE + FP16 dLLM-KVQ cache scatter (llm-mojo-2tc.9)
+                prep_qkv_norm_rope_kvq_batch(
+                    canvas_q,
+                    canvas_k,
+                    canvas_v,
+                    weights.q_norm_weight,
+                    weights.k_norm_weight,
+                    active_canvas_idx,
+                    k_cache,
+                    v_cache,
+                    active_len,
+                    num_prompt_tokens,
+                    layer_heads,
+                    layer_kv_heads,
+                    layer_head_dim,
+                    kv_stride,
+                    layer_cache_offset,
+                    MAX_Q_SIZE,
+                    MAX_KV_SIZE,
+                    is_global,
+                )
 
-                    for h in range(layer_heads):
-                        rms_norm[in_type=DType.float16, out_type=DType.float16](q_store + h * layer_head_dim, weights.q_norm_weight, q_store + h * layer_head_dim, layer_head_dim)
-                    for h in range(layer_kv_heads):
-                        rms_norm[in_type=DType.float16, out_type=DType.float16](k_store + h * layer_head_dim, weights.k_norm_weight, k_store + h * layer_head_dim, layer_head_dim)
-                    for h in range(layer_kv_heads):
-                        rms_norm_noscale[in_type=DType.float16, out_type=DType.float16](v_store + h * layer_head_dim, v_store + h * layer_head_dim, layer_head_dim)
-
-                    apply_rope[type=DType.float16](q_store, layer_heads, layer_head_dim, pos, is_global)
-                    apply_rope[type=DType.float16](k_store, layer_kv_heads, layer_head_dim, pos, is_global)
-
-                    var step_cache_offset = layer_cache_offset + pos * kv_stride
-                    for i in range(0, kv_stride, 8):
-                        k_cache.store[8](step_cache_offset + i, k_store.load[8](i).cast[DType.float32]())
-                        v_cache.store[8](step_cache_offset + i, v_store.load[8](i).cast[DType.float32]())
-
-                # Phase 2a: Bidirectional attention for active_len queries against all seq_len K/V entries
+                # Phase 2a: Flash-dLLM Head-Group & Query-Tile Fused Bidirectional Attention over FP16 dLLM-KVQ
                 var tl_attn = std.time.perf_counter()
-                def attn_worker(b: Int) capturing -> None:
-                    var q_load = canvas_q + b * MAX_Q_SIZE
-                    var attn_out_ptr = canvas_attn_out + b * MAX_Q_SIZE
-                    var scores_t = canvas_attn_scores + b * CONFIG.max_seq_len
-
-                    var q_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
-                    var acc_regs = InlineArray[SIMD[DType.float32, 8], 64](uninitialized=True)
-
-                    for h in range(layer_heads):
-                        var h_offset = h * layer_head_dim
-                        var g = h // ratio
-                        var g_offset = g * layer_head_dim
-                        var num_simd_lanes = layer_head_dim // 8
-
-                        # Cache query head into thread-local stack registers
-                        for d in range(num_simd_lanes):
-                            q_regs[d] = q_load.load[8](h_offset + d * 8).cast[DType.float32]()
-
-                        for tt in range(seq_len):
-                            var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
-                            var score_vec = SIMD[DType.float32, 8](0.0)
-                            for d in range(num_simd_lanes):
-                                score_vec += q_regs[d] * k_cache.load[8](t_cache_offset + d * 8)
-                            scores_t[tt] = score_vec.reduce_add()
-
-                        softmax(scores_t, seq_len)
-
-                        # Accumulate value vectors directly in registers
-                        for d in range(num_simd_lanes):
-                            acc_regs[d] = SIMD[DType.float32, 8](0.0)
-
-                        for tt in range(seq_len):
-                            var t_cache_offset = layer_cache_offset + tt * kv_stride + g_offset
-                            var s_vec = SIMD[DType.float32, 8](scores_t[tt])
-                            for d in range(num_simd_lanes):
-                                var v_vec = v_cache.load[8](t_cache_offset + d * 8)
-                                acc_regs[d] += s_vec * v_vec
-
-                        # Write back the final compiled attention heads once
-                        for d in range(num_simd_lanes):
-                            attn_out_ptr.store[8](h_offset + d * 8, acc_regs[d].cast[DType.float16]())
-
-                parallelize[attn_worker](active_len)
+                flash_dllm_bidirectional_attn(
+                    canvas_q,
+                    k_cache,
+                    v_cache,
+                    canvas_attn_out,
+                    active_len,
+                    seq_len,
+                    layer_heads,
+                    layer_kv_heads,
+                    layer_head_dim,
+                    kv_stride,
+                    layer_cache_offset,
+                    MAX_Q_SIZE,
+                )
 
                 var tl_attn_end = std.time.perf_counter()
 
@@ -2011,20 +1983,20 @@ def main() raises:
 
                 if use_gpu:
                     var tl_ffn2 = std.time.perf_counter()
-                    q4_gemm_l1_2x4[DType.float32, DType.float32](
+                    q4_gemm_l1_2x4[DType.float32, DType.float16](
                         weights.w_up_packed, weights.w_up_scales,
-                        canvas_norm, temp_packed_k,
+                        canvas_norm, canvas_ffn_up,
                         active_len, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks,
                         in_stride=CONFIG.embed_dim, out_stride=CONFIG.standard_mlp_dim,
                     )
                     gpu_ctx.wait_matmul(slot_gate, temp_packed_q.__int__(), CONFIG.standard_mlp_dim, batch_size=active_len, flush_cache=True)
                     for b in range(active_len):
                         var g_ptr = temp_packed_q + b * CONFIG.standard_mlp_dim
-                        var u_ptr = temp_packed_k + b * CONFIG.standard_mlp_dim
+                        var u_ptr = canvas_ffn_up + b * CONFIG.standard_mlp_dim
                         var out_ptr = canvas_ffn_gated + b * CONFIG.standard_mlp_dim
                         for i in range(0, CONFIG.standard_mlp_dim, 8):
                             var g_v = g_ptr.load[8](i)
-                            var u_v = u_ptr.load[8](i)
+                            var u_v = u_ptr.load[8](i).cast[DType.float32]()
                             var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * g_v))
                             var act = (g_v * sig * u_v).clamp(f16_min_v, f16_max_v)
                             out_ptr.store[8](i, act.cast[DType.float16]())
@@ -2082,6 +2054,7 @@ def main() raises:
                         consec_skips += 1
                         taylorseer_forecast_skipped_step(
                             canvas_hidden,
+                            teacache_h5_prev,
                             active_canvas_idx,
                             taylor_D,
                             taylor_d1,
