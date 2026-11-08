@@ -1611,7 +1611,7 @@ def teacache_eval_gate(
     or `False` if all 30 layers should be evaluated (updating `h_prev_full` and resetting
     `accum_fluctuation[0] = 0.0`). Requires `full_steps_count >= 2` so both self-conditioning
     and 1st-order Taylor velocity `d1_D` are initialized before forecasting."""
-    if full_steps_count < 1:
+    if full_steps_count < 2:
         for b in range(active_len):
             var orig_t = active_canvas_idx[b]
             var s_ptr = h_curr + b * embed_dim
@@ -2383,6 +2383,157 @@ def flash_dllm_bidirectional_attn(
                     attn_out_ptr.store[8](h_offset + d * 8, acc_regs[d].cast[DType.float16]())
 
         parallelize[generic_attn_worker](active_len)
+
+
+# ==============================================================================
+# 7. AdaCache (ICCV 2025) + dLLM-Cache (2025): Per-Token Feature-Similarity
+#    Partial Canvas Updates with Motion Regularization (llm-mojo-2tc.8)
+# ==============================================================================
+
+
+@always_inline
+def adacache_filter_after_layer1(
+    canvas_hidden: UnsafePointer[Float16, MutAnyOrigin],
+    adacache_h1_prev: UnsafePointer[Float16, MutAnyOrigin],
+    active_canvas_idx: UnsafePointer[Int, MutAnyOrigin],
+    adacache_skip_streak: UnsafePointer[Int, MutAnyOrigin],
+    active_len: Int,
+    embed_dim: Int,
+    denoise_step: Int,
+    k_slow: Int = 3,
+    tau_ada: Float32 = 0.08,
+) -> Int:
+    """Evaluates per-token normalized squared-L2 hidden-state fluctuation after Layer 1
+    (`l == 1`, where self-conditioning and 2 layers of bidirectional context have been fused),
+    applies Motion Regularization (`MoReg`) to determine the active token budget (rounded
+    to a multiple of 16 for iGPU 16x16 matmul tiles), enforces periodic full refresh every
+    `k_slow` steps (`adacache_skip_streak[orig_t] < k_slow - 1`), and compacts `canvas_hidden`
+    and `active_canvas_idx` in-place in strictly monotonic order."""
+    if active_len <= 16:
+        for b in range(active_len):
+            var orig_t = active_canvas_idx[b]
+            var h_curr = canvas_hidden + b * embed_dim
+            var h_prev = adacache_h1_prev + orig_t * embed_dim
+            for i in range(0, embed_dim, 16):
+                h_prev.store[16](i, h_curr.load[16](i))
+            adacache_skip_streak[orig_t] = 0
+        return active_len
+
+    # Warmup steps 0 and 1: record h1_prev and keep 100% of active_len so TaylorSeer & caches warm up
+    if denoise_step < 2:
+        for b in range(active_len):
+            var orig_t = active_canvas_idx[b]
+            var h_curr = canvas_hidden + b * embed_dim
+            var h_prev = adacache_h1_prev + orig_t * embed_dim
+            for i in range(0, embed_dim, 16):
+                h_prev.store[16](i, h_curr.load[16](i))
+            adacache_skip_streak[orig_t] = 0
+        return active_len
+
+    var max_consec_skip = (k_slow - 1) if k_slow > 1 else 0
+    var fluct_scores = InlineArray[Float32, 256](uninitialized=True)
+    var eff_priority = InlineArray[Float32, 256](uninitialized=True)
+    var keep_mask = InlineArray[Bool, 256](uninitialized=True)
+
+    var sum_fluct: Float32 = 0.0
+    var num_above_tau: Int = 0
+    var num_forced: Int = 0
+
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var h_curr = canvas_hidden + b * embed_dim
+        var h_prev = adacache_h1_prev + orig_t * embed_dim
+
+        var diff_sq_vec = SIMD[DType.float32, 8](0.0)
+        var norm_sq_vec = SIMD[DType.float32, 8](0.0)
+        for i in range(0, embed_dim, 8):
+            var c = h_curr.load[8](i).cast[DType.float32]()
+            var p = h_prev.load[8](i).cast[DType.float32]()
+            var d = c - p
+            diff_sq_vec = d.fma(d, diff_sq_vec)
+            norm_sq_vec = c.fma(c, p.fma(p, norm_sq_vec))
+            h_prev.store[8](i, c.cast[DType.float16]())
+
+        var raw_fluct = diff_sq_vec.reduce_add() / (norm_sq_vec.reduce_add() + Float32(1e-8))
+        fluct_scores[b] = raw_fluct
+        sum_fluct += raw_fluct
+
+        var streak = adacache_skip_streak[orig_t]
+        if streak >= max_consec_skip:
+            # Periodic refresh invariant: force evaluation after k_slow - 1 skips
+            eff_priority[b] = Float32(1e9) + raw_fluct
+            num_forced += 1
+            num_above_tau += 1
+        elif raw_fluct < tau_ada:
+            # Explicitly below absolute fluctuation threshold -> candidate for skipping
+            eff_priority[b] = raw_fluct * Float32(0.5)
+        else:
+            # Boost tokens that skipped the previous step by 1.25x so refresh rotates smoothly
+            var boost = Float32(1.25) if streak > 0 else Float32(1.0)
+            eff_priority[b] = raw_fluct * boost
+            num_above_tau += 1
+
+    var mean_fluct = sum_fluct / Float32(active_len)
+
+    # Motion Regularization (MoReg): scale target active fraction based on canvas-wide mean fluctuation
+    var moreg_cap: Int
+    if mean_fluct < Float32(0.15):
+        moreg_cap = (active_len * 4) // 8  # 50% active
+    elif mean_fluct < Float32(0.35):
+        moreg_cap = (active_len * 5) // 8  # 62.5% active (e.g. 160 / 256)
+    else:
+        moreg_cap = (active_len * 6) // 8  # 75% active (e.g. 192 / 256)
+
+    var target_active = num_above_tau if num_above_tau < moreg_cap else moreg_cap
+    if target_active < num_forced:
+        target_active = num_forced
+    if target_active < 16:
+        target_active = 16
+    # Round up to a multiple of 16 (capped at active_len) for 100% iGPU 16x16 matmul tile occupancy
+    target_active = ((target_active + 15) // 16) * 16
+    if target_active >= active_len:
+        for b in range(active_len):
+            adacache_skip_streak[active_canvas_idx[b]] = 0
+        return active_len
+
+    # Select top `target_active` tokens by `eff_priority`
+    var sorted_b = InlineArray[Int, 256](uninitialized=True)
+    for b in range(active_len):
+        sorted_b[b] = b
+        keep_mask[b] = False
+
+    for i in range(target_active):
+        var best_j = i
+        var best_val = eff_priority[sorted_b[i]]
+        for j in range(i + 1, active_len):
+            var v = eff_priority[sorted_b[j]]
+            if v > best_val:
+                best_val = v
+                best_j = j
+        if best_j != i:
+            var tmp = sorted_b[i]
+            sorted_b[i] = sorted_b[best_j]
+            sorted_b[best_j] = tmp
+        keep_mask[sorted_b[i]] = True
+
+    # In-place monotonic compaction of canvas_hidden and active_canvas_idx
+    var write_idx = 0
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        if keep_mask[b]:
+            adacache_skip_streak[orig_t] = 0
+            if write_idx != b:
+                active_canvas_idx[write_idx] = orig_t
+                var src_ptr = canvas_hidden + b * embed_dim
+                var dst_ptr = canvas_hidden + write_idx * embed_dim
+                for i in range(0, embed_dim, 16):
+                    dst_ptr.store[16](i, src_ptr.load[16](i))
+            write_idx += 1
+        else:
+            adacache_skip_streak[orig_t] += 1
+
+    return write_idx
+
 
 
 

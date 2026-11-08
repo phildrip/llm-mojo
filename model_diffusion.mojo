@@ -26,6 +26,7 @@ from diffusion_kernels import (
     apply_moe_lod_and_set_cover,
     prep_qkv_norm_rope_kvq_batch,
     flash_dllm_bidirectional_attn,
+    adacache_filter_after_layer1,
 )
 import std.time
 
@@ -1368,6 +1369,9 @@ def main() raises:
     var taylor_d1 = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
     var taylor_d2 = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
     var teacache_accum = alloc[Float32](1)
+    # AdaCache + dLLM-Cache per-token partial canvas update buffers (llm-mojo-2tc.8)
+    var adacache_h1_prev = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
+    var adacache_skip_streak = alloc[Int](CANVAS_LEN)
 
     print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
           (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
@@ -1703,6 +1707,7 @@ def main() raises:
         var confidence_threshold: Float32 = 0.005
         for t in range(CANVAS_LEN):
             locked_mask[t] = False
+            adacache_skip_streak[t] = 0
         var full_steps_count = 0
         var consec_skips = 0
         teacache_accum[0] = 0.0
@@ -2034,6 +2039,23 @@ def main() raises:
                           " attn=", String((tl_attn_end - tl_attn) * 1000), "ms",
                           " ffn=", String((tl_ffn_end - tl_ffn) * 1000), "ms",
                           " moe=", String((tl_moe_end - tl_moe) * 1000), "ms")
+
+                # AdaCache (ICCV 2025) + dLLM-Cache per-token partial canvas updates after Layer 1 (llm-mojo-2tc.8)
+                if l == 1:
+                    var prev_active_len = active_len
+                    active_len = adacache_filter_after_layer1(
+                        canvas_hidden,
+                        adacache_h1_prev,
+                        active_canvas_idx,
+                        adacache_skip_streak,
+                        active_len,
+                        CONFIG.embed_dim,
+                        denoise_step,
+                        k_slow=3,
+                        tau_ada=0.08,
+                    )
+                    if active_len < prev_active_len:
+                        print("    -> AdaCache + MoReg: compacted active_len=", active_len, "/", prev_active_len, "(layers 2..29 + logit_proj)")
 
                 # TeaCache (CVPR 2025) & TaylorSeer (ICCV 2025) middle-block forecasting (llm-mojo-2tc.4 & 2tc.7)
                 if l == 5:
@@ -2403,4 +2425,6 @@ def main() raises:
     taylor_d1.free()
     taylor_d2.free()
     teacache_accum.free()
+    adacache_h1_prev.free()
+    adacache_skip_streak.free()
     gpu_ctx.close()
