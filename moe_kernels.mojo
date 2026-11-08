@@ -316,6 +316,127 @@ def compute_moe_lod_weights(
 
 
 @always_inline
+def compute_subbatch_set_cover_moe_weights(
+    sub_b: Int,
+    all_top_idx: UnsafePointer[Int, _],
+    all_top_val: UnsafePointer[Float32, _],
+    per_expert_scale: UnsafePointer[Float32, _],
+    moe_top_p: Float32,
+    tok_active_count: UnsafePointer[Int, MutUntrackedOrigin],
+    tok_active_idx: UnsafePointer[Int, MutUntrackedOrigin],
+    tok_active_weights: UnsafePointer[Float32, MutUntrackedOrigin],
+    num_experts: Int = 128,
+    top_k: Int = 8,
+    core_top_p: Float32 = 0.85,
+    singleton_min_prob: Float32 = 0.068,
+):
+    """Subbatch-Coherent Set-Cover MoE Routing with Zero-Marginal-Cost Piggybacking (llm-mojo-xr6.2).
+    1. Anchor token b=0 is evaluated identically to compute_moe_lod_weights (100% anchor invariance).
+    2. Draft tokens b>=1 mark their core experts (i<2 or norm_prob>=singleton_min_prob or cum<core_top_p)
+       into the shared subbatch pool, and count expert frequencies across all tokens in the subbatch.
+    3. Tail candidates on b>=1 that appear in the shared pool or have frequency >= 2 piggyback for free
+       (zero marginal DDR4 bandwidth); true singleton tail stragglers (freq==1, not in pool) are pruned
+       with energy-preserving probability renormalization before per_expert_scale.
+    """
+    if sub_b <= 0:
+        return
+    # 1. Anchor token b = 0: strictly invariant
+    tok_active_count[0] = compute_moe_lod_weights(
+        all_top_idx,
+        all_top_val,
+        per_expert_scale,
+        moe_top_p,
+        tok_active_idx,
+        tok_active_weights,
+        top_k,
+    )
+    if sub_b == 1:
+        return
+
+    var in_shared_pool = InlineArray[UInt8, 256](fill=0)
+    var expert_freq = InlineArray[UInt8, 256](fill=0)
+    for k in range(tok_active_count[0]):
+        var e0 = tok_active_idx[k]
+        if e0 >= 0 and e0 < 256:
+            in_shared_pool[e0] = 1
+            expert_freq[e0] = 1
+
+    var safe_top_p = moe_top_p if (moe_top_p == moe_top_p) else Float32(1.0)
+    var inv_sums = InlineArray[Float32, 5](fill=1.0)
+    var elig_counts = InlineArray[Int, 5](fill=0)
+    var elig_prob_sums = InlineArray[Float32, 5](fill=0.0)
+
+    # Pass 1: Identify eligible & core experts across draft tokens b = 1 .. sub_b - 1
+    for b in range(1, sub_b):
+        var t_idx = all_top_idx + b * top_k
+        var t_val = all_top_val + b * top_k
+        var sum_val: Float32 = 0.0
+        for i in range(top_k):
+            sum_val += t_val[i]
+        var inv_s = Float32(1.0) / (sum_val + Float32(1e-10))
+        inv_sums[b] = inv_s
+
+        var cum_p: Float32 = 0.0
+        var e_cnt = 0
+        for i in range(top_k):
+            var np = t_val[i] * inv_s
+            if safe_top_p >= Float32(1.0):
+                if np < Float32(0.05) and i > 0:
+                    continue
+            else:
+                if i > 0 and (np < Float32(0.05) or cum_p >= safe_top_p):
+                    break
+            var e = t_idx[i]
+            if e >= 0 and e < 256:
+                expert_freq[e] += 1
+                if i < 2 or np >= singleton_min_prob or cum_p < core_top_p:
+                    in_shared_pool[e] = 1
+            cum_p += np
+            e_cnt += 1
+        elig_counts[b] = e_cnt
+        elig_prob_sums[b] = cum_p
+
+    # Pass 2: Retain core + piggybacked shared experts, prune singleton tail stragglers & renormalize
+    for b in range(1, sub_b):
+        var t_idx = all_top_idx + b * top_k
+        var t_val = all_top_val + b * top_k
+        var out_idx = tok_active_idx + b * top_k
+        var out_w = tok_active_weights + b * top_k
+        var inv_s = inv_sums[b]
+        var cum_p: Float32 = 0.0
+        var kept_p_sum: Float32 = 0.0
+        var count = 0
+        var pruned_any = False
+
+        for i in range(top_k):
+            var np = t_val[i] * inv_s
+            if safe_top_p >= Float32(1.0):
+                if np < Float32(0.05) and i > 0:
+                    continue
+            else:
+                if i > 0 and (np < Float32(0.05) or cum_p >= safe_top_p):
+                    break
+            var e = t_idx[i]
+            var is_core = (i < 2) or (np >= singleton_min_prob) or (cum_p < core_top_p)
+            var is_shared = (e >= 0 and e < 256) and (in_shared_pool[e] != 0 or expert_freq[e] >= 2)
+            cum_p += np
+            if is_core or is_shared:
+                out_idx[count] = e
+                out_w[count] = np
+                kept_p_sum += np
+                count += 1
+            else:
+                pruned_any = True
+
+        var target_mass = Float32(1.0) if (safe_top_p < Float32(1.0)) else elig_prob_sums[b]
+        var renorm = (target_mass / (kept_p_sum + Float32(1e-10))) if (pruned_any or safe_top_p < Float32(1.0)) else Float32(1.0)
+        for k in range(count):
+            var e = out_idx[k]
+            out_w[k] = (out_w[k] * renorm) * per_expert_scale[e]
+        tok_active_count[b] = count
+
+
+@always_inline
 def run_moe_experts_stage1_8core(
     experts_gate_up_packed: UnsafePointer[UInt8, _],
     experts_gate_up_scales: UnsafePointer[Float32, _],
@@ -619,11 +740,79 @@ def run_moe_coalesced_core(
                         acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
                     gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
                     gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
+            elif m_count == 3:
+                var b_t1 = bucket_toks[e * 5 + 1]
+                var b_t2 = bucket_toks[e * 5 + 2]
+                var in_e0 = batch_in_deint + b_t0 * embed_dim
+                var in_o0 = in_e0 + half_in
+                var in_e1 = batch_in_deint + b_t1 * embed_dim
+                var in_o1 = in_e1 + half_in
+                var in_e2 = batch_in_deint + b_t2 * embed_dim
+                var in_o2 = in_e2 + half_in
+                for r in range(sr, er):
+                    var rp = r * half_in
+                    var rs = r * c_in_blocks
+                    var acc0 = SIMD[DType.float32, 16](0.0)
+                    var acc1 = SIMD[DType.float32, 16](0.0)
+                    var acc2 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(c_in_blocks):
+                        var sc = gu_s[rs + blk]
+                        var bytes = gu_p.load[16](rp + blk * 16)
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
+                    gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
+                    gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
+                    gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
+            elif m_count == 4:
+                var b_t1 = bucket_toks[e * 5 + 1]
+                var b_t2 = bucket_toks[e * 5 + 2]
+                var b_t3 = bucket_toks[e * 5 + 3]
+                var in_e0 = batch_in_deint + b_t0 * embed_dim
+                var in_o0 = in_e0 + half_in
+                var in_e1 = batch_in_deint + b_t1 * embed_dim
+                var in_o1 = in_e1 + half_in
+                var in_e2 = batch_in_deint + b_t2 * embed_dim
+                var in_o2 = in_e2 + half_in
+                var in_e3 = batch_in_deint + b_t3 * embed_dim
+                var in_o3 = in_e3 + half_in
+                for r in range(sr, er):
+                    var rp = r * half_in
+                    var rs = r * c_in_blocks
+                    var acc0 = SIMD[DType.float32, 16](0.0)
+                    var acc1 = SIMD[DType.float32, 16](0.0)
+                    var acc2 = SIMD[DType.float32, 16](0.0)
+                    var acc3 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(c_in_blocks):
+                        var sc = gu_s[rs + blk]
+                        var bytes = gu_p.load[16](rp + blk * 16)
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
+                        acc3 = acc3 + (we * in_e3.load[16](blk * 16) + wo * in_o3.load[16](blk * 16)) * sc
+                    gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
+                    gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
+                    gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
+                    gu_out_scratch[(base_slot + 3) * gate_up_rows + r] = acc3.reduce_add()
             else:
                 var b_t1 = bucket_toks[e * 5 + 1]
                 var b_t2 = bucket_toks[e * 5 + 2]
-                var b_t3 = bucket_toks[e * 5 + 3] if m_count > 3 else 0
-                var b_t4 = bucket_toks[e * 5 + 4] if m_count > 4 else 0
+                var b_t3 = bucket_toks[e * 5 + 3]
+                var b_t4 = bucket_toks[e * 5 + 4]
+                var in_e0 = batch_in_deint + b_t0 * embed_dim
+                var in_o0 = in_e0 + half_in
+                var in_e1 = batch_in_deint + b_t1 * embed_dim
+                var in_o1 = in_e1 + half_in
+                var in_e2 = batch_in_deint + b_t2 * embed_dim
+                var in_o2 = in_e2 + half_in
+                var in_e3 = batch_in_deint + b_t3 * embed_dim
+                var in_o3 = in_e3 + half_in
+                var in_e4 = batch_in_deint + b_t4 * embed_dim
+                var in_o4 = in_e4 + half_in
                 for r in range(sr, er):
                     var rp = r * half_in
                     var rs = r * c_in_blocks
@@ -637,30 +826,16 @@ def run_moe_coalesced_core(
                         var bytes = gu_p.load[16](rp + blk * 16)
                         var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
                         var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var xe0 = (batch_in_deint + b_t0 * embed_dim).load[16](blk * 16)
-                        var xo0 = (batch_in_deint + b_t0 * embed_dim + half_in).load[16](blk * 16)
-                        acc0 = acc0 + (we * xe0 + wo * xo0) * sc
-                        var xe1 = (batch_in_deint + b_t1 * embed_dim).load[16](blk * 16)
-                        var xo1 = (batch_in_deint + b_t1 * embed_dim + half_in).load[16](blk * 16)
-                        acc1 = acc1 + (we * xe1 + wo * xo1) * sc
-                        var xe2 = (batch_in_deint + b_t2 * embed_dim).load[16](blk * 16)
-                        var xo2 = (batch_in_deint + b_t2 * embed_dim + half_in).load[16](blk * 16)
-                        acc2 = acc2 + (we * xe2 + wo * xo2) * sc
-                        if m_count > 3:
-                            var xe3 = (batch_in_deint + b_t3 * embed_dim).load[16](blk * 16)
-                            var xo3 = (batch_in_deint + b_t3 * embed_dim + half_in).load[16](blk * 16)
-                            acc3 = acc3 + (we * xe3 + wo * xo3) * sc
-                        if m_count > 4:
-                            var xe4 = (batch_in_deint + b_t4 * embed_dim).load[16](blk * 16)
-                            var xo4 = (batch_in_deint + b_t4 * embed_dim + half_in).load[16](blk * 16)
-                            acc4 = acc4 + (we * xe4 + wo * xo4) * sc
+                        acc0 = acc0 + (we * in_e0.load[16](blk * 16) + wo * in_o0.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * in_e1.load[16](blk * 16) + wo * in_o1.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * in_e2.load[16](blk * 16) + wo * in_o2.load[16](blk * 16)) * sc
+                        acc3 = acc3 + (we * in_e3.load[16](blk * 16) + wo * in_o3.load[16](blk * 16)) * sc
+                        acc4 = acc4 + (we * in_e4.load[16](blk * 16) + wo * in_o4.load[16](blk * 16)) * sc
                     gu_out_scratch[base_slot * gate_up_rows + r] = acc0.reduce_add()
                     gu_out_scratch[(base_slot + 1) * gate_up_rows + r] = acc1.reduce_add()
                     gu_out_scratch[(base_slot + 2) * gate_up_rows + r] = acc2.reduce_add()
-                    if m_count > 3:
-                        gu_out_scratch[(base_slot + 3) * gate_up_rows + r] = acc3.reduce_add()
-                    if m_count > 4:
-                        gu_out_scratch[(base_slot + 4) * gate_up_rows + r] = acc4.reduce_add()
+                    gu_out_scratch[(base_slot + 3) * gate_up_rows + r] = acc3.reduce_add()
+                    gu_out_scratch[(base_slot + 4) * gate_up_rows + r] = acc4.reduce_add()
 
     parallelize[coal_s1](tasks)
 
@@ -757,15 +932,88 @@ def run_moe_coalesced_core(
                         acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
                     batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
                     batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
+            elif m_count == 3:
+                var b_t1 = bucket_toks[e * 5 + 1]
+                var b_t2 = bucket_toks[e * 5 + 2]
+                var w1 = bucket_weights[e * 5 + 1]
+                var w2 = bucket_weights[e * 5 + 2]
+                var ae0_ptr = act_deint_scratch + base_slot * expert_mlp_dim
+                var ao0_ptr = ae0_ptr + down_half_in
+                var ae1_ptr = act_deint_scratch + (base_slot + 1) * expert_mlp_dim
+                var ao1_ptr = ae1_ptr + down_half_in
+                var ae2_ptr = act_deint_scratch + (base_slot + 2) * expert_mlp_dim
+                var ao2_ptr = ae2_ptr + down_half_in
+                for r in range(sr, er):
+                    var rp = r * down_half_in
+                    var rs = r * down_blocks
+                    var acc0 = SIMD[DType.float32, 16](0.0)
+                    var acc1 = SIMD[DType.float32, 16](0.0)
+                    var acc2 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(down_blocks):
+                        var sc = dn_s[rs + blk]
+                        var bytes = dn_p.load[16](rp + blk * 16)
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
+                    batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
+                    batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
+                    batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
+            elif m_count == 4:
+                var b_t1 = bucket_toks[e * 5 + 1]
+                var b_t2 = bucket_toks[e * 5 + 2]
+                var b_t3 = bucket_toks[e * 5 + 3]
+                var w1 = bucket_weights[e * 5 + 1]
+                var w2 = bucket_weights[e * 5 + 2]
+                var w3 = bucket_weights[e * 5 + 3]
+                var ae0_ptr = act_deint_scratch + base_slot * expert_mlp_dim
+                var ao0_ptr = ae0_ptr + down_half_in
+                var ae1_ptr = act_deint_scratch + (base_slot + 1) * expert_mlp_dim
+                var ao1_ptr = ae1_ptr + down_half_in
+                var ae2_ptr = act_deint_scratch + (base_slot + 2) * expert_mlp_dim
+                var ao2_ptr = ae2_ptr + down_half_in
+                var ae3_ptr = act_deint_scratch + (base_slot + 3) * expert_mlp_dim
+                var ao3_ptr = ae3_ptr + down_half_in
+                for r in range(sr, er):
+                    var rp = r * down_half_in
+                    var rs = r * down_blocks
+                    var acc0 = SIMD[DType.float32, 16](0.0)
+                    var acc1 = SIMD[DType.float32, 16](0.0)
+                    var acc2 = SIMD[DType.float32, 16](0.0)
+                    var acc3 = SIMD[DType.float32, 16](0.0)
+                    for blk in range(down_blocks):
+                        var sc = dn_s[rs + blk]
+                        var bytes = dn_p.load[16](rp + blk * 16)
+                        var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
+                        var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
+                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
+                        acc3 = acc3 + (we * ae3_ptr.load[16](blk * 16) + wo * ao3_ptr.load[16](blk * 16)) * sc
+                    batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
+                    batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
+                    batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
+                    batch_moe_out[b_t3 * embed_dim + r] += acc3.reduce_add() * w3
             else:
                 var b_t1 = bucket_toks[e * 5 + 1]
                 var b_t2 = bucket_toks[e * 5 + 2]
-                var b_t3 = bucket_toks[e * 5 + 3] if m_count > 3 else 0
-                var b_t4 = bucket_toks[e * 5 + 4] if m_count > 4 else 0
+                var b_t3 = bucket_toks[e * 5 + 3]
+                var b_t4 = bucket_toks[e * 5 + 4]
                 var w1 = bucket_weights[e * 5 + 1]
                 var w2 = bucket_weights[e * 5 + 2]
-                var w3 = bucket_weights[e * 5 + 3] if m_count > 3 else Float32(0.0)
-                var w4 = bucket_weights[e * 5 + 4] if m_count > 4 else Float32(0.0)
+                var w3 = bucket_weights[e * 5 + 3]
+                var w4 = bucket_weights[e * 5 + 4]
+                var ae0_ptr = act_deint_scratch + base_slot * expert_mlp_dim
+                var ao0_ptr = ae0_ptr + down_half_in
+                var ae1_ptr = act_deint_scratch + (base_slot + 1) * expert_mlp_dim
+                var ao1_ptr = ae1_ptr + down_half_in
+                var ae2_ptr = act_deint_scratch + (base_slot + 2) * expert_mlp_dim
+                var ao2_ptr = ae2_ptr + down_half_in
+                var ae3_ptr = act_deint_scratch + (base_slot + 3) * expert_mlp_dim
+                var ao3_ptr = ae3_ptr + down_half_in
+                var ae4_ptr = act_deint_scratch + (base_slot + 4) * expert_mlp_dim
+                var ao4_ptr = ae4_ptr + down_half_in
                 for r in range(sr, er):
                     var rp = r * down_half_in
                     var rs = r * down_blocks
@@ -779,29 +1027,15 @@ def run_moe_coalesced_core(
                         var bytes = dn_p.load[16](rp + blk * 16)
                         var we = ((bytes & 15).cast[DType.int8]() - 8).cast[DType.float32]()
                         var wo = ((bytes >> 4).cast[DType.int8]() - 8).cast[DType.float32]()
-                        var ae0 = (act_deint_scratch + base_slot * expert_mlp_dim).load[16](blk * 16)
-                        var ao0 = (act_deint_scratch + base_slot * expert_mlp_dim + down_half_in).load[16](blk * 16)
-                        acc0 = acc0 + (we * ae0 + wo * ao0) * sc
-                        var ae1 = (act_deint_scratch + (base_slot + 1) * expert_mlp_dim).load[16](blk * 16)
-                        var ao1 = (act_deint_scratch + (base_slot + 1) * expert_mlp_dim + down_half_in).load[16](blk * 16)
-                        acc1 = acc1 + (we * ae1 + wo * ao1) * sc
-                        var ae2 = (act_deint_scratch + (base_slot + 2) * expert_mlp_dim).load[16](blk * 16)
-                        var ao2 = (act_deint_scratch + (base_slot + 2) * expert_mlp_dim + down_half_in).load[16](blk * 16)
-                        acc2 = acc2 + (we * ae2 + wo * ao2) * sc
-                        if m_count > 3:
-                            var ae3 = (act_deint_scratch + (base_slot + 3) * expert_mlp_dim).load[16](blk * 16)
-                            var ao3 = (act_deint_scratch + (base_slot + 3) * expert_mlp_dim + down_half_in).load[16](blk * 16)
-                            acc3 = acc3 + (we * ae3 + wo * ao3) * sc
-                        if m_count > 4:
-                            var ae4 = (act_deint_scratch + (base_slot + 4) * expert_mlp_dim).load[16](blk * 16)
-                            var ao4 = (act_deint_scratch + (base_slot + 4) * expert_mlp_dim + down_half_in).load[16](blk * 16)
-                            acc4 = acc4 + (we * ae4 + wo * ao4) * sc
+                        acc0 = acc0 + (we * ae0_ptr.load[16](blk * 16) + wo * ao0_ptr.load[16](blk * 16)) * sc
+                        acc1 = acc1 + (we * ae1_ptr.load[16](blk * 16) + wo * ao1_ptr.load[16](blk * 16)) * sc
+                        acc2 = acc2 + (we * ae2_ptr.load[16](blk * 16) + wo * ao2_ptr.load[16](blk * 16)) * sc
+                        acc3 = acc3 + (we * ae3_ptr.load[16](blk * 16) + wo * ao3_ptr.load[16](blk * 16)) * sc
+                        acc4 = acc4 + (we * ae4_ptr.load[16](blk * 16) + wo * ao4_ptr.load[16](blk * 16)) * sc
                     batch_moe_out[b_t0 * embed_dim + r] += acc0.reduce_add() * w0
                     batch_moe_out[b_t1 * embed_dim + r] += acc1.reduce_add() * w1
                     batch_moe_out[b_t2 * embed_dim + r] += acc2.reduce_add() * w2
-                    if m_count > 3:
-                        batch_moe_out[b_t3 * embed_dim + r] += acc3.reduce_add() * w3
-                    if m_count > 4:
-                        batch_moe_out[b_t4 * embed_dim + r] += acc4.reduce_add() * w4
+                    batch_moe_out[b_t3 * embed_dim + r] += acc3.reduce_add() * w3
+                    batch_moe_out[b_t4 * embed_dim + r] += acc4.reduce_add() * w4
 
     parallelize[coal_s2](tasks)

@@ -24,6 +24,7 @@ from moe_kernels import (
     q4_matmul_vec,
     q4_matmul_batch5,
     compute_moe_lod_weights,
+    compute_subbatch_set_cover_moe_weights,
     run_moe_experts_stage1_8core,
     run_moe_experts_stage2_8core,
     run_moe_coalesced_core,
@@ -980,37 +981,107 @@ def run_moe_coalesced_subbatch(
     embed_dim: Int = 2816,
     expert_mlp_dim: Int = 704,
     num_experts: Int = 128,
+    use_set_cover: Bool = False,
 ):
     """Hoare (1961) Bucket-Sorted Coalesced MoE evaluation across 1..5 tokens simultaneously."""
     debug_assert(sub_b >= 1 and sub_b <= 5, "run_moe_coalesced_subbatch requires 1 <= sub_b <= 5")
     var half_in = embed_dim // 2
     var c_in_blocks = embed_dim // 32
 
-    for b in range(sub_b):
-        var x_b = x_sub + b * embed_dim
-        rms_norm_noscale(x_b, norm_x, embed_dim)
-        for j in range(embed_dim):
-            scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
-        q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, embed_dim, num_experts, num_tasks)
-        softmax(scores, num_experts)
-        get_top_k[8](scores, top_idx, top_val, num_experts)
-        tok_active_count[b] = compute_moe_lod_weights(
-            top_idx,
-            top_val,
+    var stack_all_top_idx = InlineArray[Int, 5 * 8](uninitialized=True)
+    var stack_all_top_val = InlineArray[Float32, 5 * 8](uninitialized=True)
+    var all_top_idx_ptr = UnsafePointer[Int, MutExternalOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=stack_all_top_idx))
+    )
+    var all_top_val_ptr = UnsafePointer[Float32, MutExternalOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=stack_all_top_val))
+    )
+
+    if sub_b == 5 and embed_dim <= 2816 and num_experts <= 128:
+        var stack_scaled_batch = InlineArray[Float32, 5 * 2816](uninitialized=True)
+        var stack_scores_batch = InlineArray[Float32, 5 * 128](uninitialized=True)
+        var scaled_batch_ptr = UnsafePointer[Float32, MutExternalOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_scaled_batch))
+        )
+        var scores_batch_ptr = UnsafePointer[Float32, MutExternalOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=stack_scores_batch))
+        )
+        for b in range(5):
+            var x_b = x_sub + b * embed_dim
+            var sb_dst = scaled_batch_ptr + b * embed_dim
+            rms_norm_noscale(x_b, norm_x, embed_dim)
+            for j in range(embed_dim):
+                sb_dst[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+            rms_norm(x_b, weights.pre_feedforward_layernorm_2_weight, moe_in, embed_dim)
+            var xe_ptr = batch_in_deint + b * embed_dim
+            var xo_ptr = xe_ptr + half_in
+            for blk in range(c_in_blocks):
+                var v0 = moe_in.load[16](blk * 32)
+                var v1 = moe_in.load[16](blk * 32 + 16)
+                xe_ptr.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
+                xo_ptr.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+
+        q4_matmul_batch5(
+            weights.w_router_packed,
+            weights.w_router_scales,
+            scaled_batch_ptr,
+            scores_batch_ptr,
+            embed_dim,
+            num_experts,
+            num_tasks,
+        )
+        for b in range(5):
+            var sc_b = scores_batch_ptr + b * num_experts
+            softmax(sc_b, num_experts)
+            get_top_k[8](sc_b, all_top_idx_ptr + b * 8, all_top_val_ptr + b * 8, num_experts)
+        var _keep_router = stack_scaled_batch[0] + stack_scores_batch[0]
+        if _keep_router > 1e38:
+            tok_active_count[0] = 0
+    else:
+        for b in range(sub_b):
+            var x_b = x_sub + b * embed_dim
+            rms_norm_noscale(x_b, norm_x, embed_dim)
+            for j in range(embed_dim):
+                scaled_norm_x[j] = norm_x[j] * weights.router_scale[j] * r_scale_factor
+            q4_matmul_vec(weights.w_router_packed, weights.w_router_scales, scaled_norm_x, scores, embed_dim, num_experts, num_tasks)
+            softmax(scores, num_experts)
+            get_top_k[8](scores, all_top_idx_ptr + b * 8, all_top_val_ptr + b * 8, num_experts)
+            rms_norm(x_b, weights.pre_feedforward_layernorm_2_weight, moe_in, embed_dim)
+            var xe_ptr = batch_in_deint + b * embed_dim
+            var xo_ptr = xe_ptr + half_in
+            for blk in range(c_in_blocks):
+                var v0 = moe_in.load[16](blk * 32)
+                var v1 = moe_in.load[16](blk * 32 + 16)
+                xe_ptr.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
+                xo_ptr.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+
+    if use_set_cover and sub_b >= 2:
+        compute_subbatch_set_cover_moe_weights(
+            sub_b,
+            all_top_idx_ptr,
+            all_top_val_ptr,
             weights.router_per_expert_scale,
             moe_top_p,
-            tok_active_idx + b * 8,
-            tok_active_weights + b * 8,
+            tok_active_count,
+            tok_active_idx,
+            tok_active_weights,
+            num_experts,
             8,
         )
-        rms_norm(x_b, weights.pre_feedforward_layernorm_2_weight, moe_in, embed_dim)
-        var xe_ptr = batch_in_deint + b * embed_dim
-        var xo_ptr = xe_ptr + half_in
-        for blk in range(c_in_blocks):
-            var v0 = moe_in.load[16](blk * 32)
-            var v1 = moe_in.load[16](blk * 32 + 16)
-            xe_ptr.store[16](blk * 16, v0.deinterleave()[0].join(v1.deinterleave()[0]))
-            xo_ptr.store[16](blk * 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+    else:
+        for b in range(sub_b):
+            tok_active_count[b] = compute_moe_lod_weights(
+                all_top_idx_ptr + b * 8,
+                all_top_val_ptr + b * 8,
+                weights.router_per_expert_scale,
+                moe_top_p,
+                tok_active_idx + b * 8,
+                tok_active_weights + b * 8,
+                8,
+            )
+    var _keep_top = Float32(stack_all_top_idx[0]) + stack_all_top_val[0]
+    if _keep_top > 1e38:
+        tok_active_count[0] += 0
 
     run_moe_coalesced_core(
         sub_b,
@@ -3068,6 +3139,7 @@ def main() raises:
                                 CONFIG.embed_dim,
                                 CONFIG.expert_mlp_dim,
                                 CONFIG.num_experts,
+                                use_set_cover=True,
                             )
 
                             if use_gpu:
