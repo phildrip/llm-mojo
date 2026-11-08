@@ -812,10 +812,14 @@ def q4_gemm_l1_2x4[
         if end_r > c_out:
             end_r = c_out
 
-        var w_buf0 = alloc[Float32](c_in)
-        var w_buf1 = alloc[Float32](c_in)
-        var w_buf2 = alloc[Float32](c_in)
-        var w_buf3 = alloc[Float32](c_in)
+        var w_arr0 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr1 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr2 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr3 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_buf0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr0)))
+        var w_buf1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr1)))
+        var w_buf2 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr2)))
+        var w_buf3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
 
         var r = start_r
         while r + 3 < end_r:
@@ -938,11 +942,6 @@ def q4_gemm_l1_2x4[
                 out_ptr[b * o_stride + r] = acc0.reduce_add().cast[out_type]()
             r += 1
 
-        w_buf0.free()
-        w_buf1.free()
-        w_buf2.free()
-        w_buf3.free()
-
     if tasks == 1:
         worker(0)
     else:
@@ -982,10 +981,14 @@ def q4_fused_gate_up_geglu_l1[
         var start_r = t * chunk_size
         var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
 
-        var w_gate0 = alloc[Float32](c_in)
-        var w_gate1 = alloc[Float32](c_in)
-        var w_up0 = alloc[Float32](c_in)
-        var w_up1 = alloc[Float32](c_in)
+        var wg_arr0 = InlineArray[Float32, 4096](uninitialized=True)
+        var wg_arr1 = InlineArray[Float32, 4096](uninitialized=True)
+        var wu_arr0 = InlineArray[Float32, 4096](uninitialized=True)
+        var wu_arr1 = InlineArray[Float32, 4096](uninitialized=True)
+        var w_gate0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=wg_arr0)))
+        var w_gate1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=wg_arr1)))
+        var w_up0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=wu_arr0)))
+        var w_up1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=wu_arr1)))
 
         var r = start_r
         while r + 1 < end_r:
@@ -1131,11 +1134,6 @@ def q4_fused_gate_up_geglu_l1[
                 var sig = 1.0 / (1.0 + exp(Float32(-1.702) * gv))
                 out_gated[b * c_out + r] = Scalar[out_type](gv * sig * uv)
             r += 1
-
-        w_gate0.free()
-        w_gate1.free()
-        w_up0.free()
-        w_up1.free()
 
     if tasks == 1:
         worker(0)
@@ -1472,3 +1470,118 @@ def sample_and_soft_embed_top32_batch[
             token_worker(t)
     else:
         parallelize[token_worker](B)
+
+
+# ==============================================================================
+# 3. Fast-dLLM / dKV-Cache: Progressive Active-Canvas Compaction (llm-mojo-2tc.3)
+# ==============================================================================
+
+
+@always_inline
+def build_active_canvas_map(
+    locked_mask: UnsafePointer[Bool, _],
+    active_canvas_idx: UnsafePointer[Int, MutAnyOrigin],
+    canvas_len: Int,
+) -> Int:
+    """Builds a compact index table `active_canvas_idx[0 .. active_len - 1]` containing
+    the canvas indices `t` of all unconverged (`not locked_mask[t]`) tokens."""
+    var active_len = 0
+    for t in range(canvas_len):
+        if not locked_mask[t]:
+            active_canvas_idx[active_len] = t
+            active_len += 1
+    return active_len
+
+
+@always_inline
+def update_locked_mask(
+    eb_mask: UnsafePointer[Bool, _],
+    history: UnsafePointer[Int, _],
+    token_entropy: UnsafePointer[Float32, _],
+    locked_mask: UnsafePointer[Bool, MutAnyOrigin],
+    canvas_len: Int,
+    hist_len: Int,
+    freeze_entropy_thresh: Float32 = 0.05,
+    max_stable_entropy: Float32 = 0.25,
+) -> Int:
+    """Updates `locked_mask[t]` using Fast-dLLM / dKV-Cache token freezing rules:
+    A token `t` transitions to locked when `eb_mask[t] == True` AND either:
+      1. Its argmax token has remained stable across 2 consecutive denoising steps
+         with low entropy (`hist_len >= 2 and history[t] == history[canvas_len + t] and token_entropy[t] <= max_stable_entropy`), OR
+      2. Its entropy is below `freeze_entropy_thresh` (`token_entropy[t] <= freeze_entropy_thresh`).
+    Returns the total number of locked tokens across the canvas."""
+    var num_locked = 0
+    for t in range(canvas_len):
+        if locked_mask[t]:
+            num_locked += 1
+        elif eb_mask[t]:
+            var stable_2step = (
+                (hist_len >= 2)
+                and (history[t] == history[canvas_len + t])
+                and (token_entropy[t] <= max_stable_entropy)
+            )
+            var very_confident = token_entropy[t] <= freeze_entropy_thresh
+            if stable_2step or very_confident:
+                locked_mask[t] = True
+                num_locked += 1
+    return num_locked
+
+
+@always_inline
+def gather_active[
+    type: DType = DType.float32
+](
+    src_full: UnsafePointer[Scalar[type], _],
+    active_canvas_idx: UnsafePointer[Int, _],
+    dst_compact: UnsafePointer[Scalar[type], MutAnyOrigin],
+    active_len: Int,
+    dim: Int,
+):
+    """Gathers `[canvas_len, dim]` rows at `active_canvas_idx[0..active_len-1]`
+    into contiguous `[active_len, dim]` buffer `dst_compact`."""
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var s_ptr = src_full + orig_t * dim
+        var d_ptr = dst_compact + b * dim
+        for i in range(0, dim, 8):
+            d_ptr.store[8](i, s_ptr.load[8](i))
+
+
+@always_inline
+def scatter_active_sampler_outputs[
+    sc_type: DType = DType.float32
+](
+    active_canvas_idx: UnsafePointer[Int, _],
+    compact_entropy: UnsafePointer[Float32, _],
+    compact_argmax: UnsafePointer[Int, _],
+    compact_new_tokens: UnsafePointer[Int, _],
+    compact_sc_embeds: UnsafePointer[Scalar[sc_type], _],
+    token_entropy: UnsafePointer[Float32, MutAnyOrigin],
+    argmax_tokens: UnsafePointer[Int, MutAnyOrigin],
+    new_tokens: UnsafePointer[Int, MutAnyOrigin],
+    sc_embeds: UnsafePointer[Scalar[sc_type], MutAnyOrigin],
+    locked_mask: UnsafePointer[Bool, _],
+    canvas_tokens: UnsafePointer[Int, _],
+    active_len: Int,
+    canvas_len: Int,
+    embed_dim: Int,
+):
+    """Scatters sampler outputs for the `active_len` unconverged tokens back into their
+    full canvas slots `orig_t = active_canvas_idx[b]`, while pinning locked tokens'
+    entropy to `0.0` and preserving their committed token IDs."""
+    for t in range(canvas_len):
+        if locked_mask[t]:
+            token_entropy[t] = 0.0
+            argmax_tokens[t] = canvas_tokens[t]
+            new_tokens[t] = canvas_tokens[t]
+
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        token_entropy[orig_t] = compact_entropy[b]
+        argmax_tokens[orig_t] = compact_argmax[b]
+        new_tokens[orig_t] = compact_new_tokens[b]
+        var s_ptr = compact_sc_embeds + b * embed_dim
+        var d_ptr = sc_embeds + orig_t * embed_dim
+        for i in range(0, embed_dim, 8):
+            d_ptr.store[8](i, s_ptr.load[8](i))
+
