@@ -118,168 +118,119 @@ def q4_moe_expert_single_thread(
     w_deint_scratch: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """Single-thread L1-resident Dual-Space Deinterleaved Q4 GEMM for one MoE expert.
-    Uses SIMD[DType.float32, 8] (1 YMM register per accumulator) with 2-row x 4-token
-    register blocking (8 acc + 2 weight + 4 input = 14 YMM registers, zero spills!)."""
+    Uses 256-bit AVX2 SIMD[DType.float32, 8] with 4-row x 3-token register blocking
+    (12 YMM accumulators + 4 YMM weights/inputs = 16 YMM registers, zero stack spills on Zen 3!)."""
     var c_in_packed = c_in // 2
     var c_in_blocks = c_in // 32
+
+    var w_arr2 = InlineArray[Float32, 2816](uninitialized=True)
+    var w_arr3 = InlineArray[Float32, 2816](uninitialized=True)
     var w_deint0 = w_deint_scratch
     var w_deint1 = w_deint_scratch + c_in
+    var w_deint2 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr2)))
+    var w_deint3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
 
     var r = 0
-    while r + 1 < c_out:
-        var rp0 = r * c_in_packed
-        var rs0 = r * c_in_blocks
+    while r + 3 < c_out:
+        var rp0 = (r + 0) * c_in_packed
+        var rs0 = (r + 0) * c_in_blocks
         var rp1 = (r + 1) * c_in_packed
         var rs1 = (r + 1) * c_in_blocks
+        var rp2 = (r + 2) * c_in_packed
+        var rs2 = (r + 2) * c_in_blocks
+        var rp3 = (r + 3) * c_in_packed
+        var rs3 = (r + 3) * c_in_blocks
 
-        if B <= 4:
-            # Direct in-register deinterleaved unpacking without L1 scratch roundtrip
+        for blk in range(c_in_blocks):
+            var off = blk * 32
+            var sc0 = scales[rs0 + blk]
+            var b0 = W_packed.load[16](rp0 + blk * 16)
+            w_deint0.store[16](off, ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+            w_deint0.store[16](off + 16, ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
+
+            var sc1 = scales[rs1 + blk]
+            var b1 = W_packed.load[16](rp1 + blk * 16)
+            w_deint1.store[16](off, ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+            w_deint1.store[16](off + 16, ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
+
+            var sc2 = scales[rs2 + blk]
+            var b2 = W_packed.load[16](rp2 + blk * 16)
+            w_deint2.store[16](off, ((b2 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc2)
+            w_deint2.store[16](off + 16, ((b2 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc2)
+
+            var sc3 = scales[rs3 + blk]
+            var b3 = W_packed.load[16](rp3 + blk * 16)
+            w_deint3.store[16](off, ((b3 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc3)
+            w_deint3.store[16](off + 16, ((b3 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc3)
+
+        var b = 0
+        while b + 2 < B:
             var a0_0 = SIMD[DType.float32, 8](0.0)
             var a0_1 = SIMD[DType.float32, 8](0.0)
             var a0_2 = SIMD[DType.float32, 8](0.0)
-            var a0_3 = SIMD[DType.float32, 8](0.0)
             var a1_0 = SIMD[DType.float32, 8](0.0)
             var a1_1 = SIMD[DType.float32, 8](0.0)
             var a1_2 = SIMD[DType.float32, 8](0.0)
-            var a1_3 = SIMD[DType.float32, 8](0.0)
-
-            for blk in range(c_in_blocks):
-                var sc0 = scales[rs0 + blk]
-                var sc1 = scales[rs1 + blk]
-                var x_off = blk * 32
-
-                # Sub-block 0 (first 8 bytes = 8 even + 8 odd)
-                var b0_lo = W_packed.load[8](rp0 + blk * 16)
-                var we0 = ((b0_lo & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
-                var wo0 = ((b0_lo >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
-
-                var b1_lo = W_packed.load[8](rp1 + blk * 16)
-                var we1 = ((b1_lo & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
-                var wo1 = ((b1_lo >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
-
-                var xe0 = X_deint.load[8](0 * c_in + x_off)
-                var xo0 = X_deint.load[8](0 * c_in + x_off + 16)
-                a0_0 = we0.fma(xe0, wo0.fma(xo0, a0_0))
-                a1_0 = we1.fma(xe0, wo1.fma(xo0, a1_0))
-                if B > 1:
-                    var xe1 = X_deint.load[8](1 * c_in + x_off)
-                    var xo1 = X_deint.load[8](1 * c_in + x_off + 16)
-                    a0_1 = we0.fma(xe1, wo0.fma(xo1, a0_1))
-                    a1_1 = we1.fma(xe1, wo1.fma(xo1, a1_1))
-                if B > 2:
-                    var xe2 = X_deint.load[8](2 * c_in + x_off)
-                    var xo2 = X_deint.load[8](2 * c_in + x_off + 16)
-                    a0_2 = we0.fma(xe2, wo0.fma(xo2, a0_2))
-                    a1_2 = we1.fma(xe2, wo1.fma(xo2, a1_2))
-                if B > 3:
-                    var xe3 = X_deint.load[8](3 * c_in + x_off)
-                    var xo3 = X_deint.load[8](3 * c_in + x_off + 16)
-                    a0_3 = we0.fma(xe3, wo0.fma(xo3, a0_3))
-                    a1_3 = we1.fma(xe3, wo1.fma(xo3, a1_3))
-
-                # Sub-block 1 (second 8 bytes = 8 even + 8 odd)
-                var b0_hi = W_packed.load[8](rp0 + blk * 16 + 8)
-                we0 = ((b0_hi & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
-                wo0 = ((b0_hi >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0
-
-                var b1_hi = W_packed.load[8](rp1 + blk * 16 + 8)
-                we1 = ((b1_hi & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
-                wo1 = ((b1_hi >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1
-
-                xe0 = X_deint.load[8](0 * c_in + x_off + 8)
-                xo0 = X_deint.load[8](0 * c_in + x_off + 24)
-                a0_0 = we0.fma(xe0, wo0.fma(xo0, a0_0))
-                a1_0 = we1.fma(xe0, wo1.fma(xo0, a1_0))
-                if B > 1:
-                    var xe1 = X_deint.load[8](1 * c_in + x_off + 8)
-                    var xo1 = X_deint.load[8](1 * c_in + x_off + 24)
-                    a0_1 = we0.fma(xe1, wo0.fma(xo1, a0_1))
-                    a1_1 = we1.fma(xe1, wo1.fma(xo1, a1_1))
-                if B > 2:
-                    var xe2 = X_deint.load[8](2 * c_in + x_off + 8)
-                    var xo2 = X_deint.load[8](2 * c_in + x_off + 24)
-                    a0_2 = we0.fma(xe2, wo0.fma(xo2, a0_2))
-                    a1_2 = we1.fma(xe2, wo1.fma(xo2, a1_2))
-                if B > 3:
-                    var xe3 = X_deint.load[8](3 * c_in + x_off + 8)
-                    var xo3 = X_deint.load[8](3 * c_in + x_off + 24)
-                    a0_3 = we0.fma(xe3, wo0.fma(xo3, a0_3))
-                    a1_3 = we1.fma(xe3, wo1.fma(xo3, a1_3))
-
-            out_ptr[0 * c_out + r] = a0_0.reduce_add()
-            out_ptr[0 * c_out + r + 1] = a1_0.reduce_add()
-            if B > 1:
-                out_ptr[1 * c_out + r] = a0_1.reduce_add()
-                out_ptr[1 * c_out + r + 1] = a1_1.reduce_add()
-            if B > 2:
-                out_ptr[2 * c_out + r] = a0_2.reduce_add()
-                out_ptr[2 * c_out + r + 1] = a1_2.reduce_add()
-            if B > 3:
-                out_ptr[3 * c_out + r] = a0_3.reduce_add()
-                out_ptr[3 * c_out + r + 1] = a1_3.reduce_add()
-        else:
-            # Unpack 2 rows into L1 scratch once, then 2x4 SIMD8 FMA (14 YMM regs, 0 spills!)
-            for blk in range(c_in_blocks):
-                var sc0 = scales[rs0 + blk]
-                var b0 = W_packed.load[16](rp0 + blk * 16)
-                w_deint0.store[16](blk * 32, ((b0 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
-                w_deint0.store[16](blk * 32 + 16, ((b0 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc0)
-
-                var sc1 = scales[rs1 + blk]
-                var b1 = W_packed.load[16](rp1 + blk * 16)
-                w_deint1.store[16](blk * 32, ((b1 & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
-                w_deint1.store[16](blk * 32 + 16, ((b1 >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc1)
-
-            var b = 0
-            while b + 3 < B:
-                var a0_0 = SIMD[DType.float32, 8](0.0)
-                var a0_1 = SIMD[DType.float32, 8](0.0)
-                var a0_2 = SIMD[DType.float32, 8](0.0)
-                var a0_3 = SIMD[DType.float32, 8](0.0)
-                var a1_0 = SIMD[DType.float32, 8](0.0)
-                var a1_1 = SIMD[DType.float32, 8](0.0)
-                var a1_2 = SIMD[DType.float32, 8](0.0)
-                var a1_3 = SIMD[DType.float32, 8](0.0)
-                var xb0 = (b + 0) * c_in
-                var xb1 = (b + 1) * c_in
-                var xb2 = (b + 2) * c_in
-                var xb3 = (b + 3) * c_in
-                for k in range(0, c_in, 8):
-                    var w0 = w_deint0.load[8](k)
-                    var w1 = w_deint1.load[8](k)
-                    var x0 = X_deint.load[8](xb0 + k)
-                    var x1 = X_deint.load[8](xb1 + k)
-                    var x2 = X_deint.load[8](xb2 + k)
-                    var x3 = X_deint.load[8](xb3 + k)
-                    a0_0 = w0.fma(x0, a0_0)
-                    a0_1 = w0.fma(x1, a0_1)
-                    a0_2 = w0.fma(x2, a0_2)
-                    a0_3 = w0.fma(x3, a0_3)
-                    a1_0 = w1.fma(x0, a1_0)
-                    a1_1 = w1.fma(x1, a1_1)
-                    a1_2 = w1.fma(x2, a1_2)
-                    a1_3 = w1.fma(x3, a1_3)
-                out_ptr[(b + 0) * c_out + r] = a0_0.reduce_add()
-                out_ptr[(b + 1) * c_out + r] = a0_1.reduce_add()
-                out_ptr[(b + 2) * c_out + r] = a0_2.reduce_add()
-                out_ptr[(b + 3) * c_out + r] = a0_3.reduce_add()
-                out_ptr[(b + 0) * c_out + r + 1] = a1_0.reduce_add()
-                out_ptr[(b + 1) * c_out + r + 1] = a1_1.reduce_add()
-                out_ptr[(b + 2) * c_out + r + 1] = a1_2.reduce_add()
-                out_ptr[(b + 3) * c_out + r + 1] = a1_3.reduce_add()
-                b += 4
-            while b < B:
-                var a0 = SIMD[DType.float32, 8](0.0)
-                var a1 = SIMD[DType.float32, 8](0.0)
-                var xb = b * c_in
-                for k in range(0, c_in, 8):
-                    var x0 = X_deint.load[8](xb + k)
-                    a0 = w_deint0.load[8](k).fma(x0, a0)
-                    a1 = w_deint1.load[8](k).fma(x0, a1)
-                out_ptr[b * c_out + r] = a0.reduce_add()
-                out_ptr[b * c_out + r + 1] = a1.reduce_add()
-                b += 1
-        r += 2
+            var a2_0 = SIMD[DType.float32, 8](0.0)
+            var a2_1 = SIMD[DType.float32, 8](0.0)
+            var a2_2 = SIMD[DType.float32, 8](0.0)
+            var a3_0 = SIMD[DType.float32, 8](0.0)
+            var a3_1 = SIMD[DType.float32, 8](0.0)
+            var a3_2 = SIMD[DType.float32, 8](0.0)
+            var xb0 = (b + 0) * c_in
+            var xb1 = (b + 1) * c_in
+            var xb2 = (b + 2) * c_in
+            for k in range(0, c_in, 8):
+                var w0 = w_deint0.load[8](k)
+                var w1 = w_deint1.load[8](k)
+                var w2 = w_deint2.load[8](k)
+                var w3 = w_deint3.load[8](k)
+                var x0 = X_deint.load[8](xb0 + k)
+                a0_0 = w0.fma(x0, a0_0)
+                a1_0 = w1.fma(x0, a1_0)
+                a2_0 = w2.fma(x0, a2_0)
+                a3_0 = w3.fma(x0, a3_0)
+                var x1 = X_deint.load[8](xb1 + k)
+                a0_1 = w0.fma(x1, a0_1)
+                a1_1 = w1.fma(x1, a1_1)
+                a2_1 = w2.fma(x1, a2_1)
+                a3_1 = w3.fma(x1, a3_1)
+                var x2 = X_deint.load[8](xb2 + k)
+                a0_2 = w0.fma(x2, a0_2)
+                a1_2 = w1.fma(x2, a1_2)
+                a2_2 = w2.fma(x2, a2_2)
+                a3_2 = w3.fma(x2, a3_2)
+            out_ptr[(b + 0) * c_out + r + 0] = a0_0.reduce_add()
+            out_ptr[(b + 1) * c_out + r + 0] = a0_1.reduce_add()
+            out_ptr[(b + 2) * c_out + r + 0] = a0_2.reduce_add()
+            out_ptr[(b + 0) * c_out + r + 1] = a1_0.reduce_add()
+            out_ptr[(b + 1) * c_out + r + 1] = a1_1.reduce_add()
+            out_ptr[(b + 2) * c_out + r + 1] = a1_2.reduce_add()
+            out_ptr[(b + 0) * c_out + r + 2] = a2_0.reduce_add()
+            out_ptr[(b + 1) * c_out + r + 2] = a2_1.reduce_add()
+            out_ptr[(b + 2) * c_out + r + 2] = a2_2.reduce_add()
+            out_ptr[(b + 0) * c_out + r + 3] = a3_0.reduce_add()
+            out_ptr[(b + 1) * c_out + r + 3] = a3_1.reduce_add()
+            out_ptr[(b + 2) * c_out + r + 3] = a3_2.reduce_add()
+            b += 3
+        while b < B:
+            var a0 = SIMD[DType.float32, 8](0.0)
+            var a1 = SIMD[DType.float32, 8](0.0)
+            var a2 = SIMD[DType.float32, 8](0.0)
+            var a3 = SIMD[DType.float32, 8](0.0)
+            var xb = b * c_in
+            for k in range(0, c_in, 8):
+                var x0 = X_deint.load[8](xb + k)
+                a0 = w_deint0.load[8](k).fma(x0, a0)
+                a1 = w_deint1.load[8](k).fma(x0, a1)
+                a2 = w_deint2.load[8](k).fma(x0, a2)
+                a3 = w_deint3.load[8](k).fma(x0, a3)
+            out_ptr[b * c_out + r + 0] = a0.reduce_add()
+            out_ptr[b * c_out + r + 1] = a1.reduce_add()
+            out_ptr[b * c_out + r + 2] = a2.reduce_add()
+            out_ptr[b * c_out + r + 3] = a3.reduce_add()
+            b += 1
+        r += 4
 
 
 def run_diffusion_moe_experts_parallel(
@@ -430,18 +381,27 @@ def run_diffusion_moe_experts_parallel(
             parallelize[expert_worker](tasks)
 
     # 3. Accumulate weighted expert outputs per token in Float32, then cast once to Float16
-    for t in range(B):
+    var acc_slots_ptr = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=assignments_slot)))
+
+    def accum_token_worker(t: Int) capturing -> None:
         var dst = canvas_moe_out + t * embed_dim
         var top_w = canvas_top_weights + t * top_k_experts
-        for j in range(0, embed_dim, 8):
-            var sum_vec = SIMD[DType.float32, 8](0.0)
+        var slot_base = t * top_k_experts
+        for j in range(0, embed_dim, 16):
+            var sum_vec = SIMD[DType.float32, 16](0.0)
             for s in range(top_k_experts):
-                var wp = assignments_slot[t * top_k_experts + s]
+                var wp = acc_slots_ptr[slot_base + s]
                 if wp >= 0:
-                    var w_vec = SIMD[DType.float32, 8](top_w[s])
+                    var w_vec = SIMD[DType.float32, 16](top_w[s])
                     var src = all_down_out + wp * embed_dim
-                    sum_vec = src.load[8](j).fma(w_vec, sum_vec)
-            dst.store[8](j, sum_vec.cast[DType.float16]())
+                    sum_vec = src.load[16](j).fma(w_vec, sum_vec)
+            dst.store[16](j, sum_vec.cast[DType.float16]())
+
+    if B <= 1:
+        if B == 1:
+            accum_token_worker(0)
+    else:
+        parallelize[accum_token_worker](B)
 
 
 def run_diffusion_moe_experts_parallel(
@@ -638,8 +598,10 @@ def q4_moe_gemm_deinterleaved[
             if end_r > c_out:
                 end_r = c_out
 
-            var w_deint0 = alloc[Float32](c_in)
-            var w_deint1 = alloc[Float32](c_in)
+            var w_arr0 = InlineArray[Float32, 8192](uninitialized=True)
+            var w_arr1 = InlineArray[Float32, 8192](uninitialized=True)
+            var w_deint0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr0)))
+            var w_deint1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr1)))
 
             var r = start_r
             while r + 1 < end_r:
@@ -717,8 +679,8 @@ def q4_moe_gemm_deinterleaved[
                     out_ptr[b * o_stride + r] = a0.reduce_add().cast[out_type]()
                 r += 1
 
-            w_deint0.free()
-            w_deint1.free()
+            _ = w_arr0[0]
+            _ = w_arr1[0]
 
         if tasks == 1:
             worker_large(0)
@@ -770,10 +732,25 @@ def unpack_row_prescaled(
         w_buf.store[8](base + 24, w3 * scale_vec)
 
 
-# L1-Unpacked 2-Row x 4-Batch FMA Q4 GEMM kernel.
-# Unpacks each Q4 row ONCE into a thread-local L1 buffer (instead of B/8 = 32 times
-# in q4_gemv_tiled), then uses 2x4 register blocking (8 YMM accumulators + 2 weight
-# regs + 4 input regs = 14 YMM registers) with chained FMA across all B tokens.
+@always_inline
+def unpack_row_deinterleaved_prescaled(
+    row_packed: UnsafePointer[UInt8, _],
+    row_scales: UnsafePointer[Float32, _],
+    w_deint: UnsafePointer[Float32, MutAnyOrigin],
+    c_in_blocks: Int,
+):
+    """Shuffle-free Dual-Space Q4 row unpacker: unpacks low nibbles (even indices) into
+    `[off .. off+15]` and high nibbles (odd indices) into `[off+16 .. off+31]` with zero
+    vector shuffles or shifts across lanes."""
+    for blk in range(c_in_blocks):
+        var off = blk * 32
+        var sc = row_scales[blk]
+        var b = row_packed.load[16](blk * 16)
+        w_deint.store[16](off, ((b & 15).cast[DType.int8]() - 8).cast[DType.float32]() * sc)
+        w_deint.store[16](off + 16, ((b >> 4).cast[DType.int8]() - 8).cast[DType.float32]() * sc)
+
+
+# L1-Unpacked 4-Row x 3-Batch FMA Q4 GEMM kernel with Dual-Space Shuffle-Free X_deint support (llm-mojo-yj4.2).
 @always_inline
 def q4_gemm_l1_2x4[
     in_type: DType = DType.float32,
@@ -789,7 +766,10 @@ def q4_gemm_l1_2x4[
     num_tasks: Int,
     in_stride: Int = -1,
     out_stride: Int = -1,
+    pre_deint_X: UnsafePointer[Float32, _] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
 ):
+    if B <= 0 or c_in <= 0 or c_out <= 0:
+        return
     var tasks = num_tasks
     if tasks > c_out:
         tasks = c_out
@@ -803,6 +783,14 @@ def q4_gemm_l1_2x4[
         chunk_size = 2
     var c_in_packed = c_in // 2
     var c_in_blocks = c_in // 32
+
+    var x_stack = InlineArray[Float32, 65536](uninitialized=True)
+    var use_deint = Int(pre_deint_X) != 0 and c_in <= 8192 and (c_in % 32 == 0)
+    var x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(pre_deint_X))
+    if not use_deint and c_in <= 8192 and (c_in % 32 == 0) and B * c_in <= 65536:
+        x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=x_stack)))
+        deinterleave_batch_to_f32[in_type](X, x_deint_ptr, B, c_in, x_stride)
+        use_deint = True
 
     def worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
@@ -822,6 +810,114 @@ def q4_gemm_l1_2x4[
         var w_buf3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
 
         var r = start_r
+        if use_deint:
+            while r + 3 < end_r:
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 0) * c_in_packed, scales + (r + 0) * c_in_blocks, w_buf0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 1) * c_in_packed, scales + (r + 1) * c_in_blocks, w_buf1, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 2) * c_in_packed, scales + (r + 2) * c_in_blocks, w_buf2, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 3) * c_in_packed, scales + (r + 3) * c_in_blocks, w_buf3, c_in_blocks
+                )
+
+                var b = 0
+                while b + 2 < B:
+                    var acc0_0 = SIMD[DType.float32, 8](0.0)
+                    var acc0_1 = SIMD[DType.float32, 8](0.0)
+                    var acc0_2 = SIMD[DType.float32, 8](0.0)
+                    var acc1_0 = SIMD[DType.float32, 8](0.0)
+                    var acc1_1 = SIMD[DType.float32, 8](0.0)
+                    var acc1_2 = SIMD[DType.float32, 8](0.0)
+                    var acc2_0 = SIMD[DType.float32, 8](0.0)
+                    var acc2_1 = SIMD[DType.float32, 8](0.0)
+                    var acc2_2 = SIMD[DType.float32, 8](0.0)
+                    var acc3_0 = SIMD[DType.float32, 8](0.0)
+                    var acc3_1 = SIMD[DType.float32, 8](0.0)
+                    var acc3_2 = SIMD[DType.float32, 8](0.0)
+
+                    var xb0 = (b + 0) * c_in
+                    var xb1 = (b + 1) * c_in
+                    var xb2 = (b + 2) * c_in
+
+                    for k in range(0, c_in, 8):
+                        var w0 = w_buf0.load[8](k)
+                        var w1 = w_buf1.load[8](k)
+                        var w2 = w_buf2.load[8](k)
+                        var w3 = w_buf3.load[8](k)
+
+                        var x0 = x_deint_ptr.load[8](xb0 + k)
+                        acc0_0 = w0.fma(x0, acc0_0)
+                        acc1_0 = w1.fma(x0, acc1_0)
+                        acc2_0 = w2.fma(x0, acc2_0)
+                        acc3_0 = w3.fma(x0, acc3_0)
+
+                        var x1 = x_deint_ptr.load[8](xb1 + k)
+                        acc0_1 = w0.fma(x1, acc0_1)
+                        acc1_1 = w1.fma(x1, acc1_1)
+                        acc2_1 = w2.fma(x1, acc2_1)
+                        acc3_1 = w3.fma(x1, acc3_1)
+
+                        var x2 = x_deint_ptr.load[8](xb2 + k)
+                        acc0_2 = w0.fma(x2, acc0_2)
+                        acc1_2 = w1.fma(x2, acc1_2)
+                        acc2_2 = w2.fma(x2, acc2_2)
+                        acc3_2 = w3.fma(x2, acc3_2)
+
+                    out_ptr[(b + 0) * o_stride + r + 0] = acc0_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r + 0] = acc0_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r + 0] = acc0_2.reduce_add().cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r + 1] = acc1_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r + 1] = acc1_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r + 1] = acc1_2.reduce_add().cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r + 2] = acc2_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r + 2] = acc2_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r + 2] = acc2_2.reduce_add().cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r + 3] = acc3_0.reduce_add().cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r + 3] = acc3_1.reduce_add().cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r + 3] = acc3_2.reduce_add().cast[out_type]()
+                    b += 3
+
+                while b < B:
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var acc1 = SIMD[DType.float32, 8](0.0)
+                    var acc2 = SIMD[DType.float32, 8](0.0)
+                    var acc3 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        acc0 = w_buf0.load[8](k).fma(x0, acc0)
+                        acc1 = w_buf1.load[8](k).fma(x0, acc1)
+                        acc2 = w_buf2.load[8](k).fma(x0, acc2)
+                        acc3 = w_buf3.load[8](k).fma(x0, acc3)
+                    out_ptr[b * o_stride + r + 0] = acc0.reduce_add().cast[out_type]()
+                    out_ptr[b * o_stride + r + 1] = acc1.reduce_add().cast[out_type]()
+                    out_ptr[b * o_stride + r + 2] = acc2.reduce_add().cast[out_type]()
+                    out_ptr[b * o_stride + r + 3] = acc3.reduce_add().cast[out_type]()
+                    b += 1
+
+                r += 4
+
+            while r < end_r:
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r * c_in_packed, scales + r * c_in_blocks, w_buf0, c_in_blocks
+                )
+                for b in range(B):
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 8):
+                        acc0 = w_buf0.load[8](k).fma(x_deint_ptr.load[8](xb + k), acc0)
+                    out_ptr[b * o_stride + r] = acc0.reduce_add().cast[out_type]()
+                r += 1
+            _ = w_arr0[0]
+            _ = w_arr1[0]
+            _ = w_arr2[0]
+            _ = w_arr3[0]
+            return
         while r + 3 < end_r:
             unpack_row_prescaled(
                 W_packed + (r + 0) * c_in_packed,
@@ -946,6 +1042,502 @@ def q4_gemm_l1_2x4[
         worker(0)
     else:
         parallelize[worker](tasks)
+    _ = x_stack[0]
+
+
+@always_inline
+def q4_lm_head_two_stage_sieve[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = -1,
+    out_stride: Int = -1,
+    pre_deint_X: UnsafePointer[Float32, _] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
+    forced_cand_tokens: UnsafePointer[Int, _] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
+    num_forced_cands: Int = 0,
+    coarse_blocks: Int = 8,
+    span_keep_frac: Float32 = 0.45,
+):
+    """Two-Stage Coarse-to-Fine Vocab Sieve for LM Head Projection (llm-mojo-yj4.4):
+    - Stage 1: Branchless 4x3 AVX2 linear scan over the first `coarse_blocks` Q4 blocks (`coarse_dim = coarse_blocks * 32`).
+    - Compaction: Selects rows exceeding `max_c[b] - span_keep_frac * (max_c[b] - min_c[b])` for any active token `b`,
+      unioned with `forced_cand_tokens` (e.g., previous-step Top-32 / argmax / top2 canvas tokens). Non-candidates
+      are masked to `-1e30` so incomplete coarse sums can never pollute downstream Top-32 reservoir sampling.
+    - Stage 2: Branchless 4x3 AVX2 FMA over the remaining `fine_blocks` Q4 blocks ONLY for the compacted `cand_rows`."""
+    if B <= 0 or c_in <= 0 or c_out <= 0:
+        return
+    var c_in_blocks = c_in // 32
+    if (
+        coarse_blocks <= 0
+        or coarse_blocks >= c_in_blocks
+        or c_out <= 64
+        or B > 256
+        or span_keep_frac >= Float32(1.0)
+        or c_in > 8192
+        or (c_in % 32 != 0)
+    ):
+        q4_gemm_l1_2x4[in_type, out_type](
+            W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride, pre_deint_X
+        )
+        return
+
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var x_stride = in_stride if in_stride >= 0 else c_in
+    var o_stride = out_stride if out_stride >= 0 else c_out
+
+    var chunk_size = ((c_out // tasks + 3) // 4) * 4
+    if chunk_size < 4:
+        chunk_size = 4
+    var c_in_packed = c_in // 2
+    var coarse_dim = coarse_blocks * 32
+    var coarse_packed = coarse_dim // 2
+    var fine_blocks = c_in_blocks - coarse_blocks
+    var fine_dim = c_in - coarse_dim
+
+    var x_stack = InlineArray[Float32, 65536](uninitialized=True)
+    var use_deint = Int(pre_deint_X) != 0
+    var x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(pre_deint_X))
+    if not use_deint:
+        if B * c_in <= 65536:
+            x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=x_stack)))
+            deinterleave_batch_to_f32[in_type](X, x_deint_ptr, B, c_in, x_stride)
+        else:
+            q4_gemm_l1_2x4[in_type, out_type](
+                W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride, pre_deint_X
+            )
+            _ = x_stack[0]
+            return
+
+    var has_forced = Int(forced_cand_tokens) != 0 and num_forced_cands > 0
+    var pruned_sentinel = Float32(-65500.0) if out_type == DType.float16 else Float32(-1e30)
+    var tile_max = ((16384 // B) // 4) * 4
+    if tile_max > 256:
+        tile_max = 256
+    if tile_max < 4:
+        tile_max = 4
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        if start_r >= c_out:
+            return
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+        if end_r > c_out:
+            end_r = c_out
+        var chunk_rows = end_r - start_r
+
+        var w_arr0 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr1 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr2 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr3 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_buf0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr0)))
+        var w_buf1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr1)))
+        var w_buf2 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr2)))
+        var w_buf3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
+
+        # L2-resident stack scratch buffers (zero heap allocations for AMD KFD PASID safety)
+        var partial_arr = InlineArray[Float32, 16384](uninitialized=True)
+        var row_extrap_arr = InlineArray[Float32, 256](uninitialized=True)
+        var cum_max_arr = InlineArray[Float32, 256](uninitialized=True)
+        var cum_min_arr = InlineArray[Float32, 256](uninitialized=True)
+        var cum_sum_arr = InlineArray[Float32, 256](uninitialized=True)
+        var cum_sq_arr = InlineArray[Float32, 256](uninitialized=True)
+        var cum_valid_arr = InlineArray[Int, 256](uninitialized=True)
+        var thresh_arr = InlineArray[Float32, 256](uninitialized=True)
+        var is_cand_arr = InlineArray[Bool, 256](uninitialized=True)
+        var cand_rows_arr = InlineArray[Int, 256](uninitialized=True)
+
+        var partial_buf = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=partial_arr)))
+        var row_extrap = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=row_extrap_arr)))
+        var max_c = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cum_max_arr)))
+        var min_c = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cum_min_arr)))
+        var cum_sum_v = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cum_sum_arr)))
+        var cum_sum_sq = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cum_sq_arr)))
+        var cum_valid = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cum_valid_arr)))
+        var thresh = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=thresh_arr)))
+        var is_cand = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=is_cand_arr)))
+        var cand_rows = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=cand_rows_arr)))
+
+        for b in range(B):
+            max_c[b] = -1e30
+            min_c[b] = 1e30
+            cum_sum_v[b] = 0.0
+            cum_sum_sq[b] = 0.0
+            cum_valid[b] = 0
+
+        var max_extrap = (Float32(c_in_blocks) / Float32(coarse_blocks)) * Float32(4.0)
+        var min_per_worker = (32 + tasks - 1) // tasks
+        var min_worker_cands = min_per_worker if chunk_rows >= min_per_worker else chunk_rows
+        var worker_total_cands = 0
+
+        var tile_start = start_r
+        while tile_start < end_r:
+            var tile_end = tile_start + tile_max
+            if tile_end > end_r:
+                tile_end = end_r
+            var tile_rows = tile_end - tile_start
+
+            for lr in range(tile_rows):
+                var r_scales = scales + (tile_start + lr) * c_in_blocks
+                var s_coarse: Float32 = 0.0
+                var s_total: Float32 = 0.0
+                for blk in range(coarse_blocks):
+                    var sc = r_scales[blk]
+                    var a_sc = sc if sc >= 0.0 else -sc
+                    s_coarse += a_sc
+                    s_total += a_sc
+                for blk in range(coarse_blocks, c_in_blocks):
+                    var sc = r_scales[blk]
+                    var a_sc = sc if sc >= 0.0 else -sc
+                    s_total += a_sc
+                if s_coarse <= Float32(1e-5) * s_total and s_total > Float32(1e-7):
+                    # Row has negligible coarse energy and significant fine energy: force Stage 2 evaluation
+                    # and set row_extrap=-1.0 as sentinel so it does not skew Stage 1 statistics
+                    row_extrap[lr] = Float32(-1.0)
+                else:
+                    var ext = s_total / (s_coarse + Float32(1e-12)) if s_coarse > Float32(1e-12) else Float32(1.0)
+                    if ext > max_extrap:
+                        ext = max_extrap
+                    row_extrap[lr] = ext
+
+            # Stage 1: Branchless 4x3 Coarse-Prefix Scan over [0 .. coarse_dim) for current L2 super-tile
+            var r = tile_start
+            while r + 3 < tile_end:
+                var lr = r - tile_start
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 0) * c_in_packed, scales + (r + 0) * c_in_blocks, w_buf0, coarse_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 1) * c_in_packed, scales + (r + 1) * c_in_blocks, w_buf1, coarse_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 2) * c_in_packed, scales + (r + 2) * c_in_blocks, w_buf2, coarse_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + (r + 3) * c_in_packed, scales + (r + 3) * c_in_blocks, w_buf3, coarse_blocks
+                )
+
+                var b = 0
+                while b + 2 < B:
+                    var acc0_0 = SIMD[DType.float32, 8](0.0)
+                    var acc0_1 = SIMD[DType.float32, 8](0.0)
+                    var acc0_2 = SIMD[DType.float32, 8](0.0)
+                    var acc1_0 = SIMD[DType.float32, 8](0.0)
+                    var acc1_1 = SIMD[DType.float32, 8](0.0)
+                    var acc1_2 = SIMD[DType.float32, 8](0.0)
+                    var acc2_0 = SIMD[DType.float32, 8](0.0)
+                    var acc2_1 = SIMD[DType.float32, 8](0.0)
+                    var acc2_2 = SIMD[DType.float32, 8](0.0)
+                    var acc3_0 = SIMD[DType.float32, 8](0.0)
+                    var acc3_1 = SIMD[DType.float32, 8](0.0)
+                    var acc3_2 = SIMD[DType.float32, 8](0.0)
+
+                    var xb0 = (b + 0) * c_in
+                    var xb1 = (b + 1) * c_in
+                    var xb2 = (b + 2) * c_in
+
+                    for k in range(0, coarse_dim, 8):
+                        var w0 = w_buf0.load[8](k)
+                        var w1 = w_buf1.load[8](k)
+                        var w2 = w_buf2.load[8](k)
+                        var w3 = w_buf3.load[8](k)
+
+                        var x0 = x_deint_ptr.load[8](xb0 + k)
+                        acc0_0 = w0.fma(x0, acc0_0)
+                        acc1_0 = w1.fma(x0, acc1_0)
+                        acc2_0 = w2.fma(x0, acc2_0)
+                        acc3_0 = w3.fma(x0, acc3_0)
+
+                        var x1 = x_deint_ptr.load[8](xb1 + k)
+                        acc0_1 = w0.fma(x1, acc0_1)
+                        acc1_1 = w1.fma(x1, acc1_1)
+                        acc2_1 = w2.fma(x1, acc2_1)
+                        acc3_1 = w3.fma(x1, acc3_1)
+
+                        var x2 = x_deint_ptr.load[8](xb2 + k)
+                        acc0_2 = w0.fma(x2, acc0_2)
+                        acc1_2 = w1.fma(x2, acc1_2)
+                        acc2_2 = w2.fma(x2, acc2_2)
+                        acc3_2 = w3.fma(x2, acc3_2)
+
+                    partial_buf[(lr + 0) * B + b + 0] = acc0_0.reduce_add()
+                    partial_buf[(lr + 0) * B + b + 1] = acc0_1.reduce_add()
+                    partial_buf[(lr + 0) * B + b + 2] = acc0_2.reduce_add()
+                    partial_buf[(lr + 1) * B + b + 0] = acc1_0.reduce_add()
+                    partial_buf[(lr + 1) * B + b + 1] = acc1_1.reduce_add()
+                    partial_buf[(lr + 1) * B + b + 2] = acc1_2.reduce_add()
+                    partial_buf[(lr + 2) * B + b + 0] = acc2_0.reduce_add()
+                    partial_buf[(lr + 2) * B + b + 1] = acc2_1.reduce_add()
+                    partial_buf[(lr + 2) * B + b + 2] = acc2_2.reduce_add()
+                    partial_buf[(lr + 3) * B + b + 0] = acc3_0.reduce_add()
+                    partial_buf[(lr + 3) * B + b + 1] = acc3_1.reduce_add()
+                    partial_buf[(lr + 3) * B + b + 2] = acc3_2.reduce_add()
+                    b += 3
+
+                while b < B:
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var acc1 = SIMD[DType.float32, 8](0.0)
+                    var acc2 = SIMD[DType.float32, 8](0.0)
+                    var acc3 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, coarse_dim, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        acc0 = w_buf0.load[8](k).fma(x0, acc0)
+                        acc1 = w_buf1.load[8](k).fma(x0, acc1)
+                        acc2 = w_buf2.load[8](k).fma(x0, acc2)
+                        acc3 = w_buf3.load[8](k).fma(x0, acc3)
+                    partial_buf[(lr + 0) * B + b] = acc0.reduce_add()
+                    partial_buf[(lr + 1) * B + b] = acc1.reduce_add()
+                    partial_buf[(lr + 2) * B + b] = acc2.reduce_add()
+                    partial_buf[(lr + 3) * B + b] = acc3.reduce_add()
+                    b += 1
+
+                r += 4
+
+            while r < tile_end:
+                var lr = r - tile_start
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r * c_in_packed, scales + r * c_in_blocks, w_buf0, coarse_blocks
+                )
+                for b in range(B):
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, coarse_dim, 8):
+                        acc0 = w_buf0.load[8](k).fma(x_deint_ptr.load[8](xb + k), acc0)
+                    partial_buf[lr * B + b] = acc0.reduce_add()
+                r += 1
+
+            # Update cumulative per-token scale-extrapolated coarse statistics across seen rows
+            for b in range(B):
+                var sum_v = cum_sum_v[b]
+                var sum_sq = cum_sum_sq[b]
+                var valid_rows = cum_valid[b]
+                for lr in range(tile_rows):
+                    var ext = row_extrap[lr]
+                    if ext < Float32(0.0):
+                        continue
+                    var v = partial_buf[lr * B + b] * ext
+                    sum_v += v
+                    sum_sq += v * v
+                    valid_rows += 1
+                    if v > max_c[b]:
+                        max_c[b] = v
+                    if v < min_c[b]:
+                        min_c[b] = v
+                cum_sum_v[b] = sum_v
+                cum_sum_sq[b] = sum_sq
+                cum_valid[b] = valid_rows
+                var span = max_c[b] - min_c[b]
+                if valid_rows == 0 or span < Float32(1e-6):
+                    # Token b has zero coarse variance; do not let a single zero-coarse token force all rows on
+                    thresh[b] = Float32(1e30)
+                else:
+                    var mean_v = sum_v / Float32(valid_rows)
+                    var var_v = (sum_sq / Float32(valid_rows)) - mean_v * mean_v
+                    if var_v < Float32(0.0):
+                        var_v = Float32(0.0)
+                    var std_v = sqrt(var_v + Float32(1e-12))
+                    var z_cut = (Float32(1.0) - span_keep_frac) * Float32(2.6)
+                    var z_thresh = mean_v + z_cut * std_v
+                    if z_thresh > max_c[b]:
+                        z_thresh = max_c[b]
+                    thresh[b] = z_thresh
+
+            # Mark candidate rows and union with forced_cand_tokens
+            for lr in range(tile_rows):
+                var p_row = partial_buf + lr * B
+                var ext = row_extrap[lr]
+                if ext < Float32(0.0):
+                    is_cand[lr] = True
+                    continue
+                var keep = False
+                for b in range(B):
+                    if p_row[b] * ext >= thresh[b]:
+                        keep = True
+                        break
+                is_cand[lr] = keep
+
+            if has_forced:
+                for f in range(num_forced_cands):
+                    var tok = forced_cand_tokens[f]
+                    if tok >= tile_start and tok < tile_end:
+                        is_cand[tok - tile_start] = True
+
+            var num_cands = 0
+            for lr in range(tile_rows):
+                if is_cand[lr]:
+                    cand_rows[num_cands] = lr
+                    num_cands += 1
+
+            # Guarantee at least min_worker_cands across the worker's tiles
+            if worker_total_cands + num_cands < min_worker_cands:
+                var needed = min_worker_cands - worker_total_cands
+                if needed > tile_rows:
+                    needed = tile_rows
+                for lr in range(tile_rows):
+                    if not is_cand[lr]:
+                        is_cand[lr] = True
+                        cand_rows[num_cands] = lr
+                        num_cands += 1
+                        if num_cands >= needed:
+                            break
+            worker_total_cands += num_cands
+
+            for lr in range(tile_rows):
+                if not is_cand[lr]:
+                    var row_idx = tile_start + lr
+                    for b in range(B):
+                        out_ptr[b * o_stride + row_idx] = Scalar[out_type](pruned_sentinel)
+
+            # Stage 2: Branchless 4x3 Fine-Suffix GEMM over [coarse_dim .. c_in) ONLY on compacted cand_rows
+            var c = 0
+            while c + 3 < num_cands:
+                var lr0 = cand_rows[c + 0]
+                var lr1 = cand_rows[c + 1]
+                var lr2 = cand_rows[c + 2]
+                var lr3 = cand_rows[c + 3]
+                var r0 = tile_start + lr0
+                var r1 = tile_start + lr1
+                var r2 = tile_start + lr2
+                var r3 = tile_start + lr3
+
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r0 * c_in_packed + coarse_packed, scales + r0 * c_in_blocks + coarse_blocks, w_buf0, fine_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r1 * c_in_packed + coarse_packed, scales + r1 * c_in_blocks + coarse_blocks, w_buf1, fine_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r2 * c_in_packed + coarse_packed, scales + r2 * c_in_blocks + coarse_blocks, w_buf2, fine_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r3 * c_in_packed + coarse_packed, scales + r3 * c_in_blocks + coarse_blocks, w_buf3, fine_blocks
+                )
+
+                var b = 0
+                while b + 2 < B:
+                    var acc0_0 = SIMD[DType.float32, 8](0.0)
+                    var acc0_1 = SIMD[DType.float32, 8](0.0)
+                    var acc0_2 = SIMD[DType.float32, 8](0.0)
+                    var acc1_0 = SIMD[DType.float32, 8](0.0)
+                    var acc1_1 = SIMD[DType.float32, 8](0.0)
+                    var acc1_2 = SIMD[DType.float32, 8](0.0)
+                    var acc2_0 = SIMD[DType.float32, 8](0.0)
+                    var acc2_1 = SIMD[DType.float32, 8](0.0)
+                    var acc2_2 = SIMD[DType.float32, 8](0.0)
+                    var acc3_0 = SIMD[DType.float32, 8](0.0)
+                    var acc3_1 = SIMD[DType.float32, 8](0.0)
+                    var acc3_2 = SIMD[DType.float32, 8](0.0)
+
+                    var xb0 = (b + 0) * c_in + coarse_dim
+                    var xb1 = (b + 1) * c_in + coarse_dim
+                    var xb2 = (b + 2) * c_in + coarse_dim
+
+                    for k in range(0, fine_dim, 8):
+                        var w0 = w_buf0.load[8](k)
+                        var w1 = w_buf1.load[8](k)
+                        var w2 = w_buf2.load[8](k)
+                        var w3 = w_buf3.load[8](k)
+
+                        var x0 = x_deint_ptr.load[8](xb0 + k)
+                        acc0_0 = w0.fma(x0, acc0_0)
+                        acc1_0 = w1.fma(x0, acc1_0)
+                        acc2_0 = w2.fma(x0, acc2_0)
+                        acc3_0 = w3.fma(x0, acc3_0)
+
+                        var x1 = x_deint_ptr.load[8](xb1 + k)
+                        acc0_1 = w0.fma(x1, acc0_1)
+                        acc1_1 = w1.fma(x1, acc1_1)
+                        acc2_1 = w2.fma(x1, acc2_1)
+                        acc3_1 = w3.fma(x1, acc3_1)
+
+                        var x2 = x_deint_ptr.load[8](xb2 + k)
+                        acc0_2 = w0.fma(x2, acc0_2)
+                        acc1_2 = w1.fma(x2, acc1_2)
+                        acc2_2 = w2.fma(x2, acc2_2)
+                        acc3_2 = w3.fma(x2, acc3_2)
+
+                    out_ptr[(b + 0) * o_stride + r0] = (partial_buf[lr0 * B + b + 0] + acc0_0.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r0] = (partial_buf[lr0 * B + b + 1] + acc0_1.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r0] = (partial_buf[lr0 * B + b + 2] + acc0_2.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r1] = (partial_buf[lr1 * B + b + 0] + acc1_0.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r1] = (partial_buf[lr1 * B + b + 1] + acc1_1.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r1] = (partial_buf[lr1 * B + b + 2] + acc1_2.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r2] = (partial_buf[lr2 * B + b + 0] + acc2_0.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r2] = (partial_buf[lr2 * B + b + 1] + acc2_1.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r2] = (partial_buf[lr2 * B + b + 2] + acc2_2.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 0) * o_stride + r3] = (partial_buf[lr3 * B + b + 0] + acc3_0.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 1) * o_stride + r3] = (partial_buf[lr3 * B + b + 1] + acc3_1.reduce_add()).cast[out_type]()
+                    out_ptr[(b + 2) * o_stride + r3] = (partial_buf[lr3 * B + b + 2] + acc3_2.reduce_add()).cast[out_type]()
+                    b += 3
+
+                while b < B:
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var acc1 = SIMD[DType.float32, 8](0.0)
+                    var acc2 = SIMD[DType.float32, 8](0.0)
+                    var acc3 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in + coarse_dim
+                    for k in range(0, fine_dim, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        acc0 = w_buf0.load[8](k).fma(x0, acc0)
+                        acc1 = w_buf1.load[8](k).fma(x0, acc1)
+                        acc2 = w_buf2.load[8](k).fma(x0, acc2)
+                        acc3 = w_buf3.load[8](k).fma(x0, acc3)
+                    out_ptr[b * o_stride + r0] = (partial_buf[lr0 * B + b] + acc0.reduce_add()).cast[out_type]()
+                    out_ptr[b * o_stride + r1] = (partial_buf[lr1 * B + b] + acc1.reduce_add()).cast[out_type]()
+                    out_ptr[b * o_stride + r2] = (partial_buf[lr2 * B + b] + acc2.reduce_add()).cast[out_type]()
+                    out_ptr[b * o_stride + r3] = (partial_buf[lr3 * B + b] + acc3.reduce_add()).cast[out_type]()
+                    b += 1
+
+                c += 4
+
+            while c < num_cands:
+                var lr0 = cand_rows[c]
+                var r0 = tile_start + lr0
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r0 * c_in_packed + coarse_packed, scales + r0 * c_in_blocks + coarse_blocks, w_buf0, fine_blocks
+                )
+                for b in range(B):
+                    var acc0 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in + coarse_dim
+                    for k in range(0, fine_dim, 8):
+                        acc0 = w_buf0.load[8](k).fma(x_deint_ptr.load[8](xb + k), acc0)
+                    out_ptr[b * o_stride + r0] = (partial_buf[lr0 * B + b] + acc0.reduce_add()).cast[out_type]()
+                c += 1
+
+            tile_start = tile_end
+
+        _ = partial_arr[0]
+        _ = row_extrap_arr[0]
+        _ = cum_max_arr[0]
+        _ = cum_min_arr[0]
+        _ = cum_sum_arr[0]
+        _ = cum_sq_arr[0]
+        _ = cum_valid_arr[0]
+        _ = thresh_arr[0]
+        _ = is_cand_arr[0]
+        _ = cand_rows_arr[0]
+        _ = w_arr0[0]
+        _ = w_arr1[0]
+        _ = w_arr2[0]
+        _ = w_arr3[0]
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+    _ = x_stack[0]
 
 
 # Fused Dual-Matrix (Gate + Up + GeGLU) L1-Unpacked 1-Row-Pair x 4-Batch FMA kernel.
@@ -966,7 +1558,10 @@ def q4_fused_gate_up_geglu_l1[
     c_in: Int,
     c_out: Int,
     num_tasks: Int,
+    pre_deint_X: UnsafePointer[Float32, _] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
 ):
+    if B <= 0 or c_in <= 0 or c_out <= 0:
+        return
     var tasks = num_tasks
     if tasks > c_out:
         tasks = c_out
@@ -976,6 +1571,14 @@ def q4_fused_gate_up_geglu_l1[
     var chunk_size = c_out // tasks
     var c_in_packed = c_in // 2
     var c_in_blocks = c_in // 32
+
+    var x_stack = InlineArray[Float32, 65536](uninitialized=True)
+    var use_deint = Int(pre_deint_X) != 0 and c_in <= 4096 and (c_in % 32 == 0) and B <= 256
+    var x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(pre_deint_X))
+    if not use_deint and c_in <= 4096 and (c_in % 32 == 0) and B <= 256 and B * c_in <= 65536:
+        x_deint_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=x_stack)))
+        deinterleave_batch_to_f32[in_type](X, x_deint_ptr, B, c_in)
+        use_deint = True
 
     def worker(t: Int) capturing -> None:
         var start_r = t * chunk_size
@@ -991,6 +1594,243 @@ def q4_fused_gate_up_geglu_l1[
         var w_up1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=wu_arr1)))
 
         var r = start_r
+        if use_deint:
+            # Stream-separated 4-row x 3-batch GeGLU tile (llm-mojo-yj4.5):
+            # Pass 1 unpacks 4 contiguous rows of W_gate into w_gate0..w_up1 and computes gate_tile[4 * B].
+            # Pass 2 unpacks 4 contiguous rows of W_up into the same L1 buffers and fuses GeGLU!
+            var gate_stack = InlineArray[Float32, 1024](uninitialized=True)
+            var gate_tile = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=gate_stack)))
+
+            while r + 3 < end_r:
+                var r0 = r
+                var r1 = r + 1
+                var r2 = r + 2
+                var r3 = r + 3
+                # Contiguous Stream 1: 4 rows of W_gate
+                unpack_row_deinterleaved_prescaled(
+                    W_gate_packed + r0 * c_in_packed, W_gate_scales + r0 * c_in_blocks, w_gate0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_gate_packed + r1 * c_in_packed, W_gate_scales + r1 * c_in_blocks, w_gate1, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_gate_packed + r2 * c_in_packed, W_gate_scales + r2 * c_in_blocks, w_up0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_gate_packed + r3 * c_in_packed, W_gate_scales + r3 * c_in_blocks, w_up1, c_in_blocks
+                )
+
+                var b = 0
+                while b + 2 < B:
+                    var g0_0 = SIMD[DType.float32, 8](0.0)
+                    var g0_1 = SIMD[DType.float32, 8](0.0)
+                    var g0_2 = SIMD[DType.float32, 8](0.0)
+                    var g1_0 = SIMD[DType.float32, 8](0.0)
+                    var g1_1 = SIMD[DType.float32, 8](0.0)
+                    var g1_2 = SIMD[DType.float32, 8](0.0)
+                    var g2_0 = SIMD[DType.float32, 8](0.0)
+                    var g2_1 = SIMD[DType.float32, 8](0.0)
+                    var g2_2 = SIMD[DType.float32, 8](0.0)
+                    var g3_0 = SIMD[DType.float32, 8](0.0)
+                    var g3_1 = SIMD[DType.float32, 8](0.0)
+                    var g3_2 = SIMD[DType.float32, 8](0.0)
+
+                    var xb0 = (b + 0) * c_in
+                    var xb1 = (b + 1) * c_in
+                    var xb2 = (b + 2) * c_in
+                    for k in range(0, c_in, 8):
+                        var wg0 = w_gate0.load[8](k)
+                        var wg1 = w_gate1.load[8](k)
+                        var wg2 = w_up0.load[8](k)
+                        var wg3 = w_up1.load[8](k)
+
+                        var x0 = x_deint_ptr.load[8](xb0 + k)
+                        g0_0 = wg0.fma(x0, g0_0)
+                        g1_0 = wg1.fma(x0, g1_0)
+                        g2_0 = wg2.fma(x0, g2_0)
+                        g3_0 = wg3.fma(x0, g3_0)
+
+                        var x1 = x_deint_ptr.load[8](xb1 + k)
+                        g0_1 = wg0.fma(x1, g0_1)
+                        g1_1 = wg1.fma(x1, g1_1)
+                        g2_1 = wg2.fma(x1, g2_1)
+                        g3_1 = wg3.fma(x1, g3_1)
+
+                        var x2 = x_deint_ptr.load[8](xb2 + k)
+                        g0_2 = wg0.fma(x2, g0_2)
+                        g1_2 = wg1.fma(x2, g1_2)
+                        g2_2 = wg2.fma(x2, g2_2)
+                        g3_2 = wg3.fma(x2, g3_2)
+
+                    gate_tile[(b + 0) * 4 + 0] = g0_0.reduce_add()
+                    gate_tile[(b + 1) * 4 + 0] = g0_1.reduce_add()
+                    gate_tile[(b + 2) * 4 + 0] = g0_2.reduce_add()
+                    gate_tile[(b + 0) * 4 + 1] = g1_0.reduce_add()
+                    gate_tile[(b + 1) * 4 + 1] = g1_1.reduce_add()
+                    gate_tile[(b + 2) * 4 + 1] = g1_2.reduce_add()
+                    gate_tile[(b + 0) * 4 + 2] = g2_0.reduce_add()
+                    gate_tile[(b + 1) * 4 + 2] = g2_1.reduce_add()
+                    gate_tile[(b + 2) * 4 + 2] = g2_2.reduce_add()
+                    gate_tile[(b + 0) * 4 + 3] = g3_0.reduce_add()
+                    gate_tile[(b + 1) * 4 + 3] = g3_1.reduce_add()
+                    gate_tile[(b + 2) * 4 + 3] = g3_2.reduce_add()
+                    b += 3
+
+                while b < B:
+                    var g0 = SIMD[DType.float32, 8](0.0)
+                    var g1 = SIMD[DType.float32, 8](0.0)
+                    var g2 = SIMD[DType.float32, 8](0.0)
+                    var g3 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        g0 = w_gate0.load[8](k).fma(x0, g0)
+                        g1 = w_gate1.load[8](k).fma(x0, g1)
+                        g2 = w_up0.load[8](k).fma(x0, g2)
+                        g3 = w_up1.load[8](k).fma(x0, g3)
+                    gate_tile[b * 4 + 0] = g0.reduce_add()
+                    gate_tile[b * 4 + 1] = g1.reduce_add()
+                    gate_tile[b * 4 + 2] = g2.reduce_add()
+                    gate_tile[b * 4 + 3] = g3.reduce_add()
+                    b += 1
+
+                # Contiguous Stream 2: 4 rows of W_up + fused GeGLU
+                unpack_row_deinterleaved_prescaled(
+                    W_up_packed + r0 * c_in_packed, W_up_scales + r0 * c_in_blocks, w_gate0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_up_packed + r1 * c_in_packed, W_up_scales + r1 * c_in_blocks, w_gate1, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_up_packed + r2 * c_in_packed, W_up_scales + r2 * c_in_blocks, w_up0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_up_packed + r3 * c_in_packed, W_up_scales + r3 * c_in_blocks, w_up1, c_in_blocks
+                )
+
+                b = 0
+                while b + 2 < B:
+                    var u0_0 = SIMD[DType.float32, 8](0.0)
+                    var u0_1 = SIMD[DType.float32, 8](0.0)
+                    var u0_2 = SIMD[DType.float32, 8](0.0)
+                    var u1_0 = SIMD[DType.float32, 8](0.0)
+                    var u1_1 = SIMD[DType.float32, 8](0.0)
+                    var u1_2 = SIMD[DType.float32, 8](0.0)
+                    var u2_0 = SIMD[DType.float32, 8](0.0)
+                    var u2_1 = SIMD[DType.float32, 8](0.0)
+                    var u2_2 = SIMD[DType.float32, 8](0.0)
+                    var u3_0 = SIMD[DType.float32, 8](0.0)
+                    var u3_1 = SIMD[DType.float32, 8](0.0)
+                    var u3_2 = SIMD[DType.float32, 8](0.0)
+
+                    var xb0 = (b + 0) * c_in
+                    var xb1 = (b + 1) * c_in
+                    var xb2 = (b + 2) * c_in
+                    for k in range(0, c_in, 8):
+                        var wu0 = w_gate0.load[8](k)
+                        var wu1 = w_gate1.load[8](k)
+                        var wu2 = w_up0.load[8](k)
+                        var wu3 = w_up1.load[8](k)
+
+                        var x0 = x_deint_ptr.load[8](xb0 + k)
+                        u0_0 = wu0.fma(x0, u0_0)
+                        u1_0 = wu1.fma(x0, u1_0)
+                        u2_0 = wu2.fma(x0, u2_0)
+                        u3_0 = wu3.fma(x0, u3_0)
+
+                        var x1 = x_deint_ptr.load[8](xb1 + k)
+                        u0_1 = wu0.fma(x1, u0_1)
+                        u1_1 = wu1.fma(x1, u1_1)
+                        u2_1 = wu2.fma(x1, u2_1)
+                        u3_1 = wu3.fma(x1, u3_1)
+
+                        var x2 = x_deint_ptr.load[8](xb2 + k)
+                        u0_2 = wu0.fma(x2, u0_2)
+                        u1_2 = wu1.fma(x2, u1_2)
+                        u2_2 = wu2.fma(x2, u2_2)
+                        u3_2 = wu3.fma(x2, u3_2)
+
+                    var gate_v0 = SIMD[DType.float32, 4](
+                        gate_tile[(b + 0) * 4 + 0], gate_tile[(b + 0) * 4 + 1],
+                        gate_tile[(b + 0) * 4 + 2], gate_tile[(b + 0) * 4 + 3],
+                    )
+                    var up_v0 = SIMD[DType.float32, 4](
+                        u0_0.reduce_add(), u1_0.reduce_add(), u2_0.reduce_add(), u3_0.reduce_add()
+                    )
+                    var act_v0 = (gate_v0 * (1.0 / (1.0 + exp(SIMD[DType.float32, 4](-1.702) * gate_v0))) * up_v0).cast[out_type]()
+                    out_gated.store((b + 0) * c_out + r0, act_v0)
+
+                    var gate_v1 = SIMD[DType.float32, 4](
+                        gate_tile[(b + 1) * 4 + 0], gate_tile[(b + 1) * 4 + 1],
+                        gate_tile[(b + 1) * 4 + 2], gate_tile[(b + 1) * 4 + 3],
+                    )
+                    var up_v1 = SIMD[DType.float32, 4](
+                        u0_1.reduce_add(), u1_1.reduce_add(), u2_1.reduce_add(), u3_1.reduce_add()
+                    )
+                    var act_v1 = (gate_v1 * (1.0 / (1.0 + exp(SIMD[DType.float32, 4](-1.702) * gate_v1))) * up_v1).cast[out_type]()
+                    out_gated.store((b + 1) * c_out + r0, act_v1)
+
+                    var gate_v2 = SIMD[DType.float32, 4](
+                        gate_tile[(b + 2) * 4 + 0], gate_tile[(b + 2) * 4 + 1],
+                        gate_tile[(b + 2) * 4 + 2], gate_tile[(b + 2) * 4 + 3],
+                    )
+                    var up_v2 = SIMD[DType.float32, 4](
+                        u0_2.reduce_add(), u1_2.reduce_add(), u2_2.reduce_add(), u3_2.reduce_add()
+                    )
+                    var act_v2 = (gate_v2 * (1.0 / (1.0 + exp(SIMD[DType.float32, 4](-1.702) * gate_v2))) * up_v2).cast[out_type]()
+                    out_gated.store((b + 2) * c_out + r0, act_v2)
+                    b += 3
+
+                while b < B:
+                    var u0 = SIMD[DType.float32, 8](0.0)
+                    var u1 = SIMD[DType.float32, 8](0.0)
+                    var u2 = SIMD[DType.float32, 8](0.0)
+                    var u3 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        u0 = w_gate0.load[8](k).fma(x0, u0)
+                        u1 = w_gate1.load[8](k).fma(x0, u1)
+                        u2 = w_up0.load[8](k).fma(x0, u2)
+                        u3 = w_up1.load[8](k).fma(x0, u3)
+                    var gate_vb = SIMD[DType.float32, 4](
+                        gate_tile[b * 4 + 0], gate_tile[b * 4 + 1], gate_tile[b * 4 + 2], gate_tile[b * 4 + 3]
+                    )
+                    var up_vb = SIMD[DType.float32, 4](
+                        u0.reduce_add(), u1.reduce_add(), u2.reduce_add(), u3.reduce_add()
+                    )
+                    var act_vb = (gate_vb * (1.0 / (1.0 + exp(SIMD[DType.float32, 4](-1.702) * gate_vb))) * up_vb).cast[out_type]()
+                    out_gated.store(b * c_out + r0, act_vb)
+                    b += 1
+
+                r += 4
+
+            while r < end_r:
+                unpack_row_deinterleaved_prescaled(
+                    W_gate_packed + r * c_in_packed, W_gate_scales + r * c_in_blocks, w_gate0, c_in_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_up_packed + r * c_in_packed, W_up_scales + r * c_in_blocks, w_up0, c_in_blocks
+                )
+                for b in range(B):
+                    var g0 = SIMD[DType.float32, 8](0.0)
+                    var u0 = SIMD[DType.float32, 8](0.0)
+                    var xb = b * c_in
+                    for k in range(0, c_in, 8):
+                        var x0 = x_deint_ptr.load[8](xb + k)
+                        g0 = w_gate0.load[8](k).fma(x0, g0)
+                        u0 = w_up0.load[8](k).fma(x0, u0)
+                    var gv = g0.reduce_add()
+                    var uv = u0.reduce_add()
+                    var sig = 1.0 / (1.0 + exp(Float32(-1.702) * gv))
+                    out_gated[b * c_out + r] = Scalar[out_type](gv * sig * uv)
+                r += 1
+            _ = gate_stack[0]
+            _ = wg_arr0[0]
+            _ = wg_arr1[0]
+            _ = wu_arr0[0]
+            _ = wu_arr1[0]
+            return
         while r + 1 < end_r:
             var r0 = r
             var r1 = r + 1
@@ -1139,6 +1979,810 @@ def q4_fused_gate_up_geglu_l1[
         worker(0)
     else:
         parallelize[worker](tasks)
+    _ = x_stack[0]
+
+
+# Branchless Pre-Compacted Block-Sparse W_down Q4 GEMM (llm-mojo-yj4.5).
+# Pre-scans 32-element Q4 blocks of X across all B tokens once before the parallel c_out loop,
+# builds active_blks[0..num_active_blks-1], compacts X into contiguous deinterleaved active blocks,
+# and executes 100% branchless 4x3 AVX2 FMA over only the active blocks.
+@always_inline
+def q4_gemm_block_sparse_down[
+    in_type: DType = DType.float32,
+    out_type: DType = DType.float32,
+](
+    W_packed: UnsafePointer[UInt8, _],
+    scales: UnsafePointer[Float32, _],
+    X: UnsafePointer[Scalar[in_type], _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutAnyOrigin],
+    B: Int,
+    c_in: Int,
+    c_out: Int,
+    num_tasks: Int,
+    in_stride: Int = 0,
+    out_stride: Int = 0,
+    pre_deint_X: UnsafePointer[Float32, _] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
+    eps_blk: Float32 = 1e-6,
+):
+    if B <= 0 or c_in <= 0 or c_out <= 0:
+        return
+    var x_stride = in_stride if in_stride > 0 else c_in
+    var o_stride = out_stride if out_stride > 0 else c_out
+    if c_in > 4096 or (c_in % 32 != 0):
+        q4_gemm_l1_2x4[in_type, out_type](
+            W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride, pre_deint_X
+        )
+        return
+
+    var c_in_blocks = c_in // 32
+    var c_in_packed = c_in // 2
+    var act_blk_arr = InlineArray[Int, 128](uninitialized=True)
+    var active_blks = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=act_blk_arr)))
+    var num_active_blks = 0
+    var has_pre_deint = Int(pre_deint_X) != 0
+
+    for blk in range(c_in_blocks):
+        var blk_off = blk * 32
+        var is_active = False
+        for b in range(B):
+            var max_v: Float32
+            if has_pre_deint:
+                var xb = b * c_in + blk_off
+                var m0 = abs(pre_deint_X.load[8](xb + 0))
+                var m1 = abs(pre_deint_X.load[8](xb + 8))
+                var m2 = abs(pre_deint_X.load[8](xb + 16))
+                var m3 = abs(pre_deint_X.load[8](xb + 24))
+                max_v = max(max(m0, m1), max(m2, m3)).reduce_max()
+            else:
+                var xb = b * x_stride + blk_off
+                var m0 = abs(X.load[8](xb + 0).cast[DType.float32]())
+                var m1 = abs(X.load[8](xb + 8).cast[DType.float32]())
+                var m2 = abs(X.load[8](xb + 16).cast[DType.float32]())
+                var m3 = abs(X.load[8](xb + 24).cast[DType.float32]())
+                max_v = max(max(m0, m1), max(m2, m3)).reduce_max()
+            if max_v > eps_blk:
+                is_active = True
+                break
+        if is_active:
+            active_blks[num_active_blks] = blk
+            num_active_blks += 1
+
+    # Fast path 1: All blocks across the batch are zero
+    if num_active_blks == 0:
+        for b in range(B):
+            for r in range(c_out):
+                out_ptr[b * o_stride + r] = Scalar[out_type](0.0)
+        _ = act_blk_arr[0]
+        return
+
+    # Fast path 2: All blocks are active (dense)
+    if num_active_blks == c_in_blocks:
+        q4_gemm_l1_2x4[in_type, out_type](
+            W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride, pre_deint_X
+        )
+        _ = act_blk_arr[0]
+        return
+
+    var active_dim = num_active_blks * 32
+    var x_stack = InlineArray[Float32, 65536](uninitialized=True)
+    var x_compact = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=x_stack)))
+    if B * active_dim > 65536:
+        if has_pre_deint:
+            # In-place monotonic compaction in pre_deint_X (b * active_dim + ab * 32 <= b * c_in + active_blks[ab] * 32)
+            x_compact = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(pre_deint_X))
+        else:
+            q4_gemm_l1_2x4[in_type, out_type](
+                W_packed, scales, X, out_ptr, B, c_in, c_out, num_tasks, in_stride, out_stride, pre_deint_X
+            )
+            _ = act_blk_arr[0]
+            return
+
+    for b in range(B):
+        var dst_row = x_compact + b * active_dim
+        if has_pre_deint:
+            var src_row = pre_deint_X + b * c_in
+            for ab in range(num_active_blks):
+                var blk_off = active_blks[ab] * 32
+                var d_off = ab * 32
+                dst_row.store(d_off + 0, src_row.load[16](blk_off + 0))
+                dst_row.store(d_off + 16, src_row.load[16](blk_off + 16))
+        else:
+            var src_row = X + b * x_stride
+            for ab in range(num_active_blks):
+                var blk_off = active_blks[ab] * 32
+                var d_off = ab * 32
+                var v0 = src_row.load[16](blk_off).cast[DType.float32]()
+                var v1 = src_row.load[16](blk_off + 16).cast[DType.float32]()
+                dst_row.store(d_off + 0, v0.deinterleave()[0].join(v1.deinterleave()[0]))
+                dst_row.store(d_off + 16, v0.deinterleave()[1].join(v1.deinterleave()[1]))
+
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var chunk_size = c_out // tasks
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+
+        var w_arr0 = InlineArray[Float32, 4096](uninitialized=True)
+        var w_arr1 = InlineArray[Float32, 4096](uninitialized=True)
+        var w_arr2 = InlineArray[Float32, 4096](uninitialized=True)
+        var w_arr3 = InlineArray[Float32, 4096](uninitialized=True)
+        var w_buf0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr0)))
+        var w_buf1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr1)))
+        var w_buf2 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr2)))
+        var w_buf3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
+
+        var r = start_r
+        while r + 3 < end_r:
+            var r0 = r
+            var r1 = r + 1
+            var r2 = r + 2
+            var r3 = r + 3
+            for ab in range(num_active_blks):
+                var blk = active_blks[ab]
+                var p_off = blk * 16
+                var d_off = ab * 32
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r0 * c_in_packed + p_off, scales + r0 * c_in_blocks + blk, w_buf0 + d_off, 1
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r1 * c_in_packed + p_off, scales + r1 * c_in_blocks + blk, w_buf1 + d_off, 1
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r2 * c_in_packed + p_off, scales + r2 * c_in_blocks + blk, w_buf2 + d_off, 1
+                )
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r3 * c_in_packed + p_off, scales + r3 * c_in_blocks + blk, w_buf3 + d_off, 1
+                )
+
+            var b = 0
+            while b + 2 < B:
+                var acc00 = SIMD[DType.float32, 8](0.0)
+                var acc01 = SIMD[DType.float32, 8](0.0)
+                var acc02 = SIMD[DType.float32, 8](0.0)
+                var acc10 = SIMD[DType.float32, 8](0.0)
+                var acc11 = SIMD[DType.float32, 8](0.0)
+                var acc12 = SIMD[DType.float32, 8](0.0)
+                var acc20 = SIMD[DType.float32, 8](0.0)
+                var acc21 = SIMD[DType.float32, 8](0.0)
+                var acc22 = SIMD[DType.float32, 8](0.0)
+                var acc30 = SIMD[DType.float32, 8](0.0)
+                var acc31 = SIMD[DType.float32, 8](0.0)
+                var acc32 = SIMD[DType.float32, 8](0.0)
+
+                var xb0 = (b + 0) * active_dim
+                var xb1 = (b + 1) * active_dim
+                var xb2 = (b + 2) * active_dim
+                for k in range(0, active_dim, 8):
+                    var w0 = w_buf0.load[8](k)
+                    var w1 = w_buf1.load[8](k)
+                    var w2 = w_buf2.load[8](k)
+                    var w3 = w_buf3.load[8](k)
+
+                    var x0 = x_compact.load[8](xb0 + k)
+                    acc00 = w0.fma(x0, acc00)
+                    acc10 = w1.fma(x0, acc10)
+                    acc20 = w2.fma(x0, acc20)
+                    acc30 = w3.fma(x0, acc30)
+
+                    var x1 = x_compact.load[8](xb1 + k)
+                    acc01 = w0.fma(x1, acc01)
+                    acc11 = w1.fma(x1, acc11)
+                    acc21 = w2.fma(x1, acc21)
+                    acc31 = w3.fma(x1, acc31)
+
+                    var x2 = x_compact.load[8](xb2 + k)
+                    acc02 = w0.fma(x2, acc02)
+                    acc12 = w1.fma(x2, acc12)
+                    acc22 = w2.fma(x2, acc22)
+                    acc32 = w3.fma(x2, acc32)
+
+                out_ptr.store(
+                    (b + 0) * o_stride + r0,
+                    SIMD[DType.float32, 4](
+                        acc00.reduce_add(), acc10.reduce_add(), acc20.reduce_add(), acc30.reduce_add()
+                    ).cast[out_type](),
+                )
+                out_ptr.store(
+                    (b + 1) * o_stride + r0,
+                    SIMD[DType.float32, 4](
+                        acc01.reduce_add(), acc11.reduce_add(), acc21.reduce_add(), acc31.reduce_add()
+                    ).cast[out_type](),
+                )
+                out_ptr.store(
+                    (b + 2) * o_stride + r0,
+                    SIMD[DType.float32, 4](
+                        acc02.reduce_add(), acc12.reduce_add(), acc22.reduce_add(), acc32.reduce_add()
+                    ).cast[out_type](),
+                )
+                b += 3
+
+            while b < B:
+                var acc0 = SIMD[DType.float32, 8](0.0)
+                var acc1 = SIMD[DType.float32, 8](0.0)
+                var acc2 = SIMD[DType.float32, 8](0.0)
+                var acc3 = SIMD[DType.float32, 8](0.0)
+                var xb = b * active_dim
+                for k in range(0, active_dim, 8):
+                    var x0 = x_compact.load[8](xb + k)
+                    acc0 = w_buf0.load[8](k).fma(x0, acc0)
+                    acc1 = w_buf1.load[8](k).fma(x0, acc1)
+                    acc2 = w_buf2.load[8](k).fma(x0, acc2)
+                    acc3 = w_buf3.load[8](k).fma(x0, acc3)
+                out_ptr.store(
+                    b * o_stride + r0,
+                    SIMD[DType.float32, 4](
+                        acc0.reduce_add(), acc1.reduce_add(), acc2.reduce_add(), acc3.reduce_add()
+                    ).cast[out_type](),
+                )
+                b += 1
+
+            r += 4
+
+        while r < end_r:
+            var r0 = r
+            for ab in range(num_active_blks):
+                var blk = active_blks[ab]
+                unpack_row_deinterleaved_prescaled(
+                    W_packed + r0 * c_in_packed + blk * 16, scales + r0 * c_in_blocks + blk, w_buf0 + ab * 32, 1
+                )
+            for b in range(B):
+                var acc0 = SIMD[DType.float32, 8](0.0)
+                var xb = b * active_dim
+                for k in range(0, active_dim, 8):
+                    acc0 = w_buf0.load[8](k).fma(x_compact.load[8](xb + k), acc0)
+                out_ptr[b * o_stride + r0] = acc0.reduce_add().cast[out_type]()
+            r += 1
+
+        _ = w_arr0[0]
+        _ = w_arr1[0]
+        _ = w_arr2[0]
+        _ = w_arr3[0]
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+    _ = x_stack[0]
+    _ = act_blk_arr[0]
+
+
+# Router-Subspace FFN Bypass for Stationary Canvas Tokens (llm-mojo-yj4.6).
+# Uses the already-computed 128-dim MoE router logits r_curr[b] and top-2 expert IDs as a
+# low-rank subspace monitor. Bypasses accepted tokens (eb_mask[orig_t] == True) whose top-2
+# expert IDs match prev_top2[orig_t] and whose relative router logit drift <= tau_ffn.
+# Updates r_prev[orig_t] and prev_top2[orig_t] ONLY when token b is evaluated, preventing
+# slow cumulative drift across consecutive steps from escaping detection!
+@always_inline
+def router_subspace_ffn_filter(
+    r_curr: UnsafePointer[Float32, _],
+    r_prev: UnsafePointer[Float32, MutAnyOrigin],
+    top_idx: UnsafePointer[Int, _],
+    prev_top2: UnsafePointer[Int, MutAnyOrigin],
+    eb_mask: UnsafePointer[Bool, _],
+    active_canvas_idx: UnsafePointer[Int, _],
+    ffn_keep_b: UnsafePointer[Int, MutAnyOrigin],
+    B: Int,
+    num_experts: Int,
+    top_k: Int,
+    step: Int,
+    tau_ffn: Float32 = 0.05,
+    top_weights: UnsafePointer[Float32, MutAnyOrigin] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
+) -> Int:
+    if B <= 0:
+        return 0
+    var has_eb = Int(eb_mask) != 0
+    var has_idx = Int(active_canvas_idx) != 0
+    var has_tw = Int(top_weights) != 0
+    var active_count = 0
+    var tau_sq = tau_ffn * tau_ffn
+
+    for b in range(B):
+        var orig_t = active_canvas_idx[b] if has_idx else b
+        var is_accepted = eb_mask[orig_t] if has_eb else True
+        var bypass = False
+
+        if step >= 1 and is_accepted and top_k >= 2 and num_experts > 0:
+            var e0 = top_idx[b * top_k + 0]
+            var e1 = top_idx[b * top_k + 1]
+            var p0 = prev_top2[orig_t * 2 + 0]
+            var p1 = prev_top2[orig_t * 2 + 1]
+            if p0 >= 0 and p1 >= 0 and e0 == p0 and e1 == p1:
+                var diff_sq: Float32 = 0.0
+                var norm_sq: Float32 = 0.0
+                var curr_row = r_curr + b * num_experts
+                var prev_row = r_prev + orig_t * num_experts
+                var e = 0
+                var v_diff = SIMD[DType.float32, 8](0.0)
+                var v_norm = SIMD[DType.float32, 8](0.0)
+                while e + 7 < num_experts:
+                    var vc = curr_row.load[8](e)
+                    var vp = prev_row.load[8](e)
+                    var vd = vc - vp
+                    v_diff = vd.fma(vd, v_diff)
+                    v_norm = vp.fma(vp, v_norm)
+                    e += 8
+                diff_sq = v_diff.reduce_add()
+                norm_sq = v_norm.reduce_add()
+                while e < num_experts:
+                    var vc = curr_row[e]
+                    var vp = prev_row[e]
+                    var vd = vc - vp
+                    diff_sq += vd * vd
+                    norm_sq += vp * vp
+                    e += 1
+                if norm_sq > 1e-12:
+                    bypass = diff_sq <= tau_sq * norm_sq
+                else:
+                    bypass = diff_sq <= 1e-12
+
+        if bypass:
+            if has_tw:
+                for s in range(top_k):
+                    top_weights[b * top_k + s] = 0.0
+        else:
+            ffn_keep_b[active_count] = b
+            active_count += 1
+            if top_k >= 1:
+                prev_top2[orig_t * 2 + 0] = top_idx[b * top_k + 0]
+            if top_k >= 2:
+                prev_top2[orig_t * 2 + 1] = top_idx[b * top_k + 1]
+            var curr_row = r_curr + b * num_experts
+            var prev_row = r_prev + orig_t * num_experts
+            for e in range(num_experts):
+                prev_row[e] = curr_row[e]
+
+    return active_count
+
+
+# In-place cache sync for router-subspace MoE bypass:
+# When bypassed tokens had their top_weights zeroed before run_diffusion_moe_experts_parallel,
+# evaluated tokens already sit in moe_out[b] (and are saved to moe_prev_cache[orig_t]), while
+# bypassed tokens restore their cached output from moe_prev_cache[orig_t] into moe_out[b]!
+@always_inline
+def sync_moe_subspace_cache[
+    dtype: DType = DType.float16
+](
+    moe_out: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    moe_prev_cache: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    active_canvas_idx: UnsafePointer[Int, _],
+    ffn_keep_b: UnsafePointer[Int, _],
+    B: Int,
+    ffn_active_len: Int,
+    dim: Int,
+):
+    if B <= 0 or dim <= 0:
+        return
+    var has_idx = Int(active_canvas_idx) != 0
+    var cur_idx = 0
+    for b in range(B):
+        var orig_t = active_canvas_idx[b] if has_idx else b
+        var row = moe_out + b * dim
+        var cache_row = moe_prev_cache + orig_t * dim
+        if cur_idx < ffn_active_len and ffn_keep_b[cur_idx] == b:
+            var d = 0
+            while d + 7 < dim:
+                cache_row.store(d, row.load[8](d))
+                d += 8
+            while d < dim:
+                cache_row[d] = row[d]
+                d += 1
+            cur_idx += 1
+        else:
+            var d = 0
+            while d + 7 < dim:
+                row.store(d, cache_row.load[8](d))
+                d += 8
+            while d < dim:
+                row[d] = cache_row[d]
+                d += 1
+
+
+# Scatters newly evaluated FFN/MoE outputs for ffn_keep_b[0..ffn_active_len-1] into ffn_full_out
+# and updates ffn_prev_cache[orig_t], while restoring ffn_prev_cache[orig_t] for bypassed tokens!
+@always_inline
+def scatter_and_restore_ffn_subspace[
+    dtype: DType = DType.float16
+](
+    ffn_sub_out: UnsafePointer[Scalar[dtype], _],
+    ffn_prev_cache: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ffn_full_out: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    active_canvas_idx: UnsafePointer[Int, _],
+    ffn_keep_b: UnsafePointer[Int, _],
+    B: Int,
+    ffn_active_len: Int,
+    dim: Int,
+):
+    if B <= 0 or dim <= 0:
+        return
+    var has_idx = Int(active_canvas_idx) != 0
+    var cur_idx = 0
+    for b in range(B):
+        var orig_t = active_canvas_idx[b] if has_idx else b
+        var dst_row = ffn_full_out + b * dim
+        var cache_row = ffn_prev_cache + orig_t * dim
+        if cur_idx < ffn_active_len and ffn_keep_b[cur_idx] == b:
+            var src_row = ffn_sub_out + cur_idx * dim
+            var d = 0
+            while d + 7 < dim:
+                var v = src_row.load[8](d)
+                dst_row.store(d, v)
+                cache_row.store(d, v)
+                d += 8
+            while d < dim:
+                var v = src_row[d]
+                dst_row[d] = v
+                cache_row[d] = v
+                d += 1
+            cur_idx += 1
+        else:
+            var d = 0
+            while d + 7 < dim:
+                dst_row.store(d, cache_row.load[8](d))
+                d += 8
+            while d < dim:
+                dst_row[d] = cache_row[d]
+                d += 1
+
+
+# Detects Global Attention heads that act as pure BOS sinks across all B active canvas tokens:
+# sink_mask[h] = True iff max_{b, d} |attn_out[b, h, d] - v_bos[h // kv_group_size, d]| <= eps_sink.
+@always_inline
+def detect_bos_sink_heads[
+    in_type: DType = DType.float16
+](
+    attn_out: UnsafePointer[Scalar[in_type], _],
+    v_bos: UnsafePointer[Scalar[in_type], _],
+    sink_mask: UnsafePointer[Bool, MutAnyOrigin],
+    B: Int,
+    num_heads: Int,
+    head_dim: Int,
+    kv_group_size: Int = 1,
+    eps_sink: Float32 = 1e-3,
+) -> Int:
+    if B <= 0 or num_heads <= 0 or head_dim <= 0:
+        return 0
+    var c_in = num_heads * head_dim
+    var grp = kv_group_size if kv_group_size > 0 else 1
+    var num_sinks = 0
+    for h in range(num_heads):
+        var kv_h = h // grp
+        var v_row = v_bos + kv_h * head_dim
+        var is_sink = True
+        for b in range(B):
+            var a_row = attn_out + b * c_in + h * head_dim
+            var d = 0
+            var max_diff: Float32 = 0.0
+            while d + 7 < head_dim:
+                var va = a_row.load[8](d).cast[DType.float32]()
+                var vb = v_row.load[8](d).cast[DType.float32]()
+                var m = abs(va - vb).reduce_max()
+                if m > max_diff:
+                    max_diff = m
+                d += 8
+            while d < head_dim:
+                var m = abs(Float32(a_row[d]) - Float32(v_row[d]))
+                if m > max_diff:
+                    max_diff = m
+                d += 1
+            if max_diff > eps_sink:
+                is_sink = False
+                break
+        sink_mask[h] = is_sink
+        if is_sink:
+            num_sinks += 1
+    return num_sinks
+
+
+# BOS-Sink Head Precomputation & Wo Slice Bypass on Global Attention Layers (llm-mojo-yj4.7).
+# Partitions heads into sink_heads (sink_mask[h] == True, where attn_out[b, h] == v_bos[h] for all b)
+# and active_heads (sink_mask[h] == False). Computes the sink contribution c_sink[r] ONCE per row
+# against v_bos, and runs the B-token 4x3 FMA only over the compacted non-sink head columns!
+@always_inline
+def q4_wo_bos_sink_bypass[
+    in_type: DType = DType.float16,
+    out_type: DType = DType.float32,
+](
+    Wo_packed: UnsafePointer[UInt8, _],
+    Wo_scales: UnsafePointer[Float32, _],
+    attn_out: UnsafePointer[Scalar[in_type], _],
+    v_bos: UnsafePointer[Scalar[in_type], _],
+    sink_mask: UnsafePointer[Bool, _],
+    out_ptr: UnsafePointer[Scalar[out_type], MutAnyOrigin],
+    B: Int,
+    num_heads: Int,
+    head_dim: Int,
+    c_out: Int,
+    num_tasks: Int,
+    kv_group_size: Int = 1,
+    prealloc_act_deint: UnsafePointer[Float32, MutAnyOrigin] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
+):
+    if B <= 0 or num_heads <= 0 or head_dim <= 0 or c_out <= 0:
+        return
+    var c_in = num_heads * head_dim
+    var grp = kv_group_size if kv_group_size > 0 else 1
+    if Int(sink_mask) == 0 or Int(v_bos) == 0 or (head_dim % 32 != 0) or num_heads > 64 or c_in > 8192:
+        q4_gemm_l1_2x4[in_type, out_type](
+            Wo_packed, Wo_scales, attn_out, out_ptr, B, c_in, c_out, num_tasks
+        )
+        return
+
+    var sink_arr = InlineArray[Int, 64](uninitialized=True)
+    var act_arr = InlineArray[Int, 64](uninitialized=True)
+    var sink_heads = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=sink_arr)))
+    var act_heads = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=act_arr)))
+    var num_sink = 0
+    var num_act = 0
+    for h in range(num_heads):
+        if sink_mask[h]:
+            sink_heads[num_sink] = h
+            num_sink += 1
+        else:
+            act_heads[num_act] = h
+            num_act += 1
+
+    if num_sink == 0:
+        q4_gemm_l1_2x4[in_type, out_type](
+            Wo_packed, Wo_scales, attn_out, out_ptr, B, c_in, c_out, num_tasks
+        )
+        _ = sink_arr[0]
+        _ = act_arr[0]
+        return
+
+    var sink_dim = num_sink * head_dim
+    var act_dim = num_act * head_dim
+    var head_blocks = head_dim // 32
+    var head_packed = head_dim // 2
+    var c_in_blocks = c_in // 32
+    var c_in_packed = c_in // 2
+
+    # Pre-deinterleave v_bos for sink heads (1 vector of length sink_dim)
+    var v_sink_arr = InlineArray[Float32, 8192](uninitialized=True)
+    var v_sink_deint = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=v_sink_arr)))
+    for sh in range(num_sink):
+        var h = sink_heads[sh]
+        var kv_h = h // grp
+        deinterleave_batch_to_f32[in_type](v_bos + kv_h * head_dim, v_sink_deint + sh * head_dim, 1, head_dim)
+
+    # Pre-deinterleave attn_out for active (non-sink) heads across all B tokens
+    var x_act_stack = InlineArray[Float32, 65536](uninitialized=True)
+    var x_act_deint = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=x_act_stack)))
+    if num_act > 0 and B * act_dim > 65536:
+        if Int(prealloc_act_deint) != 0:
+            x_act_deint = prealloc_act_deint
+        else:
+            q4_gemm_l1_2x4[in_type, out_type](
+                Wo_packed, Wo_scales, attn_out, out_ptr, B, c_in, c_out, num_tasks
+            )
+            _ = v_sink_arr[0]
+            _ = sink_arr[0]
+            _ = act_arr[0]
+            return
+
+    if num_act > 0:
+        for b in range(B):
+            var src_b = attn_out + b * c_in
+            var dst_b = x_act_deint + b * act_dim
+            for ah in range(num_act):
+                var h = act_heads[ah]
+                deinterleave_batch_to_f32[in_type](src_b + h * head_dim, dst_b + ah * head_dim, 1, head_dim)
+
+    var tasks = num_tasks
+    if tasks > c_out:
+        tasks = c_out
+    if tasks < 1:
+        tasks = 1
+    var chunk_size = c_out // tasks
+
+    def worker(t: Int) capturing -> None:
+        var start_r = t * chunk_size
+        var end_r = (t + 1) * chunk_size if t < tasks - 1 else c_out
+
+        var w_arr0 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr1 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr2 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_arr3 = InlineArray[Float32, 8192](uninitialized=True)
+        var w_buf0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr0)))
+        var w_buf1 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr1)))
+        var w_buf2 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr2)))
+        var w_buf3 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=w_arr3)))
+
+        var r = start_r
+        while r + 3 < end_r:
+            var r0 = r
+            var r1 = r + 1
+            var r2 = r + 2
+            var r3 = r + 3
+
+            # Step 1: Compute 1-token BOS-sink bias c_sink0..3 for rows r0..r3
+            for sh in range(num_sink):
+                var h = sink_heads[sh]
+                var p_off = h * head_packed
+                var s_off = h * head_blocks
+                var d_off = sh * head_dim
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r0 * c_in_packed + p_off, Wo_scales + r0 * c_in_blocks + s_off, w_buf0 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r1 * c_in_packed + p_off, Wo_scales + r1 * c_in_blocks + s_off, w_buf1 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r2 * c_in_packed + p_off, Wo_scales + r2 * c_in_blocks + s_off, w_buf2 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r3 * c_in_packed + p_off, Wo_scales + r3 * c_in_blocks + s_off, w_buf3 + d_off, head_blocks
+                )
+
+            var s0 = SIMD[DType.float32, 8](0.0)
+            var s1 = SIMD[DType.float32, 8](0.0)
+            var s2 = SIMD[DType.float32, 8](0.0)
+            var s3 = SIMD[DType.float32, 8](0.0)
+            for k in range(0, sink_dim, 8):
+                var vs = v_sink_deint.load[8](k)
+                s0 = w_buf0.load[8](k).fma(vs, s0)
+                s1 = w_buf1.load[8](k).fma(vs, s1)
+                s2 = w_buf2.load[8](k).fma(vs, s2)
+                s3 = w_buf3.load[8](k).fma(vs, s3)
+            var c_sink_v = SIMD[DType.float32, 4](
+                s0.reduce_add(), s1.reduce_add(), s2.reduce_add(), s3.reduce_add()
+            )
+
+            if num_act == 0:
+                var out_v = c_sink_v.cast[out_type]()
+                for b in range(B):
+                    out_ptr.store(b * c_out + r0, out_v)
+                r += 4
+                continue
+
+            # Step 2: Unpack only non-sink head slices of Wo and run 4x3 FMA across B tokens
+            for ah in range(num_act):
+                var h = act_heads[ah]
+                var p_off = h * head_packed
+                var s_off = h * head_blocks
+                var d_off = ah * head_dim
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r0 * c_in_packed + p_off, Wo_scales + r0 * c_in_blocks + s_off, w_buf0 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r1 * c_in_packed + p_off, Wo_scales + r1 * c_in_blocks + s_off, w_buf1 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r2 * c_in_packed + p_off, Wo_scales + r2 * c_in_blocks + s_off, w_buf2 + d_off, head_blocks
+                )
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r3 * c_in_packed + p_off, Wo_scales + r3 * c_in_blocks + s_off, w_buf3 + d_off, head_blocks
+                )
+
+            var b = 0
+            while b + 2 < B:
+                var acc00 = SIMD[DType.float32, 8](0.0)
+                var acc01 = SIMD[DType.float32, 8](0.0)
+                var acc02 = SIMD[DType.float32, 8](0.0)
+                var acc10 = SIMD[DType.float32, 8](0.0)
+                var acc11 = SIMD[DType.float32, 8](0.0)
+                var acc12 = SIMD[DType.float32, 8](0.0)
+                var acc20 = SIMD[DType.float32, 8](0.0)
+                var acc21 = SIMD[DType.float32, 8](0.0)
+                var acc22 = SIMD[DType.float32, 8](0.0)
+                var acc30 = SIMD[DType.float32, 8](0.0)
+                var acc31 = SIMD[DType.float32, 8](0.0)
+                var acc32 = SIMD[DType.float32, 8](0.0)
+
+                var xb0 = (b + 0) * act_dim
+                var xb1 = (b + 1) * act_dim
+                var xb2 = (b + 2) * act_dim
+                for k in range(0, act_dim, 8):
+                    var w0 = w_buf0.load[8](k)
+                    var w1 = w_buf1.load[8](k)
+                    var w2 = w_buf2.load[8](k)
+                    var w3 = w_buf3.load[8](k)
+
+                    var x0 = x_act_deint.load[8](xb0 + k)
+                    acc00 = w0.fma(x0, acc00)
+                    acc10 = w1.fma(x0, acc10)
+                    acc20 = w2.fma(x0, acc20)
+                    acc30 = w3.fma(x0, acc30)
+
+                    var x1 = x_act_deint.load[8](xb1 + k)
+                    acc01 = w0.fma(x1, acc01)
+                    acc11 = w1.fma(x1, acc11)
+                    acc21 = w2.fma(x1, acc21)
+                    acc31 = w3.fma(x1, acc31)
+
+                    var x2 = x_act_deint.load[8](xb2 + k)
+                    acc02 = w0.fma(x2, acc02)
+                    acc12 = w1.fma(x2, acc12)
+                    acc22 = w2.fma(x2, acc22)
+                    acc32 = w3.fma(x2, acc32)
+
+                var v0 = SIMD[DType.float32, 4](
+                    acc00.reduce_add(), acc10.reduce_add(), acc20.reduce_add(), acc30.reduce_add()
+                ) + c_sink_v
+                var v1 = SIMD[DType.float32, 4](
+                    acc01.reduce_add(), acc11.reduce_add(), acc21.reduce_add(), acc31.reduce_add()
+                ) + c_sink_v
+                var v2 = SIMD[DType.float32, 4](
+                    acc02.reduce_add(), acc12.reduce_add(), acc22.reduce_add(), acc32.reduce_add()
+                ) + c_sink_v
+                out_ptr.store((b + 0) * c_out + r0, v0.cast[out_type]())
+                out_ptr.store((b + 1) * c_out + r0, v1.cast[out_type]())
+                out_ptr.store((b + 2) * c_out + r0, v2.cast[out_type]())
+                b += 3
+
+            while b < B:
+                var acc0 = SIMD[DType.float32, 8](0.0)
+                var acc1 = SIMD[DType.float32, 8](0.0)
+                var acc2 = SIMD[DType.float32, 8](0.0)
+                var acc3 = SIMD[DType.float32, 8](0.0)
+                var xb = b * act_dim
+                for k in range(0, act_dim, 8):
+                    var x0 = x_act_deint.load[8](xb + k)
+                    acc0 = w_buf0.load[8](k).fma(x0, acc0)
+                    acc1 = w_buf1.load[8](k).fma(x0, acc1)
+                    acc2 = w_buf2.load[8](k).fma(x0, acc2)
+                    acc3 = w_buf3.load[8](k).fma(x0, acc3)
+                var vb = SIMD[DType.float32, 4](
+                    acc0.reduce_add(), acc1.reduce_add(), acc2.reduce_add(), acc3.reduce_add()
+                ) + c_sink_v
+                out_ptr.store(b * c_out + r0, vb.cast[out_type]())
+                b += 1
+
+            r += 4
+
+        while r < end_r:
+            var r0 = r
+            for sh in range(num_sink):
+                var h = sink_heads[sh]
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r0 * c_in_packed + h * head_packed,
+                    Wo_scales + r0 * c_in_blocks + h * head_blocks,
+                    w_buf0 + sh * head_dim,
+                    head_blocks,
+                )
+            var s0 = SIMD[DType.float32, 8](0.0)
+            for k in range(0, sink_dim, 8):
+                s0 = w_buf0.load[8](k).fma(v_sink_deint.load[8](k), s0)
+            var c_sink0 = s0.reduce_add()
+
+            if num_act == 0:
+                for b in range(B):
+                    out_ptr[b * c_out + r0] = c_sink0.cast[out_type]()
+                r += 1
+                continue
+
+            for ah in range(num_act):
+                var h = act_heads[ah]
+                unpack_row_deinterleaved_prescaled(
+                    Wo_packed + r0 * c_in_packed + h * head_packed,
+                    Wo_scales + r0 * c_in_blocks + h * head_blocks,
+                    w_buf0 + ah * head_dim,
+                    head_blocks,
+                )
+            for b in range(B):
+                var acc0 = SIMD[DType.float32, 8](0.0)
+                var xb = b * act_dim
+                for k in range(0, act_dim, 8):
+                    acc0 = w_buf0.load[8](k).fma(x_act_deint.load[8](xb + k), acc0)
+                out_ptr[b * c_out + r0] = (acc0.reduce_add() + c_sink0).cast[out_type]()
+            r += 1
+
+        _ = w_arr0[0]
+        _ = w_arr1[0]
+        _ = w_arr2[0]
+        _ = w_arr3[0]
+
+    if tasks == 1:
+        worker(0)
+    else:
+        parallelize[worker](tasks)
+    _ = x_act_stack[0]
+    _ = v_sink_arr[0]
+    _ = sink_arr[0]
+    _ = act_arr[0]
 
 
 # Batched Self-Conditioning MLP Forward (DiffusionGemma SC path, llm-mojo-2tc.1).
@@ -1164,6 +2808,7 @@ def sc_forward_batch[
     embed_dim: Int,
     sc_size: Int,
     num_tasks: Int,
+    pre_deint_X: UnsafePointer[Float32, MutAnyOrigin] = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
 ):
     # 1. Batched pre_norm on soft_embeds: [B, embed_dim]
     for b in range(B):
@@ -1173,6 +2818,10 @@ def sc_forward_batch[
             buf_normed + b * embed_dim,
             embed_dim,
         )
+
+    var has_pre_deint = Int(pre_deint_X) != 0 and (embed_dim % 32 == 0) and (sc_size % 32 == 0)
+    if has_pre_deint:
+        deinterleave_batch_to_f32[DType.float32](buf_normed, pre_deint_X, B, embed_dim)
 
     # 2. Fused batched gate_proj + up_proj + GeGLU: [B, embed_dim] -> [B, sc_size]
     q4_fused_gate_up_geglu_l1[DType.float32, DType.float32](
@@ -1186,7 +2835,11 @@ def sc_forward_batch[
         embed_dim,
         sc_size,
         num_tasks,
+        pre_deint_X=pre_deint_X if has_pre_deint else UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
     )
+
+    if has_pre_deint:
+        deinterleave_batch_to_f32[DType.float32](buf_gated, pre_deint_X, B, sc_size)
 
     # 3. Batched down_proj: [B, sc_size] -> [B, embed_dim]
     q4_gemm_l1_2x4[DType.float32, DType.float32](
@@ -1198,6 +2851,7 @@ def sc_forward_batch[
         sc_size,
         embed_dim,
         num_tasks,
+        pre_deint_X=pre_deint_X if has_pre_deint else UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(0)),
     )
 
     # 4. Residual + post_norm_noscale in Float32 precision, then cast to sc_out_type
@@ -1298,7 +2952,10 @@ def sample_and_soft_embed_top32_batch[
     temp: Float32,
     prompt_scale: Float32,
     num_tasks: Int = 8,
+    top2_tokens: UnsafePointer[Int, MutAnyOrigin] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
 ):
+    var has_top2 = Int(top2_tokens) != 0
+
     def token_worker(t: Int) capturing -> None:
         var logits_t = canvas_logits + t * vocab_size
         var top_vals = InlineArray[Float32, TOP_K](uninitialized=True)
@@ -1316,22 +2973,12 @@ def sample_and_soft_embed_top32_batch[
                 min_val = v
                 min_pos = k
 
-        # SIMD8 scan over remaining vocabulary:
-        # 1. Fast vector max rejection: only inspect lanes when vec.reduce_max() > min_val
-        # 2. Accumulate sum and sum_sq for 2nd-order cumulant tail partition estimate
-        var sum_vec = SIMD[DType.float32, 8](0.0)
-        var sum_sq_vec = SIMD[DType.float32, 8](0.0)
-        for k in range(0, TOP_K, 8):
-            var v0 = logits_t.load[8](k)
-            sum_vec += v0
-            sum_sq_vec = v0.fma(v0, sum_sq_vec)
-
+        # SIMD8 scan over remaining vocabulary with fast vector max rejection:
+        # only inspect individual lanes when vec.reduce_max() > min_val
         var v_idx = TOP_K
         var v_vec_end = (vocab_size // 8) * 8
         while v_idx < v_vec_end:
             var vec = logits_t.load[8](v_idx)
-            sum_vec += vec
-            sum_sq_vec = vec.fma(vec, sum_sq_vec)
             if vec.reduce_max() > min_val:
                 for lane in range(8):
                     var val = vec[lane]
@@ -1347,12 +2994,8 @@ def sample_and_soft_embed_top32_batch[
                                 min_pos = j
             v_idx += 8
 
-        var tail_sum: Float32 = sum_vec.reduce_add()
-        var tail_sum_sq: Float32 = sum_sq_vec.reduce_add()
         while v_idx < vocab_size:
             var val = logits_t[v_idx]
-            tail_sum += val
-            tail_sum_sq += val * val
             if val > min_val:
                 top_vals[min_pos] = val
                 top_idxs[min_pos] = v_idx
@@ -1381,14 +3024,11 @@ def sample_and_soft_embed_top32_batch[
                 top_idxs[best] = ti
 
         argmax_tokens[t] = top_idxs[0]
+        if has_top2:
+            top2_tokens[t] = top_idxs[1] if TOP_K > 1 else top_idxs[0]
 
-        # Subtract top-K raw logits from total sum / sum_sq to get tail moments
-        var top_raw_sum: Float32 = 0.0
-        var top_raw_sum_sq: Float32 = 0.0
         for k in range(TOP_K):
             var z = top_vals[k]
-            top_raw_sum += z
-            top_raw_sum_sq += z * z
             # Apply monotonic softcap ONLY to TOP_K logits
             top_vals[k] = (Float32(30.0) * tanh(z / Float32(30.0))) / temp
 
@@ -1404,25 +3044,22 @@ def sample_and_soft_embed_top32_batch[
             sum_exp_top += e_val
             weighted_diff_top += e_val * diff
 
-        # Cumulant tail partition estimate for exact entropy across both peaked & flat regimes
-        var n_tail = Float32(vocab_size - TOP_K)
+        # Smooth, continuous Zipfian continuation tail estimate from the K-th rank decay rate:
+        # - When flat (diff_tail -> 0), w_flat -> 1 and eff_tail_count -> (vocab_size - TOP_K) smoothly.
+        # - When peaked (diff_tail >= 0.4), w_flat -> 0 and eff_tail_count -> min(64, 1 / slope_k),
+        #   immune to -30.0 <unused*> outlier explosion in the tail.
+        var diff_tail = max_sc_logit - min_sc_logit
         var z_tail: Float32 = 0.0
-        var diff_tail: Float32 = 0.0
-        if n_tail > 0.0:
-            var mu_raw = (tail_sum - top_raw_sum) / n_tail
-            var var_raw = (tail_sum_sq - top_raw_sum_sq) / n_tail - mu_raw * mu_raw
-            if var_raw < 0.0:
-                var_raw = 0.0
-            var th_mu = tanh(mu_raw / Float32(30.0))
-            var mu_y = (Float32(30.0) * th_mu) / temp
-            var slope_y = (Float32(1.0) - th_mu * th_mu) / temp
-            var var_y = slope_y * slope_y * var_raw
-            var eff_y = mu_y + Float32(0.5) * var_y
-            if eff_y > min_sc_logit:
-                eff_y = min_sc_logit
-            diff_tail = max_sc_logit - eff_y
-            if diff_tail < 80.0:
-                z_tail = n_tail * exp(-diff_tail)
+        if diff_tail < Float32(20.0):
+            var slope_k = (top_vals[TOP_K // 2] - min_sc_logit) / Float32(TOP_K - TOP_K // 2)
+            if slope_k < Float32(0.05):
+                slope_k = Float32(0.05)
+            var base_tail = Float32(1.0) / slope_k
+            if base_tail > Float32(64.0):
+                base_tail = Float32(64.0)
+            var w_flat = exp(-diff_tail * Float32(25.0))
+            var eff_tail_count = w_flat * Float32(vocab_size - TOP_K) + (Float32(1.0) - w_flat) * base_tail
+            z_tail = eff_tail_count * exp(-diff_tail)
 
         var z_total = sum_exp_top + z_tail
         var ent = log(z_total + 1e-30) + (
@@ -1472,6 +3109,67 @@ def sample_and_soft_embed_top32_batch[
         parallelize[token_worker](B)
 
 
+@always_inline
+def resolve_adjacent_duplicate_tokens(
+    sorted_idx: UnsafePointer[Int, _],
+    eb_mask: UnsafePointer[Bool, _],
+    locked_mask: UnsafePointer[Bool, _],
+    argmax_tokens: UnsafePointer[Int, MutAnyOrigin],
+    new_tokens: UnsafePointer[Int, MutAnyOrigin],
+    top2_tokens: UnsafePointer[Int, _],
+    block_start: Int,
+    block_end: Int,
+):
+    """In ascending entropy order `sorted_idx[0 .. cur_block_len - 1]`, checks whether an unlocked
+    position `orig_idx` predicts the exact same word token (`>= 256`) as a locked or lower-entropy
+    adjacent neighbor (`orig_idx - 1` or `orig_idx + 1`). When an adjacent duplicate occurs,
+    substitutes the 2nd-best candidate `top2_tokens[orig_idx]` into `argmax_tokens[orig_idx]`
+    and `new_tokens[orig_idx]` so neither intermediate steps nor final `argmax_canvas` decode
+    can emit adjacent word stutters (e.g. 'Building Building' or 'coin coin')."""
+    var cur_block_len = block_end - block_start
+    var resolved_mask = InlineArray[Bool, 256](fill=False)
+    for t in range(block_start, block_end):
+        if locked_mask[t] or eb_mask[t]:
+            resolved_mask[t] = True
+
+    for i in range(cur_block_len):
+        var orig_idx = sorted_idx[i]
+        if locked_mask[orig_idx]:
+            resolved_mask[orig_idx] = True
+            continue
+        var cand_arg = argmax_tokens[orig_idx]
+        var cand_new = new_tokens[orig_idx]
+        var alt_tok = top2_tokens[orig_idx]
+        if alt_tok >= 0:
+            if cand_arg >= 256:
+                var dup_arg = False
+                if orig_idx > block_start and resolved_mask[orig_idx - 1] and argmax_tokens[orig_idx - 1] == cand_arg:
+                    dup_arg = True
+                if orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and argmax_tokens[orig_idx + 1] == cand_arg:
+                    dup_arg = True
+                if dup_arg and alt_tok != cand_arg:
+                    var alt_clash_arg = (
+                        (orig_idx > block_start and resolved_mask[orig_idx - 1] and argmax_tokens[orig_idx - 1] == alt_tok)
+                        or (orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and argmax_tokens[orig_idx + 1] == alt_tok)
+                    )
+                    if not alt_clash_arg:
+                        argmax_tokens[orig_idx] = alt_tok
+            if cand_new >= 256:
+                var dup_new = False
+                if orig_idx > block_start and resolved_mask[orig_idx - 1] and new_tokens[orig_idx - 1] == cand_new:
+                    dup_new = True
+                if orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and new_tokens[orig_idx + 1] == cand_new:
+                    dup_new = True
+                if dup_new and alt_tok != cand_new:
+                    var alt_clash_new = (
+                        (orig_idx > block_start and resolved_mask[orig_idx - 1] and new_tokens[orig_idx - 1] == alt_tok)
+                        or (orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and new_tokens[orig_idx + 1] == alt_tok)
+                    )
+                    if not alt_clash_new:
+                        new_tokens[orig_idx] = alt_tok
+        resolved_mask[orig_idx] = True
+
+
 # ==============================================================================
 # 3. Fast-dLLM / dKV-Cache: Progressive Active-Canvas Compaction (llm-mojo-2tc.3)
 # ==============================================================================
@@ -1501,27 +3199,29 @@ def update_locked_mask(
     locked_mask: UnsafePointer[Bool, MutAnyOrigin],
     canvas_len: Int,
     hist_len: Int,
-    freeze_entropy_thresh: Float32 = 0.05,
-    max_stable_entropy: Float32 = 0.25,
+    mean_ent: Float32 = 0.15,
+    freeze_entropy_thresh: Float32 = 0.02,
+    max_stable_entropy: Float32 = 0.08,
+    block_start: Int = 0,
+    block_end: Int = -1,
 ) -> Int:
-    """Updates `locked_mask[t]` using Fast-dLLM / dKV-Cache token freezing rules:
-    A token `t` transitions to locked when `eb_mask[t] == True` AND either:
-      1. Its argmax token has remained stable across 2 consecutive denoising steps
-         with low entropy (`hist_len >= 2 and history[t] == history[canvas_len + t] and token_entropy[t] <= max_stable_entropy`), OR
-      2. Its entropy is below `freeze_entropy_thresh` (`token_entropy[t] <= freeze_entropy_thresh`).
-    Returns the total number of locked tokens across the canvas."""
+    """Updates `locked_mask[t]` using Fast-dLLM / dKV-Cache token freezing rules with
+    anti-stutter verification:
+    A token `t` in `[block_start, eff_end)` transitions to locked when `mean_ent <= 0.30`,
+    `eb_mask[t] == True`, `hist_len >= 2`, `history[t] == history[canvas_len + t]`,
+    `token_entropy[t] <= max_stable_entropy`, and `t` does not duplicate an adjacent token."""
+    var eff_end = block_end if block_end >= 0 else canvas_len
     var num_locked = 0
-    for t in range(canvas_len):
+    for t in range(block_start, eff_end):
         if locked_mask[t]:
             num_locked += 1
-        elif eb_mask[t]:
-            var stable_2step = (
-                (hist_len >= 2)
-                and (history[t] == history[canvas_len + t])
-                and (token_entropy[t] <= max_stable_entropy)
-            )
-            var very_confident = token_entropy[t] <= freeze_entropy_thresh
-            if stable_2step or very_confident:
+        elif mean_ent <= Float32(0.30) and hist_len >= 2 and eb_mask[t] and token_entropy[t] <= max_stable_entropy:
+            var self_stable = history[t] == history[canvas_len + t]
+            if not self_stable:
+                continue
+            var no_left_dup = (t == block_start) or (history[t] != history[t - 1])
+            var no_right_dup = (t + 1 >= eff_end) or (history[t] != history[t + 1])
+            if no_left_dup and no_right_dup:
                 locked_mask[t] = True
                 num_locked += 1
     return num_locked
@@ -1565,14 +3265,20 @@ def scatter_active_sampler_outputs[
     active_len: Int,
     canvas_len: Int,
     embed_dim: Int,
+    compact_top2: UnsafePointer[Int, _] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
+    top2_tokens: UnsafePointer[Int, MutAnyOrigin] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
 ):
     """Scatters sampler outputs for the `active_len` unconverged tokens back into their
-    full canvas slots `orig_t = active_canvas_idx[b]`, while pinning locked tokens'
-    entropy to `0.0` and preserving their committed token IDs."""
+    full canvas slots `orig_t = active_canvas_idx[b]`, while smoothly cooling locked tokens'
+    entropy (`*= 0.65`) and syncing any AdaCache-skipped unlocked tokens' `new_tokens[t]`
+    with their current `canvas_tokens[t]`."""
+    var has_top2 = Int(compact_top2) != 0 and Int(top2_tokens) != 0
     for t in range(canvas_len):
         if locked_mask[t]:
-            token_entropy[t] = 0.0
+            token_entropy[t] = token_entropy[t] * Float32(0.65)
             argmax_tokens[t] = canvas_tokens[t]
+            new_tokens[t] = canvas_tokens[t]
+        else:
             new_tokens[t] = canvas_tokens[t]
 
     for b in range(active_len):
@@ -1580,6 +3286,8 @@ def scatter_active_sampler_outputs[
         token_entropy[orig_t] = compact_entropy[b]
         argmax_tokens[orig_t] = compact_argmax[b]
         new_tokens[orig_t] = compact_new_tokens[b]
+        if has_top2:
+            top2_tokens[orig_t] = compact_top2[b]
         var s_ptr = compact_sc_embeds + b * embed_dim
         var d_ptr = sc_embeds + orig_t * embed_dim
         for i in range(0, embed_dim, 8):
@@ -1621,28 +3329,20 @@ def teacache_eval_gate(
         accum_fluctuation[0] = 0.0
         return False
 
-    # Compute normalized L2/cosine fluctuation ||c - p||_2^2 / (||c||_2^2 + ||p||_2^2)
-    # over 16-token pooled semantic blocks so independent per-token re-noising variance
-    # cancels by 16x in squared norm while avoiding the sqrt(2*(1-rho)) L1 singularity.
+    # Compute unpooled per-token normalized L2 fluctuation sum_b ||c_b - p_b||_2^2 / sum_b (||c_b||_2^2 + ||p_b||_2^2)
+    # so any re-noised token immediately prevents premature mid-layer skipping.
     var diff_sq_vec = SIMD[DType.float32, 8](0.0)
     var sum_sq_vec = SIMD[DType.float32, 8](0.0)
-    var block_step = 16 if active_len >= 16 else active_len
-    var b_start = 0
-    while b_start < active_len:
-        var b_end = b_start + block_step
-        if b_end > active_len:
-            b_end = active_len
+    for b in range(active_len):
+        var orig_t = active_canvas_idx[b]
+        var c_ptr = h_curr + b * embed_dim
+        var p_ptr = h_prev_full + orig_t * embed_dim
         for i in range(0, embed_dim, 8):
-            var sum_c = SIMD[DType.float32, 8](0.0)
-            var sum_p = SIMD[DType.float32, 8](0.0)
-            for b in range(b_start, b_end):
-                var orig_t = active_canvas_idx[b]
-                sum_c += (h_curr + b * embed_dim).load[8](i).cast[DType.float32]()
-                sum_p += (h_prev_full + orig_t * embed_dim).load[8](i).cast[DType.float32]()
-            var d_v = sum_c - sum_p
+            var c_v = c_ptr.load[8](i).cast[DType.float32]()
+            var p_v = p_ptr.load[8](i).cast[DType.float32]()
+            var d_v = c_v - p_v
             diff_sq_vec = d_v.fma(d_v, diff_sq_vec)
-            sum_sq_vec = sum_c.fma(sum_c, sum_p.fma(sum_p, sum_sq_vec))
-        b_start = b_end
+            sum_sq_vec = c_v.fma(c_v, p_v.fma(p_v, sum_sq_vec))
 
     var raw_l1 = diff_sq_vec.reduce_add() / (sum_sq_vec.reduce_add() + Float32(1e-6))
 
@@ -1880,27 +3580,15 @@ def taylorseer_forecast_skipped_step(
 
 @always_inline
 def compute_moe_lod_k(denoise_step: Int, mean_ent: Float32) -> Int:
-    """Returns active Top-K expert budget based on diffusion noise/entropy phase:
-      - Phase 1 (Chaos / High-Noise, step == 0 or mean_ent > 2.5): Top-2
-      - Phase 2 (Structure Formation, 0.5 < mean_ent <= 2.5): Top-4
-      - Phase 3 (Fine Lock-In, mean_ent <= 0.5): Top-8"""
-    if denoise_step == 0 or mean_ent > Float32(2.5):
-        return 2
-    elif mean_ent > Float32(0.5):
-        return 4
-    else:
-        return 8
+    """Returns active Top-K expert budget (full Top-8 across all denoising steps to
+    preserve 26B MoE expert mixture fidelity)."""
+    return 8
 
 
 @always_inline
 def compute_moe_lod_top_p(denoise_step: Int, mean_ent: Float32) -> Float32:
     """Returns nucleus cumulative probability threshold `moe_top_p` for MoE routing."""
-    if denoise_step == 0 or mean_ent > Float32(2.5):
-        return Float32(0.65)
-    elif mean_ent > Float32(0.5):
-        return Float32(0.80)
-    else:
-        return Float32(0.92)
+    return Float32(1.0)
 
 
 @always_inline
@@ -1913,80 +3601,46 @@ def apply_moe_lod_and_set_cover(
     top_k_experts: Int,
     active_top_k: Int,
     moe_top_p: Float32,
+    eb_mask: UnsafePointer[Bool, _] = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=Int(0)),
+    active_canvas_idx: UnsafePointer[Int, _] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
+    unaccepted_top_k: Int = 2,
 ):
-    """Applies Noise-Scheduled MoE Level-of-Detail (Top-2 -> Top-4 -> Top-8 + Top-P)
-    and Subbatch Set-Cover singleton pruning (pruning secondary slots `s >= 1` whose
-    expert is only routed to a single token across the canvas, folding their probability
-    mass into the token's primary expert before applying `router_per_expert_scale`)."""
+    """Computes Gemma-4 / DiffusionGemma router expert weights for the active canvas tokens:
+    - When `eb_mask` is provided (llm-mojo-yj4.3), already-accepted tokens (`eb_mask[orig_t] == True`)
+      retain their full `active_top_k` (Top-8) budget with unmodified `norm_p >= 0.05` weights, while
+      unaccepted tokens (`eb_mask[orig_t] == False`, whose input was just replaced by random noise)
+      use `unaccepted_top_k` (Top-2) energy-conserved routing.
+    - Applied before expert bucket grouping so the inner expert GEMM has zero added branches."""
     var eff_k = active_top_k if active_top_k <= top_k_experts else top_k_experts
     if eff_k < 1:
         eff_k = 1
-
-    # Pass 1: Per-token LOD truncation (active_top_k & moe_top_p) + probability normalization
-    var expert_counts = InlineArray[Int, 128](uninitialized=True)
-    for e in range(128):
-        expert_counts[e] = 0
+    var unacc_k = unaccepted_top_k if unaccepted_top_k <= eff_k else eff_k
+    if unacc_k < 1:
+        unacc_k = 1
+    var has_eb = Int(eb_mask) != 0
+    var has_map = Int(active_canvas_idx) != 0
 
     for b in range(B):
+        var orig_t = active_canvas_idx[b] if has_map else b
+        var is_accepted = eb_mask[orig_t] if has_eb else True
+        var tok_k = eff_k if is_accepted else unacc_k
+
         var top_i = canvas_top_idx + b * top_k_experts
         var top_v = canvas_top_val + b * top_k_experts
         var top_w = canvas_top_weights + b * top_k_experts
 
-        var sum_all: Float32 = 0.0
-        for s in range(top_k_experts):
+        var sum_denom: Float32 = 0.0
+        var denom_slots = tok_k
+        for s in range(denom_slots):
             if top_i[s] >= 0:
-                sum_all += top_v[s]
-        var inv_sum_all = Float32(1.0) / (sum_all + Float32(1e-10))
+                sum_denom += top_v[s]
+        var inv_sum = Float32(1.0) / (sum_denom + Float32(1e-10))
 
-        var cum_p: Float32 = 0.0
-        var sum_kept: Float32 = 0.0
         for s in range(top_k_experts):
             var idx = top_i[s]
-            var norm_p = top_v[s] * inv_sum_all
-            if s == 0 and idx >= 0:
-                top_w[s] = norm_p
-                cum_p += norm_p
-                sum_kept += norm_p
-            elif s < eff_k and idx >= 0 and norm_p >= Float32(0.05) and cum_p < moe_top_p:
-                top_w[s] = norm_p
-                cum_p += norm_p
-                sum_kept += norm_p
-            else:
-                top_w[s] = 0.0
-
-        # Renormalize retained probabilities to sum to 1.0 (temporarily stored in top_w before per-expert scale)
-        var inv_kept = Float32(1.0) / (sum_kept + Float32(1e-10))
-        for s in range(eff_k):
-            var e = top_i[s]
-            if top_w[s] > 0.0 and e >= 0 and e < 128:
-                top_w[s] = top_w[s] * inv_kept
-                expert_counts[e] += 1
-            else:
-                top_w[s] = 0.0
-
-    # Pass 2: Subbatch Set-Cover singleton pruning on secondary slots (when eff_k < top_k_experts) + per-expert scaling
-    var prune_singletons = eff_k < top_k_experts
-    for b in range(B):
-        var top_i = canvas_top_idx + b * top_k_experts
-        var top_w = canvas_top_weights + b * top_k_experts
-
-        if prune_singletons:
-            var folded_mass: Float32 = 0.0
-            for s in range(1, eff_k):
-                var prob_s = top_w[s]
-                var e = top_i[s]
-                if prob_s > 0.0 and e >= 0 and e < 128:
-                    if expert_counts[e] == 1:
-                        folded_mass += prob_s
-                        top_w[s] = 0.0
-            if folded_mass > 0.0 and top_i[0] >= 0:
-                top_w[0] += folded_mass
-
-        for s in range(eff_k):
-            var prob_s = top_w[s]
-            var e = top_i[s]
-            if prob_s > 0.0 and e >= 0 and e < 128:
-                top_w[s] = prob_s * router_per_expert_scale[e]
+            var norm_p = top_v[s] * inv_sum
+            if s < tok_k and idx >= 0 and idx < 128 and norm_p >= Float32(0.05):
+                top_w[s] = norm_p * router_per_expert_scale[idx]
             else:
                 top_w[s] = 0.0
 
@@ -2397,30 +4051,19 @@ def adacache_filter_after_layer1(
     adacache_h1_prev: UnsafePointer[Float16, MutAnyOrigin],
     active_canvas_idx: UnsafePointer[Int, MutAnyOrigin],
     adacache_skip_streak: UnsafePointer[Int, MutAnyOrigin],
+    eb_mask: UnsafePointer[Bool, _],
     active_len: Int,
     embed_dim: Int,
     denoise_step: Int,
-    k_slow: Int = 3,
-    tau_ada: Float32 = 0.08,
+    k_slow: Int = 2,
+    tau_ada: Float32 = 0.015,
 ) -> Int:
     """Evaluates per-token normalized squared-L2 hidden-state fluctuation after Layer 1
-    (`l == 1`, where self-conditioning and 2 layers of bidirectional context have been fused),
-    applies Motion Regularization (`MoReg`) to determine the active token budget (rounded
-    to a multiple of 16 for iGPU 16x16 matmul tiles), enforces periodic full refresh every
-    `k_slow` steps (`adacache_skip_streak[orig_t] < k_slow - 1`), and compacts `canvas_hidden`
-    and `active_canvas_idx` in-place in strictly monotonic order."""
-    if active_len <= 16:
-        for b in range(active_len):
-            var orig_t = active_canvas_idx[b]
-            var h_curr = canvas_hidden + b * embed_dim
-            var h_prev = adacache_h1_prev + orig_t * embed_dim
-            for i in range(0, embed_dim, 16):
-                h_prev.store[16](i, h_curr.load[16](i))
-            adacache_skip_streak[orig_t] = 0
-        return active_len
-
-    # Warmup steps 0 and 1: record h1_prev and keep 100% of active_len so TaylorSeer & caches warm up
-    if denoise_step < 2:
+    (`l == 1`). Crucially, unaccepted tokens (`not eb_mask[orig_t]`, whose input token ID
+    was just randomly re-noised) are ALWAYS forced to evaluate all 30 layers + logit projection;
+    only previously accepted quasi-static tokens (`eb_mask[orig_t] == True` with
+    `raw_fluct < tau_ada`) are eligible for Layer 2..29 skipping."""
+    if active_len <= 16 or denoise_step < 2:
         for b in range(active_len):
             var orig_t = active_canvas_idx[b]
             var h_curr = canvas_hidden + b * embed_dim
@@ -2431,13 +4074,9 @@ def adacache_filter_after_layer1(
         return active_len
 
     var max_consec_skip = (k_slow - 1) if k_slow > 1 else 0
-    var fluct_scores = InlineArray[Float32, 256](uninitialized=True)
-    var eff_priority = InlineArray[Float32, 256](uninitialized=True)
     var keep_mask = InlineArray[Bool, 256](uninitialized=True)
-
-    var sum_fluct: Float32 = 0.0
-    var num_above_tau: Int = 0
-    var num_forced: Int = 0
+    var fluct = InlineArray[Float32, 256](uninitialized=True)
+    var num_keep = 0
 
     for b in range(active_len):
         var orig_t = active_canvas_idx[b]
@@ -2452,79 +4091,68 @@ def adacache_filter_after_layer1(
             var d = c - p
             diff_sq_vec = d.fma(d, diff_sq_vec)
             norm_sq_vec = c.fma(c, p.fma(p, norm_sq_vec))
-            h_prev.store[8](i, c.cast[DType.float16]())
 
         var raw_fluct = diff_sq_vec.reduce_add() / (norm_sq_vec.reduce_add() + Float32(1e-8))
-        fluct_scores[b] = raw_fluct
-        sum_fluct += raw_fluct
-
+        fluct[b] = raw_fluct
         var streak = adacache_skip_streak[orig_t]
-        if streak >= max_consec_skip:
-            # Periodic refresh invariant: force evaluation after k_slow - 1 skips
-            eff_priority[b] = Float32(1e9) + raw_fluct
-            num_forced += 1
-            num_above_tau += 1
-        elif raw_fluct < tau_ada:
-            # Explicitly below absolute fluctuation threshold -> candidate for skipping
-            eff_priority[b] = raw_fluct * Float32(0.5)
+
+        # Never skip a re-noised/unaccepted token (`not eb_mask[orig_t]`)!
+        if (not eb_mask[orig_t]) or (streak >= max_consec_skip) or (raw_fluct >= tau_ada):
+            keep_mask[b] = True
+            num_keep += 1
         else:
-            # Boost tokens that skipped the previous step by 1.25x so refresh rotates smoothly
-            var boost = Float32(1.25) if streak > 0 else Float32(1.0)
-            eff_priority[b] = raw_fluct * boost
-            num_above_tau += 1
+            keep_mask[b] = False
 
-    var mean_fluct = sum_fluct / Float32(active_len)
-
-    # Motion Regularization (MoReg): scale target active fraction based on canvas-wide mean fluctuation
-    var moreg_cap: Int
-    if mean_fluct < Float32(0.15):
-        moreg_cap = (active_len * 4) // 8  # 50% active
-    elif mean_fluct < Float32(0.35):
-        moreg_cap = (active_len * 5) // 8  # 62.5% active (e.g. 160 / 256)
-    else:
-        moreg_cap = (active_len * 6) // 8  # 75% active (e.g. 192 / 256)
-
-    var target_active = num_above_tau if num_above_tau < moreg_cap else moreg_cap
-    if target_active < num_forced:
-        target_active = num_forced
-    if target_active < 16:
-        target_active = 16
-    # Round up to a multiple of 16 (capped at active_len) for 100% iGPU 16x16 matmul tile occupancy
-    target_active = ((target_active + 15) // 16) * 16
-    if target_active >= active_len:
+    if num_keep >= active_len:
         for b in range(active_len):
-            adacache_skip_streak[active_canvas_idx[b]] = 0
+            var orig_t = active_canvas_idx[b]
+            var h_curr = canvas_hidden + b * embed_dim
+            var h_prev = adacache_h1_prev + orig_t * embed_dim
+            for i in range(0, embed_dim, 16):
+                h_prev.store[16](i, h_curr.load[16](i))
+            adacache_skip_streak[orig_t] = 0
         return active_len
 
-    # Select top `target_active` tokens by `eff_priority`
-    var sorted_b = InlineArray[Int, 256](uninitialized=True)
-    for b in range(active_len):
-        sorted_b[b] = b
-        keep_mask[b] = False
+    # Round target_active up to a multiple of 16 for iGPU 16x16 matmul tiles
+    var target_active = ((num_keep + 15) // 16) * 16
+    if target_active < 16:
+        target_active = 16
+    if target_active >= active_len:
+        for b in range(active_len):
+            var orig_t = active_canvas_idx[b]
+            var h_curr = canvas_hidden + b * embed_dim
+            var h_prev = adacache_h1_prev + orig_t * embed_dim
+            for i in range(0, embed_dim, 16):
+                h_prev.store[16](i, h_curr.load[16](i))
+            adacache_skip_streak[orig_t] = 0
+        return active_len
 
-    for i in range(target_active):
-        var best_j = i
-        var best_val = eff_priority[sorted_b[i]]
-        for j in range(i + 1, active_len):
-            var v = eff_priority[sorted_b[j]]
-            if v > best_val:
-                best_val = v
-                best_j = j
-        if best_j != i:
-            var tmp = sorted_b[i]
-            sorted_b[i] = sorted_b[best_j]
-            sorted_b[best_j] = tmp
-        keep_mask[sorted_b[i]] = True
+    while num_keep < target_active:
+        var best_b = -1
+        var best_f: Float32 = -1.0
+        for b in range(active_len):
+            if not keep_mask[b] and fluct[b] > best_f:
+                best_f = fluct[b]
+                best_b = b
+        if best_b < 0:
+            break
+        keep_mask[best_b] = True
+        num_keep += 1
 
-    # In-place monotonic compaction of canvas_hidden and active_canvas_idx
+    # In-place monotonic compaction of canvas_hidden and active_canvas_idx.
+    # Only update adacache_h1_prev[orig_t] for KEPT tokens so skipped tokens preserve
+    # cumulative drift relative to the last step where Layers 2..29 were evaluated!
     var write_idx = 0
     for b in range(active_len):
         var orig_t = active_canvas_idx[b]
         if keep_mask[b]:
             adacache_skip_streak[orig_t] = 0
+            var src_ptr = canvas_hidden + b * embed_dim
+            var h_prev = adacache_h1_prev + orig_t * embed_dim
+            for i in range(0, embed_dim, 16):
+                h_prev.store[16](i, src_ptr.load[16](i))
             if write_idx != b:
                 active_canvas_idx[write_idx] = orig_t
-                var src_ptr = canvas_hidden + b * embed_dim
                 var dst_ptr = canvas_hidden + write_idx * embed_dim
                 for i in range(0, embed_dim, 16):
                     dst_ptr.store[16](i, src_ptr.load[16](i))

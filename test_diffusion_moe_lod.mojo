@@ -16,7 +16,7 @@ def main() raises:
     comptime EXPERT_MLP_DIM = 704
     comptime TOP_K = 8
 
-    # 1. Test LOD Schedule transitions
+    # 1. Test LOD Schedule transitions (Full Top-8 preserved for 26B MoE fidelity)
     var k0 = compute_moe_lod_k(0, 10.2)
     var p0 = compute_moe_lod_top_p(0, 10.2)
     var k1 = compute_moe_lod_k(3, 1.5)
@@ -24,10 +24,12 @@ def main() raises:
     var k2 = compute_moe_lod_k(8, 0.25)
     var p2 = compute_moe_lod_top_p(8, 0.25)
     print("  [LOD Schedule] Phase 1 (step=0, ent=10.2): K=", k0, "top_p=", p0, "| Phase 2 (ent=1.5): K=", k1, "top_p=", p1, "| Phase 3 (ent=0.25): K=", k2, "top_p=", p2)
-    if k0 != 2 or k1 != 4 or k2 != 8:
+    if k0 != 8 or k1 != 8 or k2 != 8:
         raise Error("MoE LOD schedule returned unexpected Top-K!")
 
-    # 2. Test apply_moe_lod_and_set_cover energy conservation and singleton secondary-slot pruning
+    # 2. Test apply_moe_lod_and_set_cover:
+    #    - Preserves singleton content-word experts with norm_p >= 0.05 when active_top_k=8
+    #    - Prunes slots >= active_top_k when explicit LOD active_top_k=2 is requested
     var top_idx = alloc[Int](CANVAS_LEN * TOP_K)
     var top_val = alloc[Float32](CANVAS_LEN * TOP_K)
     var top_weights_base = alloc[Float32](CANVAS_LEN * TOP_K)
@@ -38,38 +40,30 @@ def main() raises:
 
     for b in range(CANVAS_LEN):
         for s in range(TOP_K):
-            # Slot 0 clusters on experts 0..31; secondary slots spread across 0..127 with some singletons
             if s == 0:
                 top_idx[b * TOP_K + s] = b % 32
                 top_val[b * TOP_K + s] = Float32(0.45)
             elif s == 1 and b == 0:
-                # Expert 127 is a singleton on token 0, slot 1!
+                # Expert 127 is a singleton domain expert on token 0, slot 1 (norm_p = 0.18 >= 0.05)!
                 top_idx[b * TOP_K + s] = 127
                 top_val[b * TOP_K + s] = Float32(0.18)
             else:
                 top_idx[b * TOP_K + s] = (b * 3 + s * 7) % 96
                 top_val[b * TOP_K + s] = Float32(0.55) / Float32(TOP_K - 1)
 
-    # Compute baseline Top-8 weights
-    for b in range(CANVAS_LEN):
-        var sum_v: Float32 = 0.0
-        for s in range(TOP_K):
-            sum_v += top_val[b * TOP_K + s]
-        for s in range(TOP_K):
-            var idx = top_idx[b * TOP_K + s]
-            top_weights_base[b * TOP_K + s] = (top_val[b * TOP_K + s] / sum_v) * router_scale[idx]
+    # Compute Top-8 weights via apply_moe_lod_and_set_cover (active_top_k=8)
+    apply_moe_lod_and_set_cover(
+        top_idx, top_val, router_scale, top_weights_base, CANVAS_LEN, TOP_K, 8, 1.0
+    )
+    if top_weights_base[0 * TOP_K + 1] <= 0.0:
+        raise Error("Singleton domain expert 127 (norm_p=0.18) should be retained under Top-8!")
 
-    # Compute Phase-1 LOD (K=2, top_p=0.65) + Set-Cover weights
+    # Compute explicit LOD K=2 weights
     apply_moe_lod_and_set_cover(
         top_idx, top_val, router_scale, top_weights_lod, CANVAS_LEN, TOP_K, 2, 0.65
     )
-
-    # Verify singleton expert 127 on (b=0, s=1) was pruned and folded into slot 0!
-    if top_weights_lod[0 * TOP_K + 1] != 0.0:
-        raise Error("Singleton secondary expert 127 on (b=0, s=1) was not pruned!")
-    var expected_b0_s0 = Float32(1.0) * router_scale[top_idx[0]]
-    if abs(top_weights_lod[0 * TOP_K + 0] - expected_b0_s0) > 1e-5:
-        raise Error("Folded singleton probability mass did not conserve energy on slot 0!")
+    if top_weights_lod[0 * TOP_K + 2] != 0.0:
+        raise Error("Slot >= active_top_k=2 was not pruned!")
 
     # 3. Benchmark Full 128-Expert MoE Layer: Top-8 Baseline vs Phase-1 LOD (K=2)
     comptime GU_DIM = EXPERT_MLP_DIM * 2

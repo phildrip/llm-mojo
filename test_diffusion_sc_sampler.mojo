@@ -546,6 +546,36 @@ def main() raises:
     if uniform_ent_diff > 1e-3:
         raise Error("Uniform noise entropy cumulant estimate failed!")
 
+    # 4. Regression test: Peaked distribution with -30.0 <unused*> outlier logits in the tail
+    # Verify that negative outlier logits do NOT blow up fast_entropy to ln(V) ~ 10.4!
+    for t in range(B):
+        var base_l = t * VOCAB_SIZE
+        for v in range(VOCAB_SIZE):
+            canvas_logits_raw[base_l + v] = Float32(-30.0) if (v % 4 == 0) else Float32(-4.0)
+        canvas_logits_raw[base_l + 300] = Float32(15.0)
+        for k in range(1, 32):
+            canvas_logits_raw[base_l + 300 + k] = Float32(8.0) - Float32(k) * 0.15
+
+    sample_and_soft_embed_top32_batch[32](
+        canvas_logits_raw,
+        rand_u,
+        embed_packed,
+        embed_scales,
+        fast_entropy,
+        fast_argmax,
+        fast_sampled,
+        fast_sc_embeds,
+        B,
+        VOCAB_SIZE,
+        EMBED_DIM,
+        Float32(0.6),
+        prompt_scale,
+        num_tasks,
+    )
+    print("  [Outlier Tail Guard] peaked + (-30.0 outliers) fast_entropy =", fast_entropy[0])
+    if fast_entropy[0] > 0.05:
+        raise Error("Negative tail outliers (-30.0) inflated Top-32 token entropy!")
+
     sc_gate_packed.free()
     sc_up_packed.free()
     sc_down_packed.free()

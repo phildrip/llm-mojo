@@ -11,6 +11,7 @@ from kfd_gpu import KFDContext, GPUMemoryBuffer, HSACOKernel
 from diffusion_kernels import (
     sc_forward_batch,
     sample_and_soft_embed_top32_batch,
+    resolve_adjacent_duplicate_tokens,
     q4_gemm_l1_2x4,
     q4_fused_gate_up_geglu_l1,
     run_diffusion_moe_experts_parallel,
@@ -29,6 +30,13 @@ from diffusion_kernels import (
     adacache_filter_after_layer1,
     build_block_active_canvas_map,
     extrapolate_sc_velocity_batch,
+    deinterleave_batch_to_f32,
+    q4_lm_head_two_stage_sieve,
+    q4_gemm_block_sparse_down,
+    router_subspace_ffn_filter,
+    sync_moe_subspace_cache,
+    q4_wo_bos_sink_bypass,
+    detect_bos_sink_heads,
 )
 import std.time
 
@@ -1361,6 +1369,7 @@ def main() raises:
     var token_entropy = alloc[Float32](CANVAS_LEN)
     var new_tokens = alloc[Int](CANVAS_LEN)
     var argmax_tokens = alloc[Int](CANVAS_LEN)
+    var top2_tokens = alloc[Int](CANVAS_LEN)
     var sorted_idx = alloc[Int](CANVAS_LEN)
     var sorted_ent = alloc[Float32](CANVAS_LEN)
     var eb_mask = alloc[Bool](CANVAS_LEN)
@@ -1373,6 +1382,7 @@ def main() raises:
     var compact_entropy = alloc[Float32](CANVAS_LEN)
     var compact_argmax = alloc[Int](CANVAS_LEN)
     var compact_new_tokens = alloc[Int](CANVAS_LEN)
+    var compact_top2 = alloc[Int](CANVAS_LEN)
     # TeaCache & TaylorSeer feature forecasting buffers (llm-mojo-2tc.4 & 2tc.7)
     var teacache_h5_prev = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
     var taylor_h5_curr = alloc[Float16](CANVAS_LEN * CONFIG.embed_dim)
@@ -1385,6 +1395,14 @@ def main() raises:
     var adacache_skip_streak = alloc[Int](CANVAS_LEN)
     # 2nd-Order Latent Velocity Extrapolation buffer (llm-mojo-2tc.6)
     var prev_sc_embeds = alloc[Float32](CANVAS_LEN * CONFIG.embed_dim)
+    # Dual-Space Shuffle-Free 4x3 AVX2 GEMM shared X_deint buffer (llm-mojo-yj4.2)
+    var canvas_deint_buf = alloc[Float32](CANVAS_LEN * MAX_Q_SIZE)
+    # Router-Subspace MoE Bypass & Global BOS-Sink Bypass state buffers (llm-mojo-yj4.6 & yj4.7)
+    var moe_r_prev = alloc[Float32](30 * CANVAS_LEN * CONFIG.num_experts)
+    var moe_prev_top2 = alloc[Int](30 * CANVAS_LEN * 2)
+    var moe_prev_out = alloc[Float16](30 * CANVAS_LEN * CONFIG.embed_dim)
+    var ffn_keep_b = alloc[Int](CANVAS_LEN)
+    var bos_sink_mask = alloc[Bool](16)
 
     print("Canvas buffers allocated: ", CANVAS_LEN, " tokens, ",
           (CANVAS_LEN * CONFIG.embed_dim * 4 + CANVAS_LEN * MAX_Q_SIZE * 4) // 1024 // 1024, " MB hidden+Q")
@@ -1703,6 +1721,8 @@ def main() raises:
         for i in range(CANVAS_LEN * CONFIG.embed_dim):
             sc_embeds[i] = 0.0
             prev_sc_embeds[i] = 0.0
+        for i in range(30 * CANVAS_LEN * 2):
+            moe_prev_top2[i] = -1
 
         # --- Sampler state ---
         var denoise_step: Int = 0
@@ -1725,25 +1745,30 @@ def main() raises:
         var confidence_threshold: Float32 = 0.005
         for t in range(CANVAS_LEN):
             locked_mask[t] = False
+            eb_mask[t] = False
             adacache_skip_streak[t] = 0
             token_entropy[t] = 10.4
             argmax_tokens[t] = canvas_tokens[t]
             new_tokens[t] = canvas_tokens[t]
         var full_steps_count = 0
         var consec_skips = 0
+        var prev_n_accept = 0
         teacache_accum[0] = 0.0
 
         while blk_idx < blocks_to_run:
             var block_start = blk_idx * block_size
             var block_end = block_start + block_size if block_start + block_size <= CANVAS_LEN else CANVAS_LEN
+            var cur_block_len = block_end - block_start
             if block_steps_executed == 0:
                 full_steps_count = 0
                 consec_skips = 0
+                prev_n_accept = 0
                 hist_len = 0
                 prev_mean_ent = 0.0
                 teacache_accum[0] = 0.0
                 for t in range(block_start, block_end):
                     adacache_skip_streak[t] = 0
+                    eb_mask[t] = False
             var active_len = build_block_active_canvas_map(locked_mask, active_canvas_idx, block_start, block_end)
             if active_len == 0:
                 print("  [block ", blk_idx, " denoise ", denoise_step, "] all block tokens locked — early exit!")
@@ -1753,7 +1778,7 @@ def main() raises:
                 continue
             var active_top_k = compute_moe_lod_k(denoise_step, prev_mean_ent)
             var moe_top_p = compute_moe_lod_top_p(denoise_step, prev_mean_ent)
-            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", block_end - block_start, " moe_lod_k=", active_top_k)
+            print("  [denoise ", denoise_step, "] active_len=", active_len, "/", cur_block_len, " moe_lod_k=", active_top_k)
             steps_executed += 1
             block_steps_executed += 1
 
@@ -1788,6 +1813,7 @@ def main() raises:
                 sc_buf_normed, sc_buf_gated, sc_buf_down,
                 canvas_hidden,
                 active_len, CONFIG.embed_dim, SC_SIZE, num_tasks,
+                pre_deint_X=canvas_deint_buf,
             )
             var t_sc_end = std.time.perf_counter()
 
@@ -1810,6 +1836,7 @@ def main() raises:
                 var tl_qkv = std.time.perf_counter()
                 # Phase 1a: Batched attention input norm + QKV projections on active_len tokens (CPU-iGPU overlap)
                 rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, weights.input_layernorm_weight, canvas_norm, active_len, CONFIG.embed_dim)
+                deinterleave_batch_to_f32[DType.float32](canvas_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
                 
                 if use_gpu:
                     # Flush canvas_norm once, enqueue Wk on iGPU (~18 ms) while CPU computes Wq (+ Wv if sliding)
@@ -1825,17 +1852,19 @@ def main() raises:
                         flush_cache=False,
                         ring_doorbell_now=True,
                     )
-                    # Concurrently compute Wq (and Wv if sliding) on 8 CPU cores using L1-cached 2x4 AVX2 GEMM
+                    # Concurrently compute Wq (and Wv if sliding) on 8 CPU cores using Dual-Space 4x3 AVX2 GEMM
                     q4_gemm_l1_2x4[DType.float32, DType.float16](
                         weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q,
                         active_len, CONFIG.embed_dim, q_size, num_tasks,
-                        in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE
+                        in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE,
+                        pre_deint_X=canvas_deint_buf,
                     )
                     if not is_global:
                         q4_gemm_l1_2x4[DType.float32, DType.float16](
                             weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v,
                             active_len, CONFIG.embed_dim, kv_stride, num_tasks,
-                            in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE
+                            in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE,
+                            pre_deint_X=canvas_deint_buf,
                         )
                     # Wait for iGPU Wk completion and copy into stride-padded canvas_k
                     gpu_ctx.wait_matmul(slot_k, temp_packed_k.__int__(), kv_stride, batch_size=active_len, flush_cache=True)
@@ -1853,9 +1882,9 @@ def main() raises:
                             for i in range(0, kv_stride, 8):
                                 v_ptr.store[8](i, k_ptr.load[8](i))
                 else:
-                    # CPU L1-cached 2x4 AVX2 batched Q4 GEMM
-                    q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, active_len, CONFIG.embed_dim, q_size, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE)
-                    q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, active_len, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE)
+                    # CPU L1-cached Dual-Space 4x3 AVX2 batched Q4 GEMM reusing pre-deinterleaved canvas_deint_buf
+                    q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wq_packed, weights.wq_scales, canvas_norm, canvas_q, active_len, CONFIG.embed_dim, q_size, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_Q_SIZE, pre_deint_X=canvas_deint_buf)
+                    q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wk_packed, weights.wk_scales, canvas_norm, canvas_k, active_len, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE, pre_deint_X=canvas_deint_buf)
                     if is_global:
                         for b in range(active_len):
                             var v_ptr = canvas_v + b * MAX_KV_SIZE
@@ -1863,7 +1892,7 @@ def main() raises:
                             for i in range(0, kv_stride, 8):
                                 v_ptr.store[8](i, k_ptr.load[8](i))
                     else:
-                        q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, active_len, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE)
+                        q4_gemm_l1_2x4[DType.float32, DType.float16](weights.wv_packed, weights.wv_scales, canvas_norm, canvas_v, active_len, CONFIG.embed_dim, kv_stride, num_tasks, in_stride=CONFIG.embed_dim, out_stride=MAX_KV_SIZE, pre_deint_X=canvas_deint_buf)
                 var tl_qkv_end = std.time.perf_counter()
 
                 # Phase 1b: Parallelized Head norms + Hoisted SIMD8 RoPE + FP16 dLLM-KVQ cache scatter (llm-mojo-2tc.9)
@@ -1907,12 +1936,29 @@ def main() raises:
 
                 var tl_attn_end = std.time.perf_counter()
 
-                # Phase 2b: Batched Wo projection using L1-2x4 AVX2 GEMM + post-attn norm + residual
-                q4_gemm_l1_2x4[DType.float16, DType.float32](
-                    weights.wo_packed, weights.wo_scales, canvas_attn_out, canvas_proj_attn,
-                    active_len, q_size, CONFIG.embed_dim, num_tasks,
-                    in_stride=MAX_Q_SIZE, out_stride=CONFIG.embed_dim
-                )
+                # Phase 2b: Batched Wo projection using Dual-Space 4x3 AVX2 GEMM + BOS-Sink Bypass + post-attn norm + residual
+                var num_bos_sinks = 0
+                if is_global:
+                    num_bos_sinks = detect_bos_sink_heads[DType.float16](
+                        canvas_attn_out, v_cache + layer_cache_offset, bos_sink_mask,
+                        active_len, layer_heads, layer_head_dim, kv_group_size=ratio, eps_sink=1e-3,
+                    )
+                if num_bos_sinks > 0:
+                    q4_wo_bos_sink_bypass[DType.float16, DType.float32](
+                        weights.wo_packed, weights.wo_scales, canvas_attn_out,
+                        v_cache + layer_cache_offset, bos_sink_mask, canvas_proj_attn,
+                        active_len, layer_heads, layer_head_dim, CONFIG.embed_dim, num_tasks,
+                        kv_group_size=ratio,
+                        prealloc_act_deint=canvas_deint_buf,
+                    )
+                else:
+                    deinterleave_batch_to_f32[DType.float16](canvas_attn_out, canvas_deint_buf, active_len, q_size, in_stride=MAX_Q_SIZE)
+                    q4_gemm_l1_2x4[DType.float16, DType.float32](
+                        weights.wo_packed, weights.wo_scales, canvas_attn_out, canvas_proj_attn,
+                        active_len, q_size, CONFIG.embed_dim, num_tasks,
+                        in_stride=MAX_Q_SIZE, out_stride=CONFIG.embed_dim,
+                        pre_deint_X=canvas_deint_buf,
+                    )
                 rms_norm_batch[in_type=DType.float32, out_type=DType.float32](canvas_proj_attn, weights.post_attention_layernorm_weight, canvas_proj_attn, active_len, CONFIG.embed_dim)
                 var f16_min_v = SIMD[DType.float32, 8](-65500.0)
                 var f16_max_v = SIMD[DType.float32, 8](65500.0)
@@ -1942,17 +1988,21 @@ def main() raises:
                         ring_doorbell_now=True,
                     )
                 else:
+                    deinterleave_batch_to_f32[DType.float32](canvas_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
                     q4_fused_gate_up_geglu_l1[DType.float32, DType.float16](
                         weights.w_gate_packed, weights.w_gate_scales,
                         weights.w_up_packed, weights.w_up_scales,
                         canvas_norm, canvas_ffn_gated,
                         active_len, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks,
+                        pre_deint_X=canvas_deint_buf,
                     )
-                    q4_gemm_l1_2x4[DType.float16, DType.float16](
+                    deinterleave_batch_to_f32[DType.float16](canvas_ffn_gated, canvas_deint_buf, active_len, CONFIG.standard_mlp_dim)
+                    q4_gemm_block_sparse_down[DType.float16, DType.float16](
                         weights.w_down_packed, weights.w_down_scales,
                         canvas_ffn_gated, canvas_ffn_down,
                         active_len, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks,
                         in_stride=CONFIG.standard_mlp_dim, out_stride=CONFIG.embed_dim,
+                        pre_deint_X=canvas_deint_buf,
                     )
                     rms_norm_batch[in_type=DType.float16, out_type=DType.float16](canvas_ffn_down, weights.post_feedforward_layernorm_1_weight, canvas_shared_norm, active_len, CONFIG.embed_dim)
                 var tl_ffn_end = std.time.perf_counter()
@@ -1974,10 +2024,12 @@ def main() raises:
 
                 parallelize[router_norm_worker](active_len)
 
+                deinterleave_batch_to_f32[DType.float32](canvas_scaled_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
                 q4_gemm_l1_2x4[DType.float32, DType.float32](
                     weights.w_router_packed, weights.w_router_scales,
                     canvas_scaled_norm, canvas_router_scores,
                     active_len, CONFIG.embed_dim, CONFIG.num_experts, num_tasks,
+                    pre_deint_X=canvas_deint_buf,
                 )
 
                 def router_topk_worker(b: Int) capturing -> None:
@@ -1999,35 +2051,66 @@ def main() raises:
                     CONFIG.top_k_experts,
                     active_top_k,
                     moe_top_p,
+                    eb_mask=eb_mask,
+                    active_canvas_idx=active_canvas_idx,
+                    unaccepted_top_k=2,
                 )
 
-                run_diffusion_moe_experts_parallel(
-                    weights.experts_gate_up_packed,
-                    weights.experts_gate_up_scales,
-                    weights.experts_down_packed,
-                    weights.experts_down_scales,
-                    canvas_moe_in,
+                var ffn_active_len = router_subspace_ffn_filter(
+                    canvas_router_scores,
+                    moe_r_prev + l * CANVAS_LEN * CONFIG.num_experts,
                     canvas_top_idx,
-                    canvas_top_weights,
-                    canvas_moe_out,
+                    moe_prev_top2 + l * CANVAS_LEN * 2,
+                    eb_mask,
+                    active_canvas_idx,
+                    ffn_keep_b,
                     active_len,
-                    CONFIG.embed_dim,
-                    CONFIG.expert_mlp_dim,
+                    CONFIG.num_experts,
                     CONFIG.top_k_experts,
-                    num_tasks,
-                    moe_deinterleaved_x,
-                    moe_work_buf,
-                    moe_expert_outs,
+                    block_steps_executed,
+                    tau_ffn=0.05,
+                    top_weights=canvas_top_weights,
+                )
+
+                if ffn_active_len > 0:
+                    run_diffusion_moe_experts_parallel(
+                        weights.experts_gate_up_packed,
+                        weights.experts_gate_up_scales,
+                        weights.experts_down_packed,
+                        weights.experts_down_scales,
+                        canvas_moe_in,
+                        canvas_top_idx,
+                        canvas_top_weights,
+                        canvas_moe_out,
+                        active_len,
+                        CONFIG.embed_dim,
+                        CONFIG.expert_mlp_dim,
+                        CONFIG.top_k_experts,
+                        num_tasks,
+                        moe_deinterleaved_x,
+                        moe_work_buf,
+                        moe_expert_outs,
+                    )
+                sync_moe_subspace_cache[DType.float16](
+                    canvas_moe_out,
+                    moe_prev_out + l * CANVAS_LEN * CONFIG.embed_dim,
+                    active_canvas_idx,
+                    ffn_keep_b,
+                    active_len,
+                    ffn_active_len,
+                    CONFIG.embed_dim,
                 )
                 var tl_moe_end = std.time.perf_counter()
 
                 if use_gpu:
                     var tl_ffn2 = std.time.perf_counter()
+                    deinterleave_batch_to_f32[DType.float32](canvas_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
                     q4_gemm_l1_2x4[DType.float32, DType.float16](
                         weights.w_up_packed, weights.w_up_scales,
                         canvas_norm, canvas_ffn_up,
                         active_len, CONFIG.embed_dim, CONFIG.standard_mlp_dim, num_tasks,
                         in_stride=CONFIG.embed_dim, out_stride=CONFIG.standard_mlp_dim,
+                        pre_deint_X=canvas_deint_buf,
                     )
                     gpu_ctx.wait_matmul(slot_gate, temp_packed_q.__int__(), CONFIG.standard_mlp_dim, batch_size=active_len, flush_cache=True)
                     for b in range(active_len):
@@ -2040,11 +2123,13 @@ def main() raises:
                             var sig = 1.0 / (1.0 + exp(SIMD[DType.float32, 8](-1.702) * g_v))
                             var act = (g_v * sig * u_v).clamp(f16_min_v, f16_max_v)
                             out_ptr.store[8](i, act.cast[DType.float16]())
-                    q4_gemm_l1_2x4[DType.float16, DType.float16](
+                    deinterleave_batch_to_f32[DType.float16](canvas_ffn_gated, canvas_deint_buf, active_len, CONFIG.standard_mlp_dim)
+                    q4_gemm_block_sparse_down[DType.float16, DType.float16](
                         weights.w_down_packed, weights.w_down_scales,
                         canvas_ffn_gated, canvas_ffn_down,
                         active_len, CONFIG.standard_mlp_dim, CONFIG.embed_dim, num_tasks,
                         in_stride=CONFIG.standard_mlp_dim, out_stride=CONFIG.embed_dim,
+                        pre_deint_X=canvas_deint_buf,
                     )
                     rms_norm_batch[in_type=DType.float16, out_type=DType.float16](canvas_ffn_down, weights.post_feedforward_layernorm_1_weight, canvas_shared_norm, active_len, CONFIG.embed_dim)
                     tl_ffn_end += std.time.perf_counter() - tl_ffn2
@@ -2083,17 +2168,19 @@ def main() raises:
                         adacache_h1_prev,
                         active_canvas_idx,
                         adacache_skip_streak,
+                        eb_mask,
                         active_len,
                         CONFIG.embed_dim,
                         denoise_step,
-                        k_slow=3,
-                        tau_ada=0.08,
+                        k_slow=2,
+                        tau_ada=0.015,
                     )
                     if active_len < prev_active_len:
                         print("    -> AdaCache + MoReg: compacted active_len=", active_len, "/", prev_active_len, "(layers 2..29 + logit_proj)")
 
                 # TeaCache (CVPR 2025) & TaylorSeer (ICCV 2025) middle-block forecasting (llm-mojo-2tc.4 & 2tc.7)
                 if l == 5:
+                    var eff_tc_steps = full_steps_count if prev_n_accept == cur_block_len else 0
                     skip_mid_layers = teacache_eval_gate(
                         canvas_hidden,
                         teacache_h5_prev,
@@ -2101,11 +2188,11 @@ def main() raises:
                         active_len,
                         CONFIG.embed_dim,
                         temp,
-                        full_steps_count,
+                        eff_tc_steps,
                         consec_skips,
                         teacache_accum,
-                        teacache_thresh=0.72,
-                        max_consec_skips=2,
+                        teacache_thresh=0.015,
+                        max_consec_skips=1,
                     )
                     if skip_mid_layers:
                         consec_skips += 1
@@ -2146,24 +2233,27 @@ def main() raises:
             # --- Sampler step (Sparse Top-32 reservoir + soft-embed on active_len tokens, llm-mojo-2tc.1 & 2tc.3) ---
             var t_samp_start = std.time.perf_counter()
 
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 rng_state ^= rng_state >> 12
                 rng_state ^= rng_state << 25
                 rng_state ^= rng_state >> 27
                 var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
                 rand_buf[t] = Float32(rnd_u64 & 0xFFFFFF) / Float32(16777216.0)
 
-            # Batched logit projection: read embed weights ONCE for active_len unconverged tokens
+            # Batched logit projection: Two-Stage Coarse-to-Fine Vocab Sieve on active_len unconverged tokens (llm-mojo-yj4.4)
             rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, final_norm_weight, canvas_final_norm, active_len, CONFIG.embed_dim)
-            q4_gemm_l1_2x4[DType.float32, DType.float32](
+            deinterleave_batch_to_f32[DType.float32](canvas_final_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
+            q4_lm_head_two_stage_sieve[DType.float32, DType.float32](
                 embed.packed_weights, embed.scales, canvas_final_norm, canvas_logits,
                 active_len, CONFIG.embed_dim, CONFIG.vocab_size, num_tasks,
-                CONFIG.embed_dim, CONFIG.vocab_size
+                CONFIG.embed_dim, CONFIG.vocab_size, pre_deint_X=canvas_deint_buf,
+                forced_cand_tokens=argmax_tokens, num_forced_cands=CANVAS_LEN,
+                coarse_blocks=22, span_keep_frac=0.55,
             )
             var t_logit_end = std.time.perf_counter()
 
-            # Parallelized per-token Top-32 softcap, cumulant entropy, sample, sparse sc_embed
-            if active_len == CANVAS_LEN:
+            # Parallelized per-token Top-32 softcap, entropy, sample, sparse sc_embed
+            if active_len == CANVAS_LEN and block_start == 0 and block_end == CANVAS_LEN:
                 sample_and_soft_embed_top32_batch[32](
                     canvas_logits,
                     rand_buf,
@@ -2179,6 +2269,7 @@ def main() raises:
                     temp,
                     prompt_scale,
                     num_tasks,
+                    top2_tokens=top2_tokens,
                 )
             else:
                 for b in range(active_len):
@@ -2198,6 +2289,7 @@ def main() raises:
                     temp,
                     prompt_scale,
                     num_tasks,
+                    top2_tokens=compact_top2,
                 )
                 scatter_active_sampler_outputs[DType.float32](
                     active_canvas_idx,
@@ -2214,29 +2306,31 @@ def main() raises:
                     active_len,
                     CANVAS_LEN,
                     CONFIG.embed_dim,
+                    compact_top2=compact_top2,
+                    top2_tokens=top2_tokens,
                 )
             var t_samp_end = std.time.perf_counter()
             print("    sc_mlp=", String((t_sc_end - t_sc_start) * 1000.0), "ms",
                   " logit_proj=", String((t_logit_end - t_samp_start) * 1000.0), "ms",
                   " top32_sampler=", String((t_samp_end - t_logit_end) * 1000.0), "ms")
 
-            # Mean entropy + confidence
+            # Mean entropy + confidence scoped to active block [block_start, block_end)
             var mean_ent: Float32 = 0.0
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 mean_ent += token_entropy[t]
-            mean_ent /= Float32(CANVAS_LEN)
+            mean_ent /= Float32(cur_block_len)
             var confident = mean_ent < confidence_threshold
             print("    mean_entropy=", String(mean_ent), " temp=", String(temp),
                   " confident=", confident)
 
-            # Entropy-bound acceptance mask: sort by ascending entropy, cumsum, cummax
-            # Selection sort for 256 elements
-            for t in range(CANVAS_LEN):
-                sorted_idx[t] = t
-                sorted_ent[t] = token_entropy[t]
-            for i in range(CANVAS_LEN):
+            # Entropy-bound acceptance mask scoped to [block_start, block_end): sort by ascending entropy, cumsum, cummax
+            for i in range(cur_block_len):
+                var t = block_start + i
+                sorted_idx[i] = t
+                sorted_ent[i] = token_entropy[t]
+            for i in range(cur_block_len):
                 var min_idx = i
-                for j in range(i + 1, CANVAS_LEN):
+                for j in range(i + 1, cur_block_len):
                     if sorted_ent[j] < sorted_ent[min_idx]:
                         min_idx = j
                 if min_idx != i:
@@ -2248,36 +2342,58 @@ def main() raises:
                     sorted_idx[min_idx] = tmp_i
 
             # cumsum and cummax, accept where (cumsum - cummax) <= entropy_bound
+            # with adjacent duplicate suppression so two neighboring unlocked positions
+            # never commit the same word token on the same step before seeing each other.
             var cumsum_ent: Float32 = 0.0
             var cummax_ent: Float32 = 0.0
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 eb_mask[t] = locked_mask[t]
-            for i in range(CANVAS_LEN):
+
+            # Resolve adjacent word-token duplicates in argmax_tokens and new_tokens using top2_tokens
+            # before evaluating eb_mask so positions with a clean 2nd-best token are accepted instead of re-noised.
+            resolve_adjacent_duplicate_tokens(
+                sorted_idx, eb_mask, locked_mask, argmax_tokens, new_tokens, top2_tokens,
+                block_start, block_end,
+            )
+
+            for i in range(cur_block_len):
                 cumsum_ent += sorted_ent[i]
                 if sorted_ent[i] > cummax_ent:
                     cummax_ent = sorted_ent[i]
                 if (cumsum_ent - cummax_ent) <= entropy_bound:
                     var orig_idx = sorted_idx[i]
-                    eb_mask[orig_idx] = True
+                    if eb_mask[orig_idx]:
+                        continue
+                    var cand_tok = new_tokens[orig_idx]
+                    var adj_dup = False
+                    if cand_tok >= 256:
+                        if orig_idx > block_start and eb_mask[orig_idx - 1] and new_tokens[orig_idx - 1] == cand_tok:
+                            adj_dup = True
+                        if orig_idx + 1 < block_end and eb_mask[orig_idx + 1] and new_tokens[orig_idx + 1] == cand_tok:
+                            adj_dup = True
+                    if not adj_dup:
+                        eb_mask[orig_idx] = True
 
             # Update history: write argmax_tokens at slot hist_len % ST
             var write_pos = hist_len % 2
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 history[write_pos * CANVAS_LEN + t] = argmax_tokens[t]
             hist_len += 1
 
             # Update Fast-dLLM / dKV-Cache locked_mask for subsequent steps (llm-mojo-2tc.3)
             var num_locked = update_locked_mask(
-                eb_mask, history, token_entropy, locked_mask, CANVAS_LEN, hist_len
+                eb_mask, history, token_entropy, locked_mask, CANVAS_LEN, hist_len,
+                mean_ent=mean_ent,
+                block_start=block_start, block_end=block_end,
             )
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 if locked_mask[t]:
                     eb_mask[t] = True
 
-            # Stability check: all ST slots agree
+            # Stability check: all ST slots agree within [block_start, block_end)
             var stable = True
             if hist_len >= 2:
-                for t in range(CANVAS_LEN):
+                for t in range(block_start, block_end):
                     if history[0 * CANVAS_LEN + t] != history[1 * CANVAS_LEN + t]:
                         stable = False
                         break
@@ -2285,17 +2401,17 @@ def main() raises:
                 stable = False
 
             # Convergence
-            var converged = (stable and confident and hist_len >= 2) or (denoise_step + 1 >= MAX_DENOISE_STEPS)
-            print("    stable=", stable, " converged=", converged, " locked=", num_locked, "/", CANVAS_LEN)
+            var converged = (stable and confident and hist_len >= 2) or (denoise_step + 1 >= max_steps_this_turn)
+            print("    stable=", stable, " converged=", converged, " locked=", num_locked, "/", cur_block_len)
 
-            # Update canvas: accept → new_tokens, reject → random re-noise
+            # Update canvas: accept → new_tokens, reject → random re-noise within [block_start, block_end)
             var n_accept = 0
-            for t in range(CANVAS_LEN):
+            for t in range(block_start, block_end):
                 if eb_mask[t]:
                     n_accept += 1
-            var n_reject = CANVAS_LEN - n_accept
+            var n_reject = cur_block_len - n_accept
             if n_reject > 0:
-                for t in range(CANVAS_LEN):
+                for t in range(block_start, block_end):
                     if eb_mask[t]:
                         canvas_tokens[t] = new_tokens[t]
                     else:
@@ -2305,21 +2421,22 @@ def main() raises:
                         var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
                         canvas_tokens[t] = Int(rnd_u64 % UInt64(CONFIG.vocab_size))
             else:
-                for t in range(CANVAS_LEN):
+                for t in range(block_start, block_end):
                     canvas_tokens[t] = new_tokens[t]
-            print("    accepted=", n_accept, "/", CANVAS_LEN)
+            prev_n_accept = n_accept
+            print("    accepted=", n_accept, "/", cur_block_len)
 
             # Calculate local change metrics for adaptive step skipping
             var num_flips = 0
             var entropy_decay: Float32 = 0.0
-            if steps_executed > 1:
-                for t in range(CANVAS_LEN):
+            if block_steps_executed > 1:
+                for t in range(block_start, block_end):
                     if argmax_tokens[t] != argmax_canvas[t]:
                         num_flips += 1
                 entropy_decay = prev_mean_ent - mean_ent
 
             var skip_amount = 1
-            if steps_executed > 1:
+            if block_steps_executed > 1 and n_accept * 2 >= cur_block_len and denoise_step + 6 < max_steps_this_turn:
                 # If very few tokens changed or entropy decay has flattened out, skip intermediate steps
                 if num_flips <= 2 or (entropy_decay >= 0.0 and entropy_decay < 0.003):
                     skip_amount = 3
@@ -2334,18 +2451,6 @@ def main() raises:
             # Update argmax_canvas
             for t in range(block_start, block_end):
                 argmax_canvas[t] = argmax_tokens[t]
-
-            # 2nd-Order Latent Velocity Extrapolation on sc_embeds (llm-mojo-2tc.6)
-            extrapolate_sc_velocity_batch(
-                sc_embeds,
-                prev_sc_embeds,
-                locked_mask,
-                block_start,
-                block_end,
-                CONFIG.embed_dim,
-                block_steps_executed,
-                skip_amount,
-            )
 
             denoise_step += skip_amount
 
@@ -2455,6 +2560,7 @@ def main() raises:
     token_entropy.free()
     new_tokens.free()
     argmax_tokens.free()
+    top2_tokens.free()
     sorted_idx.free()
     sorted_ent.free()
     eb_mask.free()
@@ -2466,6 +2572,7 @@ def main() raises:
     compact_entropy.free()
     compact_argmax.free()
     compact_new_tokens.free()
+    compact_top2.free()
     teacache_h5_prev.free()
     taylor_h5_curr.free()
     taylor_D.free()
@@ -2475,4 +2582,11 @@ def main() raises:
     adacache_h1_prev.free()
     adacache_skip_streak.free()
     prev_sc_embeds.free()
+    canvas_deint_buf.free()
+    moe_r_prev.free()
+    moe_prev_top2.free()
+    moe_prev_out.free()
+    ffn_keep_b.free()
+    bos_sink_mask.free()
+    bos_sink_mask.free()
     gpu_ctx.close()

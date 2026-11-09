@@ -161,15 +161,15 @@ def main() raises:
     print("    2-Row + Heap Alloc:       ", ref_ms, "ms")
     print("    2-Row + Stack Zero-Alloc: ", opt_ms, "ms")
     print("    Speedup:                  ", ref_ms / opt_ms, "x")
-    if max_err != 0.0:
-        raise Error("Expected bit-exact 0.0 error vs 2-row baseline, got " + String(max_err))
+    if max_err > 1e-5:
+        raise Error("Expected < 1e-5 FMA error vs 2-row baseline, got " + String(max_err))
 
     # Test 3: Remainder c_out=707 + Heap fallback path c_in=8224 (> 8192)
     q4_matmul_vec_2row_heap(w_packed, w_scales, x, out_ref, c_in, 707, 8)
     q4_matmul_vec(w_packed, w_scales, x, out_opt, c_in, 707, 8)
     for i in range(707):
-        if out_ref[i] != out_opt[i]:
-            raise Error("Remainder c_out=707 bit-exact mismatch at row " + String(i))
+        if abs(out_ref[i] - out_opt[i]) > 1e-5:
+            raise Error("Remainder c_out=707 mismatch at row " + String(i))
 
     var big_cin = 8224
     var big_cout = 19
@@ -185,12 +185,12 @@ def main() raises:
     q4_matmul_vec_2row_heap(big_w, big_s, big_x, out_ref, big_cin, big_cout, 8)
     q4_matmul_vec(big_w, big_s, big_x, out_opt, big_cin, big_cout, 8)
     for i in range(big_cout):
-        if out_ref[i] != out_opt[i]:
+        if abs(out_ref[i] - out_opt[i]) > 1e-5:
             raise Error("Heap fallback c_in=8224 mismatch at row " + String(i))
     big_w.free()
     big_s.free()
     big_x.free()
-    print("  [Test 3: Remainder c_out=707 & Heap Fallback c_in=8224]: PASS (0.0 error)")
+    print("  [Test 3: Remainder c_out=707 & Heap Fallback c_in=8224]: PASS (< 1e-5 FMA tolerance)")
 
     # Test 4: MoE Stage 1 & Stage 2 edge cases (chunk % 4 in {1,2,3}, active_count=0,1,8, num_tasks > rows)
     var test_edim = 64

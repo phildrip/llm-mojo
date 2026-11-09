@@ -14,10 +14,12 @@ def main() raises:
     var adacache_h1_prev = alloc[Float16](CANVAS_LEN * EMBED_DIM)
     var active_canvas_idx = alloc[Int](CANVAS_LEN)
     var adacache_skip_streak = alloc[Int](CANVAS_LEN)
+    var eb_mask = alloc[Bool](CANVAS_LEN)
 
     for t in range(CANVAS_LEN):
         active_canvas_idx[t] = t
         adacache_skip_streak[t] = 0
+        eb_mask[t] = True
         for d in range(EMBED_DIM):
             var v = Float16(Float32((t * 7 + d % 31) - 15) * 0.05)
             h_orig[t * EMBED_DIM + d] = v
@@ -27,11 +29,11 @@ def main() raises:
     # 1. Warmup steps 0 & 1 must keep all 256 tokens
     var len0 = adacache_filter_after_layer1(
         canvas_hidden, adacache_h1_prev, active_canvas_idx, adacache_skip_streak,
-        CANVAS_LEN, EMBED_DIM, 0, k_slow=3, tau_ada=0.08
+        eb_mask, CANVAS_LEN, EMBED_DIM, 0, k_slow=3, tau_ada=0.08
     )
     var len1 = adacache_filter_after_layer1(
         canvas_hidden, adacache_h1_prev, active_canvas_idx, adacache_skip_streak,
-        CANVAS_LEN, EMBED_DIM, 1, k_slow=3, tau_ada=0.08
+        eb_mask, CANVAS_LEN, EMBED_DIM, 1, k_slow=3, tau_ada=0.08
     )
     if len0 != 256 or len1 != 256:
         raise Error("Warmup steps 0 & 1 should retain all 256 tokens!")
@@ -49,7 +51,7 @@ def main() raises:
     var t0 = std.time.perf_counter()
     var len2 = adacache_filter_after_layer1(
         canvas_hidden, adacache_h1_prev, active_canvas_idx, adacache_skip_streak,
-        CANVAS_LEN, EMBED_DIM, 2, k_slow=3, tau_ada=0.08
+        eb_mask, CANVAS_LEN, EMBED_DIM, 2, k_slow=3, tau_ada=0.08
     )
     var dt_ms = (std.time.perf_counter() - t0) * 1000.0
 
@@ -88,13 +90,28 @@ def main() raises:
 
     var len3 = adacache_filter_after_layer1(
         canvas_hidden, adacache_h1_prev, active_canvas_idx, adacache_skip_streak,
-        CANVAS_LEN, EMBED_DIM, 3, k_slow=3, tau_ada=0.08
+        eb_mask, CANVAS_LEN, EMBED_DIM, 3, k_slow=3, tau_ada=0.08
     )
     for t in range(32):
         if adacache_skip_streak[t] != 0:
             raise Error("Token with streak == k_slow - 1 was not forced to refresh!")
 
-    print("  [AdaCache + MoReg] len0=", len0, "| len2=", len2, "/ 256 (multiple of 16) | max_err=", max_err, "| filter latency=", dt_ms, "ms | k_slow refresh verified (len3=", len3, ")")
+    # 4. Regression test: Unaccepted/re-noised tokens (eb_mask[t] == False) must NEVER be skipped
+    for t in range(CANVAS_LEN):
+        active_canvas_idx[t] = t
+        adacache_skip_streak[t] = 0
+        eb_mask[t] = False if t < 16 else True
+        for d in range(EMBED_DIM):
+            canvas_hidden[t * EMBED_DIM + d] = adacache_h1_prev[t * EMBED_DIM + d]
+    var len4 = adacache_filter_after_layer1(
+        canvas_hidden, adacache_h1_prev, active_canvas_idx, adacache_skip_streak,
+        eb_mask, CANVAS_LEN, EMBED_DIM, 4, k_slow=3, tau_ada=0.08
+    )
+    for b in range(16):
+        if active_canvas_idx[b] != b:
+            raise Error("Unaccepted (eb_mask=False) token was skipped by AdaCache!")
+
+    print("  [AdaCache + MoReg] len0=", len0, "| len2=", len2, "/ 256 (multiple of 16) | max_err=", max_err, "| filter latency=", dt_ms, "ms | k_slow & eb_mask guards verified (len3=", len3, ", len4=", len4, ")")
     if max_err > 0.0:
         raise Error("In-place compaction corrupted hidden state!")
 
@@ -103,4 +120,5 @@ def main() raises:
     adacache_h1_prev.free()
     active_canvas_idx.free()
     adacache_skip_streak.free()
+    eb_mask.free()
     print("=== ALL TESTS PASSED! ===")
