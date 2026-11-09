@@ -203,17 +203,43 @@ def test_1_sc_and_top32_sampler(num_tasks: Int) raises:
         raise Error("q4_lm_head_two_stage_sieve failed to prune any low-scoring rows in Stage 1!")
     var argmax_full = alloc[Int](B)
     var argmax_sieve = alloc[Int](B)
+    var ent_full = alloc[Float32](B)
+    var ent_sieve = alloc[Float32](B)
+    # Plant a realistic Top-2 competitor (row 105) for b=0 whose coarse half is slightly below +1.1*std
+    # (~ +0.6*std) while its fine half is strong (+3.5*std), so pruning at +1.17*std drops row 105 and
+    # distorts b=0's token_entropy!
+    for k in range(EMBED_DIM):
+        var byte77 = sieve_p[77 * (EMBED_DIM // 2) + (k // 2)]
+        var nib77 = (byte77 & 15) if (k % 2 == 0) else (byte77 >> 4)
+        var sc77 = Float32(0.05) if (k < 64) else sieve_s[77 * (EMBED_DIM // 32) + (k // 32)]
+        var w77 = Float32(Int(nib77) - 8) * sc77
+        var byte105 = sieve_p[105 * (EMBED_DIM // 2) + (k // 2)]
+        var nib105 = (byte105 & 15) if (k % 2 == 0) else (byte105 >> 4)
+        var w105 = Float32(Int(nib105) - 8) * sieve_s[105 * (EMBED_DIM // 32) + (k // 32)]
+        x_lm[0 * EMBED_DIM + k] = w77 * 5.0 + (w105 * 1.2 if k < 64 else w105 * 22.0)
+    q4_gemm_l1_2x4[DType.float32, DType.float32](
+        sieve_p, sieve_s, x_lm, logits_full, B, EMBED_DIM, VOCAB_SIZE, num_tasks
+    )
+    q4_lm_head_two_stage_sieve[DType.float32, DType.float32](
+        sieve_p, sieve_s, x_lm, logits_sieve, B, EMBED_DIM, VOCAB_SIZE, num_tasks,
+        forced_cand_tokens=forced_toks, num_forced_cands=4, coarse_blocks=2, span_keep_frac=0.70
+    )
     sample_and_soft_embed_top32_batch[32](
-        logits_full, rand_u, sieve_p, sieve_s, ent, argmax_full, sampled_t, sc_out,
+        logits_full, rand_u, sieve_p, sieve_s, ent_full, argmax_full, sampled_t, sc_out,
         B, VOCAB_SIZE, EMBED_DIM, Float32(0.6), sqrt(Float32(EMBED_DIM)), num_tasks
     )
     sample_and_soft_embed_top32_batch[32](
-        logits_sieve, rand_u, sieve_p, sieve_s, ent, argmax_sieve, sampled_t, sc_out,
+        logits_sieve, rand_u, sieve_p, sieve_s, ent_sieve, argmax_sieve, sampled_t, sc_out,
         B, VOCAB_SIZE, EMBED_DIM, Float32(0.6), sqrt(Float32(EMBED_DIM)), num_tasks
     )
     for b in range(B):
         if argmax_sieve[b] != argmax_full[b]:
             raise Error("q4_lm_head_two_stage_sieve missed true argmax token on b=" + String(b))
+    if abs(ent_sieve[0] - ent_full[0]) > 0.05:
+        raise Error(
+            "q4_lm_head_two_stage_sieve pruned Top-32 competitor and distorted entropy: "
+            + String(ent_sieve[0]) + " vs " + String(ent_full[0])
+        )
     sieve_p.free()
     sieve_s.free()
     x_lm.free()
@@ -222,6 +248,8 @@ def test_1_sc_and_top32_sampler(num_tasks: Int) raises:
     forced_toks.free()
     argmax_full.free()
     argmax_sieve.free()
+    ent_full.free()
+    ent_sieve.free()
 
     sc_gate_p.free()
     sc_up_p.free()
@@ -312,6 +340,16 @@ def test_2_moe_4x3_and_lod(num_tasks: Int) raises:
         eb_moe.free()
         act_map_moe.free()
         raise Error("Per-token confidence-adaptive MoE failed to retain Top-8 on accepted token b=16!")
+    # Default unaccepted_top_k must preserve full Top-8 capacity on unaccepted tokens (b=0) so step-0
+    # and unconverged tokens retain full 26B MoE expert mixture fidelity!
+    apply_moe_lod_and_set_cover(
+        top_idx, top_val, r_scale, top_w, B, TOP_K, 8, 1.0,
+        eb_mask=eb_moe, active_canvas_idx=act_map_moe
+    )
+    if top_w[0 * TOP_K + 2] <= 0.0 or top_w[0 * TOP_K + 3] <= 0.0:
+        eb_moe.free()
+        act_map_moe.free()
+        raise Error("Default apply_moe_lod_and_set_cover starved unaccepted token b=0 of Top-8 experts!")
     eb_moe.free()
     act_map_moe.free()
 
@@ -986,6 +1024,32 @@ def test_4_e2e_denoising_state_machine() raises:
             raise Error("update_locked_mask prematurely locked tokens at step 1 while mean_ent > 0.30!")
         if step == 3 and num_locked == 0:
             raise Error("update_locked_mask failed to lock converged low-entropy tokens at step 3!")
+        for t in range(CANVAS_LEN):
+            if locked_mask[t]:
+                new_tokens[t] = argmax_tokens[t]
+                canvas_tokens[t] = argmax_tokens[t]
+        if step == 3 and canvas_tokens[0] != argmax_tokens[0]:
+            raise Error("Locked token failed to preserve argmax_tokens[0] in canvas_tokens[0]!")
+
+    # Verify update_locked_mask checks BOTH history slots (0 and 1) for adjacent duplicates!
+    for t in range(CANVAS_LEN):
+        locked_mask[t] = False
+        eb_mask[t] = True
+        token_entropy[t] = 0.01
+        history[0 * CANVAS_LEN + t] = 400 + t
+        history[1 * CANVAS_LEN + t] = 400 + t
+    # Suppose t=5 is stable at 777 (both slots), while t=4 had 404 in slot 0 and 777 in slot 1:
+    # t=5 MUST NOT lock while its neighbor t=4 has 777 in slot 1!
+    history[0 * CANVAS_LEN + 5] = 777
+    history[1 * CANVAS_LEN + 5] = 777
+    history[0 * CANVAS_LEN + 4] = 404
+    history[1 * CANVAS_LEN + 4] = 777
+    _ = update_locked_mask(
+        eb_mask, history, token_entropy, locked_mask, CANVAS_LEN, 2,
+        mean_ent=0.05, block_start=0, block_end=CANVAS_LEN
+    )
+    if locked_mask[5]:
+        raise Error("update_locked_mask locked t=5 despite slot-1 duplicate with neighbor t=4!")
 
     token_entropy.free()
     new_tokens.free()

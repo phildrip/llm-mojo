@@ -1732,7 +1732,10 @@ def main() raises:
         var steps_executed: Int = 0
         var num_blocks = (CANVAS_LEN + block_size - 1) // block_size
         var blocks_to_run = 1 if bench_single_block else num_blocks
-        var max_steps_this_turn = bench_steps if bench_mode else (MAX_DENOISE_STEPS // num_blocks)
+        var block_step_budget = MAX_DENOISE_STEPS // num_blocks
+        if block_step_budget < 1:
+            block_step_budget = 1
+        var max_steps_this_turn = bench_steps if bench_mode else block_step_budget
         var blk_idx: Int = 0
         var block_steps_executed: Int = 0
 
@@ -1783,10 +1786,11 @@ def main() raises:
             block_steps_executed += 1
 
             # Temperature schedule (computed up front for TeaCache polynomial modulation & Sampler)
-            var remaining = MAX_DENOISE_STEPS - denoise_step
+            # Scoped to per-block step budget so block-diffusion mode cools from t_max (0.8) to t_min (0.4) per block
+            var remaining = block_step_budget - denoise_step
             if remaining < 1:
                 remaining = 1
-            var temp = t_min + (t_max - t_min) * Float32(remaining) / Float32(MAX_DENOISE_STEPS)
+            var temp = t_min + (t_max - t_min) * Float32(remaining) / Float32(block_step_budget)
             if temp < 1e-10:
                 temp = 1e-10
 
@@ -2053,7 +2057,7 @@ def main() raises:
                     moe_top_p,
                     eb_mask=eb_mask,
                     active_canvas_idx=active_canvas_idx,
-                    unaccepted_top_k=2,
+                    unaccepted_top_k=8,
                 )
 
                 var ffn_active_len = router_subspace_ffn_filter(
@@ -2067,8 +2071,8 @@ def main() raises:
                     active_len,
                     CONFIG.num_experts,
                     CONFIG.top_k_experts,
-                    block_steps_executed,
-                    tau_ffn=0.05,
+                    denoise_step,
+                    tau_ffn=0.005,
                     top_weights=canvas_top_weights,
                 )
 
@@ -2240,15 +2244,13 @@ def main() raises:
                 var rnd_u64 = rng_state * 0x2545F4914F6CDD1D
                 rand_buf[t] = Float32(rnd_u64 & 0xFFFFFF) / Float32(16777216.0)
 
-            # Batched logit projection: Two-Stage Coarse-to-Fine Vocab Sieve on active_len unconverged tokens (llm-mojo-yj4.4)
+            # Batched logit projection: exact Dual-Space 4x3 AVX2 GEMM reusing pre-deinterleaved canvas_deint_buf
             rms_norm_batch[in_type=DType.float16, out_type=DType.float32](canvas_hidden, final_norm_weight, canvas_final_norm, active_len, CONFIG.embed_dim)
             deinterleave_batch_to_f32[DType.float32](canvas_final_norm, canvas_deint_buf, active_len, CONFIG.embed_dim)
-            q4_lm_head_two_stage_sieve[DType.float32, DType.float32](
+            q4_gemm_l1_2x4[DType.float32, DType.float32](
                 embed.packed_weights, embed.scales, canvas_final_norm, canvas_logits,
                 active_len, CONFIG.embed_dim, CONFIG.vocab_size, num_tasks,
                 CONFIG.embed_dim, CONFIG.vocab_size, pre_deint_X=canvas_deint_buf,
-                forced_cand_tokens=argmax_tokens, num_forced_cands=CANVAS_LEN,
-                coarse_blocks=22, span_keep_frac=0.55,
             )
             var t_logit_end = std.time.perf_counter()
 
@@ -2389,6 +2391,7 @@ def main() raises:
             for t in range(block_start, block_end):
                 if locked_mask[t]:
                     eb_mask[t] = True
+                    new_tokens[t] = argmax_tokens[t]
 
             # Stability check: all ST slots agree within [block_start, block_end)
             var stable = True
@@ -2412,7 +2415,9 @@ def main() raises:
             var n_reject = cur_block_len - n_accept
             if n_reject > 0:
                 for t in range(block_start, block_end):
-                    if eb_mask[t]:
+                    if locked_mask[t]:
+                        canvas_tokens[t] = argmax_tokens[t]
+                    elif eb_mask[t]:
                         canvas_tokens[t] = new_tokens[t]
                     else:
                         rng_state ^= rng_state >> 12
@@ -2422,7 +2427,7 @@ def main() raises:
                         canvas_tokens[t] = Int(rnd_u64 % UInt64(CONFIG.vocab_size))
             else:
                 for t in range(block_start, block_end):
-                    canvas_tokens[t] = new_tokens[t]
+                    canvas_tokens[t] = argmax_tokens[t] if locked_mask[t] else new_tokens[t]
             prev_n_accept = n_accept
             print("    accepted=", n_accept, "/", cur_block_len)
 
@@ -2451,6 +2456,18 @@ def main() raises:
             # Update argmax_canvas
             for t in range(block_start, block_end):
                 argmax_canvas[t] = argmax_tokens[t]
+
+            # 2nd-Order Latent Velocity Extrapolation on sc_embeds (llm-mojo-2tc.6)
+            extrapolate_sc_velocity_batch(
+                sc_embeds,
+                prev_sc_embeds,
+                locked_mask,
+                block_start,
+                block_end,
+                CONFIG.embed_dim,
+                block_steps_executed,
+                skip_amount,
+            )
 
             denoise_step += skip_amount
 
@@ -2587,6 +2604,5 @@ def main() raises:
     moe_prev_top2.free()
     moe_prev_out.free()
     ffn_keep_b.free()
-    bos_sink_mask.free()
     bos_sink_mask.free()
     gpu_ctx.close()

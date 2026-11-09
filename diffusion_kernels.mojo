@@ -1348,7 +1348,7 @@ def q4_lm_head_two_stage_sieve[
                     if var_v < Float32(0.0):
                         var_v = Float32(0.0)
                     var std_v = sqrt(var_v + Float32(1e-12))
-                    var z_cut = (Float32(1.0) - span_keep_frac) * Float32(2.6)
+                    var z_cut = (Float32(0.75) - span_keep_frac) * Float32(3.8)
                     var z_thresh = mean_v + z_cut * std_v
                     if z_thresh > max_c[b]:
                         z_thresh = max_c[b]
@@ -3142,28 +3142,36 @@ def resolve_adjacent_duplicate_tokens(
         var alt_tok = top2_tokens[orig_idx]
         if alt_tok >= 0:
             if cand_arg >= 256:
+                var left_resolved = (orig_idx > 0 and locked_mask[orig_idx - 1]) or (
+                    orig_idx > block_start and resolved_mask[orig_idx - 1]
+                )
+                var right_resolved = orig_idx + 1 < block_end and resolved_mask[orig_idx + 1]
                 var dup_arg = False
-                if orig_idx > block_start and resolved_mask[orig_idx - 1] and argmax_tokens[orig_idx - 1] == cand_arg:
+                if left_resolved and argmax_tokens[orig_idx - 1] == cand_arg:
                     dup_arg = True
-                if orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and argmax_tokens[orig_idx + 1] == cand_arg:
+                if right_resolved and argmax_tokens[orig_idx + 1] == cand_arg:
                     dup_arg = True
                 if dup_arg and alt_tok != cand_arg:
                     var alt_clash_arg = (
-                        (orig_idx > block_start and resolved_mask[orig_idx - 1] and argmax_tokens[orig_idx - 1] == alt_tok)
-                        or (orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and argmax_tokens[orig_idx + 1] == alt_tok)
+                        (left_resolved and argmax_tokens[orig_idx - 1] == alt_tok)
+                        or (right_resolved and argmax_tokens[orig_idx + 1] == alt_tok)
                     )
                     if not alt_clash_arg:
                         argmax_tokens[orig_idx] = alt_tok
             if cand_new >= 256:
+                var left_resolved = (orig_idx > 0 and locked_mask[orig_idx - 1]) or (
+                    orig_idx > block_start and resolved_mask[orig_idx - 1]
+                )
+                var right_resolved = orig_idx + 1 < block_end and resolved_mask[orig_idx + 1]
                 var dup_new = False
-                if orig_idx > block_start and resolved_mask[orig_idx - 1] and new_tokens[orig_idx - 1] == cand_new:
+                if left_resolved and new_tokens[orig_idx - 1] == cand_new:
                     dup_new = True
-                if orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and new_tokens[orig_idx + 1] == cand_new:
+                if right_resolved and new_tokens[orig_idx + 1] == cand_new:
                     dup_new = True
                 if dup_new and alt_tok != cand_new:
                     var alt_clash_new = (
-                        (orig_idx > block_start and resolved_mask[orig_idx - 1] and new_tokens[orig_idx - 1] == alt_tok)
-                        or (orig_idx + 1 < block_end and resolved_mask[orig_idx + 1] and new_tokens[orig_idx + 1] == alt_tok)
+                        (left_resolved and new_tokens[orig_idx - 1] == alt_tok)
+                        or (right_resolved and new_tokens[orig_idx + 1] == alt_tok)
                     )
                     if not alt_clash_new:
                         new_tokens[orig_idx] = alt_tok
@@ -3219,8 +3227,12 @@ def update_locked_mask(
             var self_stable = history[t] == history[canvas_len + t]
             if not self_stable:
                 continue
-            var no_left_dup = (t == block_start) or (history[t] != history[t - 1])
-            var no_right_dup = (t + 1 >= eff_end) or (history[t] != history[t + 1])
+            var no_left_dup = (t == 0) or (
+                history[t] != history[t - 1] and history[canvas_len + t] != history[canvas_len + t - 1]
+            )
+            var no_right_dup = (t + 1 >= eff_end) or (
+                history[t] != history[t + 1] and history[canvas_len + t] != history[canvas_len + t + 1]
+            )
             if no_left_dup and no_right_dup:
                 locked_mask[t] = True
                 num_locked += 1
@@ -3603,7 +3615,7 @@ def apply_moe_lod_and_set_cover(
     moe_top_p: Float32,
     eb_mask: UnsafePointer[Bool, _] = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=Int(0)),
     active_canvas_idx: UnsafePointer[Int, _] = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(0)),
-    unaccepted_top_k: Int = 2,
+    unaccepted_top_k: Int = 8,
 ):
     """Computes Gemma-4 / DiffusionGemma router expert weights for the active canvas tokens:
     - When `eb_mask` is provided (llm-mojo-yj4.3), already-accepted tokens (`eb_mask[orig_t] == True`)
